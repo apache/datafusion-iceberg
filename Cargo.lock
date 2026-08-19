@@ -2112,14 +2112,18 @@ name = "datafusion-iceberg"
 version = "0.10.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "dashmap",
  "datafusion",
  "expect-test",
  "futures",
  "iceberg",
+ "insta",
  "parquet",
+ "serde",
  "tempfile",
  "tokio",
+ "typetag",
  "uuid",
 ]
 
@@ -3462,6 +3466,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "insta"
+version = "1.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
+dependencies = [
+ "console",
+ "once_cell",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]
