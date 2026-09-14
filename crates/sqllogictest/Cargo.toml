@@ -22,7 +22,6 @@ license = { workspace = true }
 name = "iceberg-sqllogictest"
 publish = false
 repository = { workspace = true }
-rust-version = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
@@ -30,20 +29,20 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
 datafusion-sqllogictest = { workspace = true }
-enum-ordinalize = { workspace = true }
-env_logger = { workspace = true }
+enum-ordinalize = "4.3.0"
+env_logger = "0.11.8"
 iceberg = { workspace = true }
-iceberg-datafusion = { workspace = true }
-indicatif = { workspace = true }
-log = { workspace = true }
-serde = { workspace = true }
-sqllogictest = { workspace = true }
+datafusion-iceberg = { workspace = true }
+indicatif = "0.18"
+log = "0.4.28"
+serde = { version = "1.0.219", features = ["rc"] }
+sqllogictest = "0.29"
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-libtest-mimic = { workspace = true }
+libtest-mimic = "0.8.1"
 
 [[test]]
 harness = false

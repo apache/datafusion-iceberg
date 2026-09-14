@@ -44,7 +44,7 @@ use crate::to_datafusion_error;
 /// use datafusion::common::TableReference;
 /// use datafusion::execution::session_state::SessionStateBuilder;
 /// use datafusion::prelude::*;
-/// use iceberg_datafusion::IcebergTableProviderFactory;
+/// use datafusion_iceberg::IcebergTableProviderFactory;
 ///
 /// #[tokio::main]
 /// async fn main() {

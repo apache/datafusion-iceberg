@@ -25,7 +25,7 @@ use fs_err::read_to_string;
 use iceberg::CatalogBuilder;
 use iceberg::memory::MemoryCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
-use iceberg_datafusion::IcebergCatalogProvider;
+use datafusion_iceberg::IcebergCatalogProvider;
 use toml::{Table as TomlTable, Value};
 
 const CONFIG_NAME_CATALOGS: &str = "catalogs";

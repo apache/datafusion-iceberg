@@ -17,33 +17,32 @@
 
 [package]
 description = "Apache iceberg client"
-edition.workspace = true
-homepage.workspace = true
-license.workspace = true
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
 name = "iceberg-playground"
 publish = false
 readme = "README.md"
-repository.workspace = true
-rust-version.workspace = true
-version.workspace = true
+repository = { workspace = true }
+version = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true }
+clap = { version = "4.5.48", features = ["derive", "cargo"] }
 datafusion = { workspace = true }
 datafusion-cli = { workspace = true }
-dirs = { workspace = true }
-fs-err = { workspace = true }
-home = { workspace = true }
+dirs = "6"
+fs-err = "3.1.0"
+home = "0.5.12"
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-iceberg-datafusion = { workspace = true }
-mimalloc = { workspace = true }
-stacker = { workspace = true }
+datafusion-iceberg = { workspace = true }
+mimalloc = "0.1.46"
+stacker = "0.1.20"
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = "0.3.20"
 
 [package.metadata.cargo-machete]
 # These dependencies are added to ensure minimal dependency version
