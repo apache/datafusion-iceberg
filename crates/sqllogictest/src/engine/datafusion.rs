@@ -28,7 +28,7 @@ use iceberg::spec::{
     NestedField, PrimitiveType, Schema, TableProperties, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
-use iceberg_datafusion::IcebergCatalogProvider;
+use datafusion_iceberg::IcebergCatalogProvider;
 use indicatif::ProgressBar;
 
 use crate::engine::{DatafusionCatalogConfig, EngineRunner, run_slt_with_runner};

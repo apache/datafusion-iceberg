@@ -46,7 +46,7 @@ pub(crate) fn collect_trials(handle: Handle) -> anyhow::Result<Vec<Trial>> {
     log::debug!(
         "Found {} schedules files: {:?}",
         schedule_files.len(),
-        &schedule_files
+        schedule_files
     );
     let mut trials = Vec::with_capacity(schedule_files.len());
     for schedule_file in schedule_files {
