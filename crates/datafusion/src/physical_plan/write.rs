@@ -23,9 +23,9 @@ use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use datafusion::common::Result as DFResult;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{internal_err, not_impl_err, tree_node::TreeNodeRecursion};
 use datafusion::error::DataFusionError;
+use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -44,7 +44,6 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::{Error, ErrorKind};
 use uuid::Uuid;
 
 use crate::physical_plan::DATA_FILES_COL_NAME;
@@ -94,7 +93,7 @@ impl IcebergWriteExec {
     }
 
     // Create a record batch with serialized data files
-    fn make_result_batch(data_files: Vec<String>) -> DFResult<RecordBatch> {
+    fn make_result_batch(data_files: Vec<String>) -> Result<RecordBatch> {
         let files_array = Arc::new(StringArray::from(data_files)) as ArrayRef;
 
         RecordBatch::try_new(Self::make_result_schema(), vec![files_array]).map_err(|e| {
@@ -161,20 +160,20 @@ impl ExecutionPlan for IcebergWriteExec {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
+            return internal_err!(
                 "IcebergWriteExec expects exactly one child, but provided {}",
                 children.len()
-            )));
+            );
         }
 
         Ok(Arc::new(Self::new(
@@ -208,7 +207,7 @@ impl ExecutionPlan for IcebergWriteExec {
         &self,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         let partition_type = self.table.metadata().default_partition_type().clone();
         let format_version = self.table.metadata().format_version();
 
@@ -222,12 +221,9 @@ impl ExecutionPlan for IcebergWriteExec {
         let file_format = DataFileFormat::from_str(&write_format_default)
             .map_err(to_datafusion_error)?;
         if file_format != DataFileFormat::Parquet {
-            return Err(to_datafusion_error(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "File format {file_format} is not supported for insert_into yet!"
-                ),
-            )));
+            return not_impl_err!(
+                "File format {file_format} is not supported for insert_into yet!"
+            );
         }
 
         // Build the writer from the already-parsed table properties so it honors
@@ -275,8 +271,7 @@ impl ExecutionPlan for IcebergWriteExec {
             fanout_enabled,
             schema.clone(),
             partition_spec,
-        )
-        .map_err(to_datafusion_error)?;
+        )?;
 
         // Get input data
         let data = execute_input_stream(
@@ -293,13 +288,10 @@ impl ExecutionPlan for IcebergWriteExec {
 
             while let Some(batch) = input_stream.next().await {
                 let batch = batch?;
-                task_writer
-                    .write(batch)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                task_writer.write(batch).await?;
             }
 
-            let data_files = task_writer.close().await.map_err(to_datafusion_error)?;
+            let data_files = task_writer.close().await?;
 
             // Convert builders to data files and then to JSON strings
             let data_files_strs: Vec<String> = data_files
@@ -312,7 +304,7 @@ impl ExecutionPlan for IcebergWriteExec {
                     )
                     .map_err(to_datafusion_error)
                 })
-                .collect::<DFResult<Vec<String>>>()?;
+                .collect::<Result<Vec<String>>>()?;
 
             Self::make_result_batch(data_files_strs)
         })
@@ -335,7 +327,7 @@ mod tests {
     use datafusion::arrow::datatypes::{
         DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
-    use datafusion::common::Result as DFResult;
+    use datafusion::error::Result;
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -350,7 +342,8 @@ mod tests {
         deserialize_data_file_from_json,
     };
     use iceberg::{
-        Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation,
+        Catalog, CatalogBuilder, Error, ErrorKind, MemoryCatalog, NamespaceIdent,
+        Result as IcebergResult, TableCreation,
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use tempfile::TempDir;
@@ -414,15 +407,15 @@ mod tests {
 
         fn apply_expressions(
             &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-        ) -> DFResult<TreeNodeRecursion> {
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
             Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        ) -> Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }
 
@@ -430,7 +423,7 @@ mod tests {
             &self,
             _partition: usize,
             _context: Arc<TaskContext>,
-        ) -> DFResult<SendableRecordBatchStream> {
+        ) -> Result<SendableRecordBatchStream> {
             let batches = self.batches.clone();
             let stream = stream::iter(batches.into_iter().map(Ok));
             Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -458,7 +451,7 @@ mod tests {
     }
 
     /// Helper function to create a test table schema
-    fn get_test_schema() -> Result<Schema> {
+    fn get_test_schema() -> IcebergResult<Schema> {
         Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -485,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_iceberg_write_exec() -> Result<()> {
+    async fn test_iceberg_write_exec() -> Result<(), Box<dyn std::error::Error>> {
         // 1. Set up test environment
         let iceberg_catalog = get_iceberg_catalog().await;
         let namespace = NamespaceIdent::new("test_namespace".to_string());
@@ -654,7 +647,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_iceberg_write_exec_advertises_result_schema() -> Result<()> {
+    async fn test_iceberg_write_exec_advertises_result_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
         let iceberg_catalog = get_iceberg_catalog().await;
         let namespace = NamespaceIdent::new("test_namespace".to_string());
         iceberg_catalog

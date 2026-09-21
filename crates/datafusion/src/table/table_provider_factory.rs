@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider, TableProviderFactory};
-use datafusion::common::TableReference;
-use datafusion::error::Result as DFResult;
+use datafusion::common::{TableReference, not_impl_err};
+use datafusion::error::Result;
 use datafusion::logical_expr::CreateExternalTable;
+use iceberg::TableIdent;
 use iceberg::io::{FileIOBuilder, LocalFsStorageFactory, StorageFactory};
 use iceberg::table::StaticTable;
-use iceberg::{Error, ErrorKind, Result, TableIdent};
 
 use super::IcebergStaticTableProvider;
 use crate::to_datafusion_error;
@@ -122,8 +122,8 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         &self,
         _state: &dyn Session,
         cmd: &CreateExternalTable,
-    ) -> DFResult<Arc<dyn TableProvider>> {
-        let metadata_file_path = check_cmd(cmd).map_err(to_datafusion_error)?;
+    ) -> Result<Arc<dyn TableProvider>> {
+        let metadata_file_path = check_cmd(cmd)?;
 
         let table_name = &cmd.name;
         let options = &cmd.options;
@@ -141,13 +141,10 @@ impl TableProviderFactory for IcebergTableProviderFactory {
             options,
             storage_factory,
         )
-        .await
-        .map_err(to_datafusion_error)?
+        .await?
         .into_table();
 
-        let provider = IcebergStaticTableProvider::try_new_from_table(table)
-            .await
-            .map_err(to_datafusion_error)?;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
 
         Ok(Arc::new(provider))
     }
@@ -171,18 +168,16 @@ fn check_cmd(cmd: &CreateExternalTable) -> Result<&str> {
         || !column_defaults.is_empty();
 
     if is_invalid {
-        return Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Currently we only support reading existing icebergs tables in external table command. To create new table, please use catalog provider.",
-        ));
+        return not_impl_err!(
+            "Currently we only support reading existing icebergs tables in external table command. To create new table, please use catalog provider."
+        );
     }
 
     match cmd.locations.as_slice() {
         [location] => Ok(location),
-        _ => Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Iceberg external tables require exactly one metadata location.",
-        )),
+        _ => not_impl_err!(
+            "Iceberg external tables require exactly one metadata location."
+        ),
     }
 }
 
@@ -213,11 +208,14 @@ async fn create_static_table(
     props: &HashMap<String, String>,
     storage_factory: Arc<dyn StorageFactory>,
 ) -> Result<StaticTable> {
-    let table_ident = TableIdent::from_strs(table_name.to_vec())?;
+    let table_ident =
+        TableIdent::from_strs(table_name.to_vec()).map_err(to_datafusion_error)?;
     let file_io = FileIOBuilder::new(storage_factory)
         .with_props(props)
         .build();
-    StaticTable::from_metadata_file(metadata_file_path, table_ident, file_io).await
+    StaticTable::from_metadata_file(metadata_file_path, table_ident, file_io)
+        .await
+        .map_err(to_datafusion_error)
 }
 
 #[cfg(test)]

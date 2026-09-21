@@ -20,18 +20,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::{exec_datafusion_err, exec_err, plan_datafusion_err};
 use datafusion::datasource::TableProvider;
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
-use futures::StreamExt;
+use futures::TryStreamExt;
 use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
-use iceberg::{
-    Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent,
-};
+use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
@@ -69,7 +68,8 @@ impl IcebergSchemaProvider {
         // As of right now; tables might become stale.
         let table_names: Vec<_> = client
             .list_tables(&namespace)
-            .await?
+            .await
+            .map_err(to_datafusion_error)?
             .iter()
             .map(|tbl| tbl.name().to_string())
             .collect();
@@ -122,15 +122,12 @@ impl SchemaProvider for IcebergSchemaProvider {
         }
     }
 
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
             let metadata_table_type = MetadataTableType::try_from(metadata_table_name)
-                .map_err(DataFusionError::Plan)?;
+                .map_err(|e| plan_datafusion_err!("{e}"))?;
             if let Some(table) = self.tables.get(table_name) {
-                let metadata_table = table
-                    .metadata_table(metadata_table_type)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                let metadata_table = table.metadata_table(metadata_table_type).await?;
                 return Ok(Some(Arc::new(metadata_table)));
             } else {
                 return Ok(None);
@@ -147,12 +144,10 @@ impl SchemaProvider for IcebergSchemaProvider {
         &self,
         name: String,
         table: Arc<dyn TableProvider>,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Check if table already exists
         if self.table_exist(name.as_str()) {
-            return Err(DataFusionError::Execution(format!(
-                "Table {name} already exists"
-            )));
+            return exec_err!("Table {name} already exists");
         }
 
         // Convert DataFusion schema to Iceberg schema
@@ -184,9 +179,7 @@ impl SchemaProvider for IcebergSchemaProvider {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async move {
                 // Verify the input table is empty - CREATE TABLE only accepts schema definition
-                ensure_table_is_empty(&table)
-                    .await
-                    .map_err(to_datafusion_error)?;
+                ensure_table_is_empty(&table).await?;
 
                 catalog
                     .create_table(&namespace, table_creation)
@@ -199,8 +192,7 @@ impl SchemaProvider for IcebergSchemaProvider {
                     namespace.clone(),
                     name_clone.clone(),
                 )
-                .await
-                .map_err(to_datafusion_error)?;
+                .await?;
 
                 // Store the new table provider
                 tables.insert(name_clone, Arc::new(table_provider));
@@ -211,12 +203,11 @@ impl SchemaProvider for IcebergSchemaProvider {
 
         // Block on the spawned task to get the result
         // This is safe because spawn_blocking moves the blocking to a dedicated thread pool
-        futures::executor::block_on(result).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create Iceberg table: {e}"))
-        })?
+        futures::executor::block_on(result)
+            .map_err(|e| exec_datafusion_err!("Failed to create Iceberg table: {e}"))?
     }
 
-    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         // Check if table exists
         if !self.table_exist(name) {
             return Ok(None);
@@ -248,9 +239,8 @@ impl SchemaProvider for IcebergSchemaProvider {
             })
         });
 
-        futures::executor::block_on(result).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
-        })?
+        futures::executor::block_on(result)
+            .map_err(|e| exec_datafusion_err!("Failed to drop Iceberg table: {e}"))?
     }
 }
 
@@ -258,32 +248,16 @@ impl SchemaProvider for IcebergSchemaProvider {
 /// Returns an error if the table has any rows.
 async fn ensure_table_is_empty(table: &Arc<dyn TableProvider>) -> Result<()> {
     let session_ctx = SessionContext::new();
-    let exec_plan = table
-        .scan(&session_ctx.state(), None, &[], Some(1))
-        .await
-        .map_err(|e| {
-            Error::new(ErrorKind::Unexpected, format!("Failed to scan table: {e}"))
-        })?;
+    let exec_plan = table.scan(&session_ctx.state(), None, &[], Some(1)).await?;
 
     let task_ctx = Arc::new(TaskContext::default());
-    let stream = exec_plan.execute(0, task_ctx).map_err(|e| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Failed to execute scan: {e}"),
-        )
-    })?;
+    let stream = exec_plan.execute(0, task_ctx)?;
 
-    let batches: Vec<_> = stream.collect().await;
-    let has_data = batches
-        .into_iter()
-        .filter_map(|r| r.ok())
-        .any(|batch| batch.num_rows() > 0);
+    let batches: Vec<_> = stream.try_collect().await?;
+    let has_data = batches.iter().any(|batch| batch.num_rows() > 0);
 
     if has_data {
-        return Err(Error::new(
-            ErrorKind::Unexpected,
-            "register_table does not support tables with data.",
-        ));
+        return exec_err!("register_table does not support tables with data.");
     }
 
     Ok(())

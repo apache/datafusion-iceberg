@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Schema as ArrowSchema};
-use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::common::plan_err;
+use datafusion::error::Result;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -51,7 +52,7 @@ use crate::to_datafusion_error;
 pub fn project_with_partition(
     input: Arc<dyn ExecutionPlan>,
     table: &Table,
-) -> DFResult<Arc<dyn ExecutionPlan>> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     let metadata = table.metadata();
     let partition_spec = metadata.default_partition_spec();
     let table_schema = metadata.current_schema();
@@ -72,11 +73,11 @@ pub fn project_with_partition(
         .map_err(to_datafusion_error)?;
 
     if input_schema_cleaned != expected_schema_cleaned {
-        return Err(DataFusionError::Plan(format!(
+        return plan_err!(
             "Input schema does not match Iceberg table schema.\n\
              Expected schema: {expected_schema_cleaned}\n\
              Input schema: {input_schema_cleaned}"
-        )));
+        );
     }
 
     let calculator =
@@ -129,15 +130,15 @@ impl PartialEq for PartitionExpr {
 impl Eq for PartitionExpr {}
 
 impl PhysicalExpr for PartitionExpr {
-    fn data_type(&self, _input_schema: &ArrowSchema) -> DFResult<DataType> {
+    fn data_type(&self, _input_schema: &ArrowSchema) -> Result<DataType> {
         Ok(self.calculator.partition_arrow_type().clone())
     }
 
-    fn nullable(&self, _input_schema: &ArrowSchema) -> DFResult<bool> {
+    fn nullable(&self, _input_schema: &ArrowSchema) -> Result<bool> {
         Ok(false)
     }
 
-    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let array = self
             .calculator
             .calculate(batch)
@@ -152,7 +153,7 @@ impl PhysicalExpr for PartitionExpr {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+    ) -> Result<Arc<dyn PhysicalExpr>> {
         Ok(self)
     }
 

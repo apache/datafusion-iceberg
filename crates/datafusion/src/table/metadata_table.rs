@@ -22,7 +22,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::Result;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
@@ -64,13 +64,13 @@ impl TableProvider for IcebergMetadataTableProvider {
         _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(IcebergMetadataScan::new(self.clone())))
     }
 }
 
 impl IcebergMetadataTableProvider {
-    pub async fn scan(self) -> DFResult<BoxStream<'static, DFResult<RecordBatch>>> {
+    pub async fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let metadata_table = self.table.inspect();
         let stream = match self.r#type {
             MetadataTableType::Snapshots => metadata_table.snapshots().scan().await,

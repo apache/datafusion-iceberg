@@ -2111,7 +2111,6 @@ dependencies = [
 name = "datafusion-iceberg"
 version = "0.10.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "dashmap",
  "datafusion",

@@ -19,10 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::error::Result;
 use futures::future::try_join_all;
-use iceberg::{Catalog, NamespaceIdent, Result};
+use iceberg::{Catalog, NamespaceIdent};
 
 use crate::schema::IcebergSchemaProvider;
+use crate::to_datafusion_error;
 
 /// Provides an interface to manage and access multiple schemas
 /// within an Iceberg [`Catalog`].
@@ -51,7 +53,8 @@ impl IcebergCatalogProvider {
         // As of right now; schemas might become stale.
         let schema_names: Vec<_> = client
             .list_namespaces(None)
-            .await?
+            .await
+            .map_err(to_datafusion_error)?
             .iter()
             .flat_map(|ns| ns.as_ref().clone())
             .collect();

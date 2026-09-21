@@ -22,8 +22,10 @@ use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::common::{
+    internal_datafusion_err, internal_err, tree_node::TreeNodeRecursion,
+};
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -84,7 +86,7 @@ impl IcebergCommitExec {
     }
 
     // Create a record batch with just the count of rows written
-    fn make_count_batch(count: u64) -> DFResult<RecordBatch> {
+    fn make_count_batch(count: u64) -> Result<RecordBatch> {
         let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
 
         RecordBatch::try_from_iter_with_nullable(vec![("count", count_array, false)])
@@ -142,8 +144,8 @@ impl ExecutionPlan for IcebergCommitExec {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
 
@@ -163,12 +165,12 @@ impl ExecutionPlan for IcebergCommitExec {
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
+            return internal_err!(
                 "IcebergCommitExec expects exactly one child, but provided {}",
                 children.len()
-            )));
+            );
         }
 
         Ok(Arc::new(IcebergCommitExec::new(
@@ -183,12 +185,12 @@ impl ExecutionPlan for IcebergCommitExec {
         &self,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         // IcebergCommitExec only has one partition (partition 0)
         if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
+            return internal_err!(
                 "IcebergCommitExec only has one partition, but got partition {partition}"
-            )));
+            );
         }
 
         let table = self.table.clone();
@@ -215,15 +217,15 @@ impl ExecutionPlan for IcebergCommitExec {
                 let files_array = batch
                     .column_by_name(DATA_FILES_COL_NAME)
                     .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "Expected 'data_files' column in input batch".to_string(),
+                        internal_datafusion_err!(
+                            "Expected 'data_files' column in input batch"
                         )
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "Expected 'data_files' column to be StringArray".to_string(),
+                        internal_datafusion_err!(
+                            "Expected 'data_files' column to be StringArray"
                         )
                     })?;
 
@@ -231,7 +233,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 let batch_files: Vec<DataFile> = files_array
                     .into_iter()
                     .flatten()
-                    .map(|f| -> DFResult<DataFile> {
+                    .map(|f| -> Result<DataFile> {
                         // Parse JSON to DataFileSerde and convert to DataFile
                         deserialize_data_file_from_json(
                             f,
@@ -241,7 +243,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         )
                         .map_err(to_datafusion_error)
                     })
-                    .collect::<datafusion::common::Result<_>>()?;
+                    .collect::<Result<_>>()?;
 
                 // add record_counts from the current batch to total record count
                 total_record_count +=
@@ -361,15 +363,15 @@ mod tests {
 
         fn apply_expressions(
             &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-        ) -> DFResult<TreeNodeRecursion> {
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
             Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        ) -> Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }
 
@@ -377,7 +379,7 @@ mod tests {
             &self,
             _partition: usize,
             _context: Arc<TaskContext>,
-        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        ) -> Result<SendableRecordBatchStream> {
             // Create a record batch with the serialized data files
             let array =
                 Arc::new(StringArray::from(self.data_files_json.clone())) as ArrayRef;
