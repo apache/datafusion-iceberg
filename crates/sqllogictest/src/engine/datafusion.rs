@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_iceberg::IcebergCatalogProvider;
 use datafusion_sqllogictest::DataFusion;
 use iceberg::encryption::kms::MemoryKmsClientFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -28,7 +29,6 @@ use iceberg::spec::{
     NestedField, PrimitiveType, Schema, TableProperties, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
-use datafusion_iceberg::IcebergCatalogProvider;
 use indicatif::ProgressBar;
 
 use crate::engine::{DatafusionCatalogConfig, EngineRunner, run_slt_with_runner};

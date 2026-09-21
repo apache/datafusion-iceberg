@@ -334,10 +334,13 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let mem_table = MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap();

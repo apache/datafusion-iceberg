@@ -147,9 +147,10 @@ mod tests {
 
         assert_eq!(config.engines.len(), 1);
         assert!(config.engines.contains_key("df"));
-        assert!(matches!(config.engines["df"], EngineConfig::Datafusion {
-            catalog: None
-        }));
+        assert!(matches!(
+            config.engines["df"],
+            EngineConfig::Datafusion { catalog: None }
+        ));
         assert_eq!(config.steps.len(), 1);
         assert_eq!(config.steps[0].engine, "df");
         assert_eq!(config.steps[0].slt, "test.slt");
