@@ -31,7 +31,7 @@ anyhow = { workspace = true }
 clap = { version = "4.5.48", features = ["derive", "cargo"] }
 datafusion = { workspace = true }
 datafusion-cli = { workspace = true }
-dirs = "6"
+dirs = "7"
 fs-err = "3.1.0"
 home = "0.5.12"
 iceberg = { workspace = true }
