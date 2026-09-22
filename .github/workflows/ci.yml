@@ -69,8 +69,8 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     env:
-      # Incremental artifacts and debug info go unused in CI and only add cache
-      # size and build time.
+      # Incremental artifacts and debug info go unused in CI and only
+      # add cache size and build time.
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
