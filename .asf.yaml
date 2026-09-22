@@ -46,5 +46,8 @@ github:
       required_status_checks:
         # Require branches to be up-to-date before merging.
         strict: true
-        # Do not require any jobs to pass.
-        contexts: []
+        contexts:
+          - "Format"
+          - "Clippy"
+          - "Test"
+          - "asf-allowlist-check"
