@@ -44,7 +44,9 @@ impl IcebergCatalogList {
     pub async fn parse_table(configs: &TomlTable) -> anyhow::Result<Self> {
         if let Value::Array(catalogs_config) =
             configs.get(CONFIG_NAME_CATALOGS).ok_or_else(|| {
-                anyhow::Error::msg(format!("{CONFIG_NAME_CATALOGS} entry not found in config"))
+                anyhow::Error::msg(format!(
+                    "{CONFIG_NAME_CATALOGS} entry not found in config"
+                ))
             })?
         {
             let mut catalogs = HashMap::with_capacity(catalogs_config.len());
@@ -96,7 +98,9 @@ impl IcebergCatalogList {
         // Create catalog based on type using the appropriate builder
         let catalog: Arc<dyn iceberg::Catalog> = match r#type {
             "rest" => Arc::new(RestCatalogBuilder::default().load(name, props).await?),
-            "memory" => Arc::new(MemoryCatalogBuilder::default().load(name, props).await?),
+            "memory" => {
+                Arc::new(MemoryCatalogBuilder::default().load(name, props).await?)
+            }
             _ => {
                 return Err(anyhow::anyhow!(
                     "Unsupported catalog type: '{type}'. Supported types: rest, memory"

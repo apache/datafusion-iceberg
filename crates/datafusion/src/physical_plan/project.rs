@@ -68,8 +68,8 @@ pub fn project_with_partition(
         schema_to_arrow_schema(table_schema.as_ref()).map_err(to_datafusion_error)?;
     let input_schema_cleaned =
         strip_metadata_from_schema(&input_schema).map_err(to_datafusion_error)?;
-    let expected_schema_cleaned =
-        strip_metadata_from_schema(&expected_arrow_schema).map_err(to_datafusion_error)?;
+    let expected_schema_cleaned = strip_metadata_from_schema(&expected_arrow_schema)
+        .map_err(to_datafusion_error)?;
 
     if input_schema_cleaned != expected_schema_cleaned {
         return Err(DataFusionError::Plan(format!(
@@ -106,7 +106,10 @@ struct PartitionExpr {
 }
 
 impl PartitionExpr {
-    fn new(calculator: PartitionValueCalculator, partition_spec: Arc<PartitionSpec>) -> Self {
+    fn new(
+        calculator: PartitionValueCalculator,
+        partition_spec: Arc<PartitionSpec>,
+    ) -> Self {
         Self {
             calculator: Arc::new(calculator),
             partition_spec,
@@ -189,7 +192,9 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Transform, Type};
+    use iceberg::spec::{
+        NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    };
     use iceberg::test_utils::test_runtime;
 
     use super::*;
@@ -199,8 +204,10 @@ mod tests {
         let table_schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()
             .unwrap();
@@ -211,7 +218,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        let calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
 
         // Verify partition type
         assert_eq!(calculator.partition_type().fields().len(), 1);
@@ -223,8 +231,10 @@ mod tests {
         let table_schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()
             .unwrap();
@@ -244,7 +254,8 @@ mod tests {
 
         let input = Arc::new(EmptyExec::new(arrow_schema.clone()));
 
-        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        let calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
 
         let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
             Vec::with_capacity(arrow_schema.fields().len() + 1);
@@ -254,7 +265,8 @@ mod tests {
         }
 
         let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec));
-        projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
+        projection_exprs
+            .push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
         let projection = ProjectionExec::try_new(projection_exprs, input).unwrap();
         let result = Arc::new(projection);
@@ -270,8 +282,10 @@ mod tests {
         let table_schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "data", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()
             .unwrap();
@@ -299,7 +313,8 @@ mod tests {
         .unwrap();
 
         let partition_spec = Arc::new(partition_spec);
-        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        let calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let partition_type = calculator.partition_arrow_type().clone();
         let expr = PartitionExpr::new(calculator, partition_spec);
 
@@ -327,14 +342,17 @@ mod tests {
     #[test]
     fn test_nested_partition() {
         let address_struct = StructType::new(vec![
-            NestedField::required(3, "street", Type::Primitive(PrimitiveType::String)).into(),
-            NestedField::required(4, "city", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "street", Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::required(4, "city", Type::Primitive(PrimitiveType::String))
+                .into(),
         ]);
 
         let table_schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
                 NestedField::required(2, "address", Type::Struct(address_struct)).into(),
             ])
             .build()
@@ -385,7 +403,8 @@ mod tests {
         )
         .unwrap();
 
-        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+        let calculator =
+            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let array = calculator.calculate(&batch).unwrap();
 
         let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
@@ -409,8 +428,14 @@ mod tests {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
                 ])
                 .build()
                 .unwrap(),
@@ -468,8 +493,14 @@ mod tests {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
                 ])
                 .build()
                 .unwrap(),
@@ -538,8 +569,14 @@ mod tests {
         let table_schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
                 ])
                 .build()
                 .unwrap(),

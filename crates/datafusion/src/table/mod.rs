@@ -179,8 +179,8 @@ impl TableProvider for IcebergTableProvider {
         };
 
         // Step 2: Repartition for parallel processing
-        let target_partitions =
-            NonZeroUsize::new(state.config().target_partitions()).ok_or_else(|| {
+        let target_partitions = NonZeroUsize::new(state.config().target_partitions())
+            .ok_or_else(|| {
                 DataFusionError::Configuration(
                     "target_partitions must be greater than 0".to_string(),
                 )
@@ -267,7 +267,10 @@ impl IcebergStaticTableProvider {
     ///
     /// Queries the specified snapshot for all operations. Useful for time-travel queries.
     /// Does not support write operations.
-    pub async fn try_new_from_table_snapshot(table: Table, snapshot_id: i64) -> Result<Self> {
+    pub async fn try_new_from_table_snapshot(
+        table: Table,
+        snapshot_id: i64,
+    ) -> Result<Self> {
         let snapshot = table
             .metadata()
             .snapshot_by_id(snapshot_id)
@@ -366,22 +369,30 @@ mod tests {
             metadata_file_name
         );
         let file_io = FileIO::new_with_fs();
-        let static_identifier = TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
-        let static_table =
-            StaticTable::from_metadata_file(&metadata_file_path, static_identifier, file_io)
-                .await
-                .unwrap();
+        let static_identifier =
+            TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
+        let static_table = StaticTable::from_metadata_file(
+            &metadata_file_path,
+            static_identifier,
+            file_io,
+        )
+        .await
+        .unwrap();
         static_table.into_table()
     }
 
-    async fn get_test_catalog_and_table() -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
+    async fn get_test_catalog_and_table()
+    -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
 
         let catalog = MemoryCatalogBuilder::default()
             .load(
                 "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse_path.clone(),
+                )]),
             )
             .await
             .unwrap();
@@ -395,8 +406,10 @@ mod tests {
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()
             .unwrap();
@@ -426,9 +439,10 @@ mod tests {
     #[tokio::test]
     async fn test_static_provider_from_table() {
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
-            .await
-            .unwrap();
+        let table_provider =
+            IcebergStaticTableProvider::try_new_from_table(table.clone())
+                .await
+                .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -451,10 +465,12 @@ mod tests {
     async fn test_static_provider_from_snapshot() {
         let table = get_test_table_from_metadata_file().await;
         let snapshot_id = table.metadata().snapshots().next().unwrap().snapshot_id();
-        let table_provider =
-            IcebergStaticTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id)
-                .await
-                .unwrap();
+        let table_provider = IcebergStaticTableProvider::try_new_from_table_snapshot(
+            table.clone(),
+            snapshot_id,
+        )
+        .await
+        .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -476,9 +492,10 @@ mod tests {
     #[tokio::test]
     async fn test_static_provider_rejects_writes() {
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
-            .await
-            .unwrap();
+        let table_provider =
+            IcebergStaticTableProvider::try_new_from_table(table.clone())
+                .await
+                .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -499,9 +516,10 @@ mod tests {
     #[tokio::test]
     async fn test_static_provider_scan() {
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
-            .await
-            .unwrap();
+        let table_provider =
+            IcebergStaticTableProvider::try_new_from_table(table.clone())
+                .await
+                .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -516,13 +534,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_backed_provider_creation() {
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
 
         // Test creating a catalog-backed provider
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         // Verify the schema is loaded correctly
         let schema = provider.schema();
@@ -533,12 +555,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_backed_provider_scan() {
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         ctx.register_table("test_table", Arc::new(provider))
@@ -559,12 +585,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_catalog_backed_provider_insert() {
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         ctx.register_table("test_table", Arc::new(provider))
@@ -586,12 +616,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_physical_input_schema_consistent_with_logical_input_schema() {
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         ctx.register_table("test_table", Arc::new(provider))
@@ -634,7 +668,10 @@ mod tests {
         let catalog = MemoryCatalogBuilder::default()
             .load(
                 "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse_path.clone(),
+                )]),
             )
             .await
             .unwrap();
@@ -648,8 +685,14 @@ mod tests {
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(
+                    2,
+                    "category",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
             ])
             .build()
             .unwrap();
@@ -706,7 +749,8 @@ mod tests {
     async fn test_catalog_backed_provider_rejects_non_append_op() {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
         let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
             .await
             .unwrap();
@@ -722,7 +766,8 @@ mod tests {
                 "IcebergTableProvider supports only append inserts, got Replace Into",
             ),
         ] {
-            let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+            let input =
+                Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
             let error = provider
                 .insert_into(&ctx.state(), input, insert_op)
                 .await
@@ -748,10 +793,13 @@ mod tests {
         let (catalog, namespace, table_name, _temp_dir) =
             get_partitioned_test_catalog_and_table(Some(true)).await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         let input_schema = provider.schema();
@@ -780,10 +828,13 @@ mod tests {
         let (catalog, namespace, table_name, _temp_dir) =
             get_partitioned_test_catalog_and_table(Some(false)).await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         let input_schema = provider.schema();
@@ -807,9 +858,10 @@ mod tests {
         use datafusion::datasource::TableProvider;
 
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
-            .await
-            .unwrap();
+        let table_provider =
+            IcebergStaticTableProvider::try_new_from_table(table.clone())
+                .await
+                .unwrap();
 
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -837,12 +889,16 @@ mod tests {
     async fn test_limit_pushdown_catalog_backed_provider() {
         use datafusion::datasource::TableProvider;
 
-        let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
 
-        let provider =
-            IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), table_name.clone())
-                .await
-                .unwrap();
+        let provider = IcebergTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.clone(),
+        )
+        .await
+        .unwrap();
 
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -868,9 +924,10 @@ mod tests {
         use datafusion::datasource::TableProvider;
 
         let table = get_test_table_from_metadata_file().await;
-        let table_provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
-            .await
-            .unwrap();
+        let table_provider =
+            IcebergStaticTableProvider::try_new_from_table(table.clone())
+                .await
+                .unwrap();
 
         let ctx = SessionContext::new();
         let state = ctx.state();

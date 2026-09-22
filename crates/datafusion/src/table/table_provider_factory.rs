@@ -196,7 +196,9 @@ fn check_cmd(cmd: &CreateExternalTable) -> Result<&str> {
 /// # See also
 /// - [`iceberg::NamespaceIdent`]
 /// - [`datafusion::sql::planner::SqlToRel::external_table_to_plan`]
-fn complement_namespace_if_necessary(table_name: &TableReference) -> Cow<'_, TableReference> {
+fn complement_namespace_if_necessary(
+    table_name: &TableReference,
+) -> Cow<'_, TableReference> {
     match table_name {
         TableReference::Bare { table } => {
             Cow::Owned(TableReference::partial("default", table.as_ref()))

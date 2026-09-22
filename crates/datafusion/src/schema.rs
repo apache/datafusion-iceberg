@@ -29,7 +29,9 @@ use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent,
+};
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
@@ -75,7 +77,9 @@ impl IcebergSchemaProvider {
         let providers = try_join_all(
             table_names
                 .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
+                .map(|name| {
+                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), name)
+                })
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -100,13 +104,11 @@ impl SchemaProvider for IcebergSchemaProvider {
             .iter()
             .flat_map(|entry| {
                 let table_name = entry.key().clone();
-                [table_name.clone()]
-                    .into_iter()
-                    .chain(
-                        MetadataTableType::all_types().map(move |metadata_table_name| {
-                            format!("{}${}", table_name, metadata_table_name.as_str())
-                        }),
-                    )
+                [table_name.clone()].into_iter().chain(
+                    MetadataTableType::all_types().map(move |metadata_table_name| {
+                        format!("{}${}", table_name, metadata_table_name.as_str())
+                    }),
+                )
             })
             .collect()
     }
@@ -122,8 +124,8 @@ impl SchemaProvider for IcebergSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
-            let metadata_table_type =
-                MetadataTableType::try_from(metadata_table_name).map_err(DataFusionError::Plan)?;
+            let metadata_table_type = MetadataTableType::try_from(metadata_table_name)
+                .map_err(DataFusionError::Plan)?;
             if let Some(table) = self.tables.get(table_name) {
                 let metadata_table = table
                     .metadata_table(metadata_table_type)
@@ -246,8 +248,9 @@ impl SchemaProvider for IcebergSchemaProvider {
             })
         });
 
-        futures::executor::block_on(result)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}")))?
+        futures::executor::block_on(result).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}"))
+        })?
     }
 }
 
@@ -258,7 +261,9 @@ async fn ensure_table_is_empty(table: &Arc<dyn TableProvider>) -> Result<()> {
     let exec_plan = table
         .scan(&session_ctx.state(), None, &[], Some(1))
         .await
-        .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to scan table: {e}")))?;
+        .map_err(|e| {
+            Error::new(ErrorKind::Unexpected, format!("Failed to scan table: {e}"))
+        })?;
 
     let task_ctx = Arc::new(TaskContext::default());
     let stream = exec_plan.execute(0, task_ctx).map_err(|e| {
@@ -306,7 +311,10 @@ mod tests {
         let catalog = MemoryCatalogBuilder::default()
             .load(
                 "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse_path.clone(),
+                )]),
             )
             .await
             .unwrap();
@@ -346,7 +354,8 @@ mod tests {
         let mem_table = MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap();
 
         // Attempt to register the table with data - should fail
-        let result = schema_provider.register_table("test_table".to_string(), Arc::new(mem_table));
+        let result =
+            schema_provider.register_table("test_table".to_string(), Arc::new(mem_table));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -372,7 +381,8 @@ mod tests {
         let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
 
         // Attempt to register the empty table - should succeed
-        let result = schema_provider.register_table("empty_table".to_string(), Arc::new(mem_table));
+        let result = schema_provider
+            .register_table("empty_table".to_string(), Arc::new(mem_table));
 
         assert!(result.is_ok(), "Expected success, got: {result:?}");
 
@@ -393,15 +403,19 @@ mod tests {
 
         let empty_batch1 = RecordBatch::new_empty(arrow_schema.clone());
         let empty_batch2 = RecordBatch::new_empty(arrow_schema.clone());
-        let mem_table1 = MemTable::try_new(arrow_schema.clone(), vec![vec![empty_batch1]]).unwrap();
-        let mem_table2 = MemTable::try_new(arrow_schema, vec![vec![empty_batch2]]).unwrap();
+        let mem_table1 =
+            MemTable::try_new(arrow_schema.clone(), vec![vec![empty_batch1]]).unwrap();
+        let mem_table2 =
+            MemTable::try_new(arrow_schema, vec![vec![empty_batch2]]).unwrap();
 
         // Register first table - should succeed
-        let result1 = schema_provider.register_table("dup_table".to_string(), Arc::new(mem_table1));
+        let result1 =
+            schema_provider.register_table("dup_table".to_string(), Arc::new(mem_table1));
         assert!(result1.is_ok());
 
         // Register second table with same name - should fail
-        let result2 = schema_provider.register_table("dup_table".to_string(), Arc::new(mem_table2));
+        let result2 =
+            schema_provider.register_table("dup_table".to_string(), Arc::new(mem_table2));
         assert!(result2.is_err());
         let err = result2.unwrap_err();
         assert!(
@@ -425,7 +439,8 @@ mod tests {
         let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
 
         // Register the table
-        let result = schema_provider.register_table("drop_me".to_string(), Arc::new(mem_table));
+        let result =
+            schema_provider.register_table("drop_me".to_string(), Arc::new(mem_table));
         assert!(result.is_ok());
         assert!(schema_provider.table_exist("drop_me"));
 

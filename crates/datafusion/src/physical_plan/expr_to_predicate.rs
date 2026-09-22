@@ -21,7 +21,9 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
-use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
+use iceberg::expr::{
+    BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression,
+};
 use iceberg::spec::{Datum, PrimitiveLiteral};
 
 // A datafusion expression could be an Iceberg predicate, column, or literal.
@@ -76,7 +78,9 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             let right = to_iceberg_predicate(&binary.right);
             let op = to_iceberg_operation(binary.op);
             match op {
-                OpTransformedResult::Operator(op) => to_iceberg_binary_predicate(left, right, op),
+                OpTransformedResult::Operator(op) => {
+                    to_iceberg_binary_predicate(left, right, op)
+                }
                 OpTransformedResult::And => to_iceberg_and_predicate(left, right),
                 OpTransformedResult::Or => to_iceberg_or_predicate(left, right),
                 OpTransformedResult::NotTransformed => TransformedResult::NotTransformed,
@@ -88,11 +92,13 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
                 TransformedResult::Predicate(p) => TransformedResult::Predicate(!p),
                 TransformedResult::Column(column) => {
                     // NOT of a bare boolean column: NOT col => col = false
-                    TransformedResult::Predicate(Predicate::Binary(BinaryExpression::new(
-                        PredicateOperator::Eq,
-                        column,
-                        Datum::bool(false),
-                    )))
+                    TransformedResult::Predicate(Predicate::Binary(
+                        BinaryExpression::new(
+                            PredicateOperator::Eq,
+                            column,
+                            Datum::bool(false),
+                        ),
+                    ))
                 }
                 _ => TransformedResult::NotTransformed,
             }
@@ -124,23 +130,24 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         Expr::IsNull(expr) => {
             let p = to_iceberg_predicate(expr);
             match p {
-                TransformedResult::Column(r) => TransformedResult::Predicate(Predicate::Unary(
-                    UnaryExpression::new(PredicateOperator::IsNull, r),
-                )),
+                TransformedResult::Column(r) => TransformedResult::Predicate(
+                    Predicate::Unary(UnaryExpression::new(PredicateOperator::IsNull, r)),
+                ),
                 _ => TransformedResult::NotTransformed,
             }
         }
         Expr::IsNotNull(expr) => {
             let p = to_iceberg_predicate(expr);
             match p {
-                TransformedResult::Column(r) => TransformedResult::Predicate(Predicate::Unary(
-                    UnaryExpression::new(PredicateOperator::NotNull, r),
-                )),
+                TransformedResult::Column(r) => TransformedResult::Predicate(
+                    Predicate::Unary(UnaryExpression::new(PredicateOperator::NotNull, r)),
+                ),
                 _ => TransformedResult::NotTransformed,
             }
         }
         Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32 || *c.field.data_type() == DataType::Date64
+            if *c.field.data_type() == DataType::Date32
+                || *c.field.data_type() == DataType::Date64
             {
                 // Casts to date truncate the expression, we cannot simply extract it as it
                 // can create erroneous predicates.
@@ -212,7 +219,9 @@ fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
         Operator::Lt => OpTransformedResult::Operator(PredicateOperator::LessThan),
         Operator::LtEq => OpTransformedResult::Operator(PredicateOperator::LessThanOrEq),
         Operator::Gt => OpTransformedResult::Operator(PredicateOperator::GreaterThan),
-        Operator::GtEq => OpTransformedResult::Operator(PredicateOperator::GreaterThanOrEq),
+        Operator::GtEq => {
+            OpTransformedResult::Operator(PredicateOperator::GreaterThanOrEq)
+        }
         // AND OR
         Operator::And => OpTransformedResult::And,
         Operator::Or => OpTransformedResult::Or,
@@ -224,7 +233,10 @@ fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
 /// Translates a DataFusion scalar function into an Iceberg predicate.
 /// Unlike dedicated Expr variants (e.g. `Expr::IsNull`), scalar functions are
 /// identified by name at runtime, so we need to handle them here.
-fn scalar_function_to_iceberg_predicate(func_name: &str, args: &[Expr]) -> TransformedResult {
+fn scalar_function_to_iceberg_predicate(
+    func_name: &str,
+    args: &[Expr],
+) -> TransformedResult {
     match func_name {
         "isnan" if args.len() == 1 => match resolve_nan_preserving_reference(&args[0]) {
             Some(r) => TransformedResult::Predicate(r.is_nan()),
@@ -369,7 +381,10 @@ fn to_iceberg_and_predicate(
     }
 }
 
-fn to_iceberg_or_predicate(left: TransformedResult, right: TransformedResult) -> TransformedResult {
+fn to_iceberg_or_predicate(
+    left: TransformedResult,
+    right: TransformedResult,
+) -> TransformedResult {
     match (left, right) {
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.or(right))
@@ -384,8 +399,12 @@ fn to_iceberg_binary_predicate(
     op: PredicateOperator,
 ) -> TransformedResult {
     let (r, d, op) = match (left, right) {
-        (TransformedResult::NotTransformed, _) => return TransformedResult::NotTransformed,
-        (_, TransformedResult::NotTransformed) => return TransformedResult::NotTransformed,
+        (TransformedResult::NotTransformed, _) => {
+            return TransformedResult::NotTransformed;
+        }
+        (_, TransformedResult::NotTransformed) => {
+            return TransformedResult::NotTransformed;
+        }
         (TransformedResult::Column(r), TransformedResult::Literal(d)) => (r, d, op),
         (TransformedResult::Literal(d), TransformedResult::Column(r)) => {
             (r, d, reverse_predicate_operator(op))
@@ -430,7 +449,9 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         // DataFusion's type coercion always converts them to match the column type
         // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
         // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => {
+            Some(Datum::timestamp_micros(*v))
+        }
         ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
         _ => None,
     }
@@ -451,23 +472,24 @@ mod tests {
     use super::convert_filters_to_predicate;
 
     fn create_test_schema() -> DFSchema {
-        let arrow_schema = Schema::new(vec![
-            Field::new("foo", DataType::Int32, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-            Field::new("bar", DataType::Utf8, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )])),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), true).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
-            ),
-            Field::new("qux", DataType::Float64, true).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "4".to_string(),
-            )])),
-        ]);
+        let arrow_schema =
+            Schema::new(vec![
+                Field::new("foo", DataType::Int32, true).with_metadata(HashMap::from([
+                    (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                ])),
+                Field::new("bar", DataType::Utf8, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )])),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), true)
+                    .with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "3".to_string(),
+                    )])),
+                Field::new("qux", DataType::Float64, true).with_metadata(HashMap::from(
+                    [(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())],
+                )),
+            ]);
         DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
     }
 
@@ -640,8 +662,8 @@ mod tests {
     fn test_predicate_conversion_with_cast() {
         let sql = "ts >= timestamp '2023-01-05T00:00:00'";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
-        let expected_predicate =
-            Reference::new("ts").greater_than_or_equal_to(Datum::string("2023-01-05T00:00:00"));
+        let expected_predicate = Reference::new("ts")
+            .greater_than_or_equal_to(Datum::string("2023-01-05T00:00:00"));
         assert_eq!(predicate, expected_predicate);
     }
 
@@ -658,18 +680,23 @@ mod tests {
 
         // Test TimestampMicrosecond - maps directly to Datum::timestamp_micros
         let ts_micros = 1672876800000000i64; // 2023-01-05 00:00:00 UTC in microseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(Some(ts_micros), None));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(
+            Some(ts_micros),
+            None,
+        ));
         assert_eq!(datum, Some(Datum::timestamp_micros(ts_micros)));
 
         // Test TimestampNanosecond - maps to Datum::timestamp_nanos to preserve precision
         let ts_nanos = 1672876800000000500i64; // 2023-01-05 00:00:00.000000500 UTC in nanoseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(
+            Some(ts_nanos),
+            None,
+        ));
         assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
 
         // Test None timestamp
-        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
         assert_eq!(datum, None);
 
         // Note: TimestampSecond and TimestampMillisecond are not supported because
@@ -678,13 +705,17 @@ mod tests {
         //
         // These return None (not pushed down):
         let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampSecond(
+            Some(ts_seconds),
+            None,
+        ));
         assert_eq!(datum, None);
 
         let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
-        let datum =
-            super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(
+            Some(ts_millis),
+            None,
+        ));
         assert_eq!(datum, None);
     }
 
@@ -693,10 +724,12 @@ mod tests {
         use datafusion::common::ScalarValue;
 
         let bytes = vec![1u8, 2u8, 3u8];
-        let datum = super::scalar_value_to_datum(&ScalarValue::Binary(Some(bytes.clone())));
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::Binary(Some(bytes.clone())));
         assert_eq!(datum, Some(Datum::binary(bytes.clone())));
 
-        let datum = super::scalar_value_to_datum(&ScalarValue::LargeBinary(Some(bytes.clone())));
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::LargeBinary(Some(bytes.clone())));
         assert_eq!(datum, Some(Datum::binary(bytes)));
 
         let datum = super::scalar_value_to_datum(&ScalarValue::Binary(None));
@@ -892,7 +925,8 @@ mod tests {
     #[test]
     fn test_predicate_conversion_with_isnan_nested_expr() {
         // Nested NaN-preserving transformations resolve to the inner column
-        let predicate = convert_to_iceberg_predicate("isnan(-(abs(qux) + 1) * 3)").unwrap();
+        let predicate =
+            convert_to_iceberg_predicate("isnan(-(abs(qux) + 1) * 3)").unwrap();
         assert_eq!(predicate, Reference::new("qux").is_nan());
     }
 

@@ -73,7 +73,9 @@ impl ExecutionPlan for IcebergMetadataScan {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> datafusion::error::Result<TreeNodeRecursion>,
     ) -> datafusion::error::Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }

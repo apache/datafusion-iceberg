@@ -171,15 +171,16 @@ fn determine_partitioning_strategy(
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit,
+        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
+        TimeUnit,
     };
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::empty::EmptyExec;
     use iceberg::TableIdent;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
-        Transform, Type,
+        NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField,
+        SortOrder, Transform, Type,
     };
     use iceberg::table::Table;
     use iceberg::test_utils::test_runtime;
@@ -258,7 +259,8 @@ mod tests {
         let input = Arc::new(EmptyExec::new(create_test_arrow_schema()));
 
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(8).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(8).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         match partitioning {
@@ -310,7 +312,8 @@ mod tests {
         let input = Arc::new(EmptyExec::new(create_test_arrow_schema()));
 
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(3).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(3).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         match partitioning {
@@ -384,7 +387,8 @@ mod tests {
         ]));
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         // For bucketed tables without _partition column, should use round-robin
@@ -453,7 +457,9 @@ mod tests {
         let table_metadata = table_metadata_builder.build().unwrap();
         let table = Table::builder()
             .metadata(table_metadata.metadata)
-            .identifier(TableIdent::from_strs(["test", "partitioned_bucketed_table"]).unwrap())
+            .identifier(
+                TableIdent::from_strs(["test", "partitioned_bucketed_table"]).unwrap(),
+            )
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/partitioned_bucketed_metadata.json")
             .runtime(test_runtime())
@@ -472,7 +478,8 @@ mod tests {
         ]));
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         match partitioning {
@@ -542,7 +549,8 @@ mod tests {
 
         let input = Arc::new(EmptyExec::new(create_test_arrow_schema()));
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         assert!(
@@ -620,7 +628,8 @@ mod tests {
         ]));
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         assert!(
@@ -674,7 +683,9 @@ mod tests {
         let table_metadata = table_metadata_builder.build().unwrap();
         let table = Table::builder()
             .metadata(table_metadata.metadata)
-            .identifier(TableIdent::from_strs(["test", "mixed_transforms_table"]).unwrap())
+            .identifier(
+                TableIdent::from_strs(["test", "mixed_transforms_table"]).unwrap(),
+            )
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/mixed_transforms_metadata.json")
             .runtime(test_runtime())
@@ -693,7 +704,8 @@ mod tests {
         ]));
         let input = Arc::new(EmptyExec::new(arrow_schema));
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         match partitioning {
@@ -776,7 +788,8 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
 
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         assert!(
@@ -842,7 +855,8 @@ mod tests {
         let input = Arc::new(EmptyExec::new(arrow_schema));
 
         let repartitioned_plan =
-            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap()).unwrap();
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
 
         let partitioning = repartitioned_plan.properties().output_partitioning();
         assert!(

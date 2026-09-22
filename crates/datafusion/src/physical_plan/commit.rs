@@ -28,7 +28,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
 use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::spec::{DataFile, deserialize_data_file_from_json};
@@ -85,12 +87,13 @@ impl IcebergCommitExec {
     fn make_count_batch(count: u64) -> DFResult<RecordBatch> {
         let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
 
-        RecordBatch::try_from_iter_with_nullable(vec![("count", count_array, false)]).map_err(|e| {
-            DataFusionError::ArrowError(
-                Box::new(e),
-                Some("Failed to make count batch!".to_string()),
-            )
-        })
+        RecordBatch::try_from_iter_with_nullable(vec![("count", count_array, false)])
+            .map_err(|e| {
+                DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("Failed to make count batch!".to_string()),
+                )
+            })
     }
 
     fn make_count_schema() -> ArrowSchemaRef {
@@ -144,8 +147,13 @@ impl ExecutionPlan for IcebergCommitExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
-        vec![datafusion::physical_plan::Distribution::SinglePartition; self.children().len()]
+    fn required_input_distribution(
+        &self,
+    ) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![
+            datafusion::physical_plan::Distribution::SinglePartition;
+            self.children().len()
+        ]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -236,7 +244,8 @@ impl ExecutionPlan for IcebergCommitExec {
                     .collect::<datafusion::common::Result<_>>()?;
 
                 // add record_counts from the current batch to total record count
-                total_record_count += batch_files.iter().map(|f| f.record_count()).sum::<u64>();
+                total_record_count +=
+                    batch_files.iter().map(|f| f.record_count()).sum::<u64>();
 
                 // Add all deserialized files to our collection
                 data_files.extend(batch_files);
@@ -276,7 +285,9 @@ mod tests {
     use std::fmt;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array};
+    use datafusion::arrow::array::{
+        ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::datasource::MemTable;
     use datafusion::execution::context::TaskContext;
@@ -284,13 +295,15 @@ mod tests {
     use datafusion::physical_plan::common::collect;
     use datafusion::physical_plan::execution_plan::Boundedness;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    };
     use datafusion::prelude::*;
     use futures::StreamExt;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
-        Struct, Type,
+        DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType,
+        Schema, Struct, Type,
     };
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
@@ -366,7 +379,8 @@ mod tests {
             _context: Arc<TaskContext>,
         ) -> datafusion::common::Result<SendableRecordBatchStream> {
             // Create a record batch with the serialized data files
-            let array = Arc::new(StringArray::from(self.data_files_json.clone())) as ArrayRef;
+            let array =
+                Arc::new(StringArray::from(self.data_files_json.clone())) as ArrayRef;
             let batch = RecordBatch::try_new(self.schema.clone(), vec![array])?;
 
             // Create a stream that returns this batch
@@ -415,8 +429,10 @@ mod tests {
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()?;
 
@@ -466,7 +482,8 @@ mod tests {
         )?;
 
         // Create a mock execution plan that returns the serialized data files
-        let input_exec = Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]));
+        let input_exec =
+            Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]));
 
         // Create the IcebergCommitExec
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -475,8 +492,12 @@ mod tests {
             false,
         )]));
 
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            catalog.clone(),
+            input_exec,
+            arrow_schema,
+        );
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
@@ -537,7 +558,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_iceberg_commit_exec_empty_insert() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_iceberg_commit_exec_empty_insert()
+    -> Result<(), Box<dyn std::error::Error>> {
         let catalog = Arc::new(
             MemoryCatalogBuilder::default()
                 .load(
@@ -557,7 +579,8 @@ mod tests {
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
             ])
             .build()?;
 
@@ -578,8 +601,12 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(
+            table.clone(),
+            catalog.clone(),
+            input_exec,
+            arrow_schema,
+        );
 
         let task_ctx = Arc::new(TaskContext::default());
         let stream = commit_exec.execute(0, task_ctx)?;
@@ -600,7 +627,8 @@ mod tests {
         // No new snapshot should be created for an empty insert
         let updated_table = catalog
             .load_table(
-                &TableIdent::from_strs(["test_empty_insert", "empty_insert_table"]).unwrap(),
+                &TableIdent::from_strs(["test_empty_insert", "empty_insert_table"])
+                    .unwrap(),
             )
             .await?;
         let snapshot_count_after = updated_table.metadata().snapshots().len();
@@ -614,8 +642,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_datafusion_execution_partitioned_source() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_datafusion_execution_partitioned_source()
+    -> Result<(), Box<dyn std::error::Error>> {
         let catalog = Arc::new(
             MemoryCatalogBuilder::default()
                 .load(
@@ -634,8 +662,10 @@ mod tests {
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()?;
 
@@ -659,7 +689,8 @@ mod tests {
                     arrow_schema.clone(),
                     vec![
                         Arc::new(Int32Array::from(vec![idx])) as ArrayRef,
-                        Arc::new(StringArray::from(vec![format!("Name{idx}")])) as ArrayRef,
+                        Arc::new(StringArray::from(vec![format!("Name{idx}")]))
+                            as ArrayRef,
                     ],
                 )
             })
@@ -673,7 +704,8 @@ mod tests {
         // Create multiple partitions - each batch becomes a separate partition
         let partitions: Vec<Vec<RecordBatch>> =
             batches.into_iter().map(|batch| vec![batch]).collect();
-        let source_table = Arc::new(MemTable::try_new(Arc::clone(&arrow_schema), partitions)?);
+        let source_table =
+            Arc::new(MemTable::try_new(Arc::clone(&arrow_schema), partitions)?);
         ctx.register_table("source_table", source_table)?;
 
         let iceberg_table_provider = IcebergTableProvider::try_new(

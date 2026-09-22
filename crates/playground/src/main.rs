@@ -87,7 +87,8 @@ async fn main_inner() -> anyhow::Result<()> {
     let runtime_env = rt_builder.build_arc()?;
 
     // enable dynamic file query
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env).enable_url_table();
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env)
+        .enable_url_table();
     ctx.refresh_catalogs().await?;
 
     let mut print_options = PrintOptions {

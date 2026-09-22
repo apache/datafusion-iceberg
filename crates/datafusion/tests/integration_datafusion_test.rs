@@ -34,7 +34,8 @@ use iceberg::spec::{
 };
 use iceberg::test_utils::check_record_batches;
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation,
+    TableIdent,
 };
 use tempfile::TempDir;
 
@@ -61,7 +62,10 @@ fn get_struct_type() -> StructType {
     ])
 }
 
-async fn set_test_namespace(catalog: &MemoryCatalog, namespace: &NamespaceIdent) -> Result<()> {
+async fn set_test_namespace(
+    catalog: &MemoryCatalog,
+    namespace: &NamespaceIdent,
+) -> Result<()> {
     let properties = HashMap::new();
 
     catalog.create_namespace(namespace, properties).await?;
@@ -78,8 +82,10 @@ fn get_table_creation(
         None => Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()?,
         Some(schema) => schema,
@@ -216,7 +222,8 @@ async fn test_table_projection() -> Result<()> {
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String))
+                .into(),
             NestedField::optional(3, "foo3", Type::Struct(get_struct_type())).into(),
         ])
         .build()?;
@@ -284,7 +291,8 @@ async fn test_table_predict_pushdown() -> Result<()> {
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String))
+                .into(),
         ])
         .build()?;
     let creation = get_table_creation(temp_path(), "t1", Some(schema))?;
@@ -329,7 +337,8 @@ async fn test_metadata_table() -> Result<()> {
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String))
+                .into(),
         ])
         .build()?;
     let creation = get_table_creation(temp_path(), "t1", Some(schema))?;
@@ -536,9 +545,16 @@ fn get_nested_struct_type() -> StructType {
             10,
             "address",
             Type::Struct(StructType::new(vec![
-                NestedField::optional(11, "street", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(12, "city", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(13, "zip", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(
+                    11,
+                    "street",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::optional(12, "city", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::optional(13, "zip", Type::Primitive(PrimitiveType::Int))
+                    .into(),
             ])),
         )
         .into(),
@@ -546,8 +562,18 @@ fn get_nested_struct_type() -> StructType {
             20,
             "contact",
             Type::Struct(StructType::new(vec![
-                NestedField::optional(21, "email", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(22, "phone", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(
+                    21,
+                    "email",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::optional(
+                    22,
+                    "phone",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
             ])),
         )
         .into(),
@@ -566,8 +592,10 @@ async fn test_insert_into_nested() -> Result<()> {
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-            NestedField::optional(3, "profile", Type::Struct(get_nested_struct_type())).into(),
+            NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::optional(3, "profile", Type::Struct(get_nested_struct_type()))
+                .into(),
         ])
         .build()?;
 
@@ -821,8 +849,10 @@ async fn test_insert_into_partitioned() -> Result<()> {
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
-            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::required(3, "value", Type::Primitive(PrimitiveType::String))
+                .into(),
         ])
         .build()?;
 

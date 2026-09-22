@@ -68,7 +68,8 @@ pub(crate) struct IcebergWriteExec {
 
 impl IcebergWriteExec {
     pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
-        let plan_properties = Self::compute_properties(&input, Self::make_result_schema());
+        let plan_properties =
+            Self::compute_properties(&input, Self::make_result_schema());
 
         Self {
             table,
@@ -84,7 +85,9 @@ impl IcebergWriteExec {
     ) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count()),
+            Partitioning::UnknownPartitioning(
+                input.output_partitioning().partition_count(),
+            ),
             EmissionType::Final,
             Boundedness::Bounded,
         ))
@@ -216,27 +219,30 @@ impl ExecutionPlan for IcebergWriteExec {
         let write_format_default = table_props
             .write_format_default()
             .map_err(to_datafusion_error)?;
-        let file_format =
-            DataFileFormat::from_str(&write_format_default).map_err(to_datafusion_error)?;
+        let file_format = DataFileFormat::from_str(&write_format_default)
+            .map_err(to_datafusion_error)?;
         if file_format != DataFileFormat::Parquet {
             return Err(to_datafusion_error(Error::new(
                 ErrorKind::FeatureUnsupported,
-                format!("File format {file_format} is not supported for insert_into yet!"),
+                format!(
+                    "File format {file_format} is not supported for insert_into yet!"
+                ),
             )));
         }
 
         // Build the writer from the already-parsed table properties so it honors
         // `write.parquet.*` settings (e.g. CDC). Arrow batches flowing through
         // DataFusion carry no field-id metadata, so match fields by name.
-        let mut parquet_file_writer_builder = ParquetWriterBuilder::from_table_properties(
-            &table_props,
-            self.table.metadata().current_schema().clone(),
-        )
-        .map_err(to_datafusion_error)?
-        .with_match_mode(FieldMatchMode::Name);
+        let mut parquet_file_writer_builder =
+            ParquetWriterBuilder::from_table_properties(
+                &table_props,
+                self.table.metadata().current_schema().clone(),
+            )
+            .map_err(to_datafusion_error)?
+            .with_match_mode(FieldMatchMode::Name);
         if let Some(encryption_manager) = self.table.encryption_manager() {
-            parquet_file_writer_builder =
-                parquet_file_writer_builder.with_encryption_manager(encryption_manager.clone());
+            parquet_file_writer_builder = parquet_file_writer_builder
+                .with_encryption_manager(encryption_manager.clone());
         }
         let target_file_size = table_props
             .write_target_file_size_bytes()
@@ -244,8 +250,8 @@ impl ExecutionPlan for IcebergWriteExec {
 
         let file_io = self.table.file_io().clone();
         // todo location_gen and file_name_gen should be configurable
-        let location_generator =
-            DefaultLocationGenerator::new(self.table.metadata()).map_err(to_datafusion_error)?;
+        let location_generator = DefaultLocationGenerator::new(self.table.metadata())
+            .map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
             DefaultFileNameGenerator::new(Uuid::now_v7().to_string(), None, file_format);
@@ -299,8 +305,12 @@ impl ExecutionPlan for IcebergWriteExec {
             let data_files_strs: Vec<String> = data_files
                 .into_iter()
                 .map(|data_file| {
-                    serialize_data_file_to_json(data_file, &partition_type, format_version)
-                        .map_err(to_datafusion_error)
+                    serialize_data_file_to_json(
+                        data_file,
+                        &partition_type,
+                        format_version,
+                    )
+                    .map_err(to_datafusion_error)
                 })
                 .collect::<DFResult<Vec<String>>>()?;
 
@@ -330,13 +340,18 @@ mod tests {
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    };
     use futures::{StreamExt, stream};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataFileFormat, NestedField, PrimitiveType, Schema, Type, deserialize_data_file_from_json,
+        DataFileFormat, NestedField, PrimitiveType, Schema, Type,
+        deserialize_data_file_from_json,
     };
-    use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation};
+    use iceberg::{
+        Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation,
+    };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use tempfile::TempDir;
 
@@ -447,8 +462,10 @@ mod tests {
         Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()
     }
@@ -488,27 +505,28 @@ mod tests {
         let table = iceberg_catalog.create_table(&namespace, creation).await?;
 
         // 2. Create test data
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )])),
-            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )])),
-        ]));
+        let arrow_schema =
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([
+                    (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                ])),
+                Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([
+                    (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
+                ])),
+            ]));
 
         let id_array = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
-        let name_array = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef;
+        let name_array =
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef;
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![id_array, name_array])
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to create record batch: {e}"),
-                )
-            })?;
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![id_array, name_array])
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to create record batch: {e}"),
+                    )
+                })?;
 
         // 3. Create mock input execution plan
         let input_plan = Arc::new(MockExecutionPlan::new(
@@ -544,7 +562,11 @@ mod tests {
         // Check schema
         assert_eq!(
             result_batch.schema().as_ref(),
-            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)])
+            &ArrowSchema::new(vec![Field::new(
+                DATA_FILES_COL_NAME,
+                DataType::Utf8,
+                false
+            )])
         );
 
         // Check data
@@ -563,9 +585,13 @@ mod tests {
         let spec_id = table.metadata().default_partition_spec_id();
         let schema = table.metadata().current_schema();
 
-        let data_file =
-            deserialize_data_file_from_json(data_file_json, spec_id, partition_type, schema)
-                .expect("Failed to deserialize data file JSON");
+        let data_file = deserialize_data_file_from_json(
+            data_file_json,
+            spec_id,
+            partition_type,
+            schema,
+        )
+        .expect("Failed to deserialize data file JSON");
 
         // Verify data file properties
         assert_eq!(
@@ -606,11 +632,13 @@ mod tests {
 
         // Verify lower and upper bounds
         assert!(
-            data_file.lower_bounds().contains_key(&1) || data_file.lower_bounds().contains_key(&2),
+            data_file.lower_bounds().contains_key(&1)
+                || data_file.lower_bounds().contains_key(&2),
             "Expected lower bounds to contain at least one column"
         );
         assert!(
-            data_file.upper_bounds().contains_key(&1) || data_file.upper_bounds().contains_key(&2),
+            data_file.upper_bounds().contains_key(&1)
+                || data_file.upper_bounds().contains_key(&2),
             "Expected upper bounds to contain at least one column"
         );
 
@@ -645,7 +673,11 @@ mod tests {
 
         assert_eq!(
             write_exec.schema().as_ref(),
-            &ArrowSchema::new(vec![Field::new(DATA_FILES_COL_NAME, DataType::Utf8, false)]),
+            &ArrowSchema::new(vec![Field::new(
+                DATA_FILES_COL_NAME,
+                DataType::Utf8,
+                false
+            )]),
             "IcebergWriteExec should advertise the data_files schema, not the table schema"
         );
 

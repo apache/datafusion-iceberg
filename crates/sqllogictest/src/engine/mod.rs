@@ -55,7 +55,9 @@ pub trait EngineRunner: Send {
 
 pub async fn load_engine_runner(config: EngineConfig) -> Result<Box<dyn EngineRunner>> {
     match config {
-        EngineConfig::Datafusion { catalog } => Ok(Box::new(DataFusionEngine::new(catalog).await?)),
+        EngineConfig::Datafusion { catalog } => {
+            Ok(Box::new(DataFusionEngine::new(catalog).await?))
+        }
     }
 }
 
@@ -68,7 +70,8 @@ where
     M: MakeConnection<Conn = D> + Send + 'static,
 {
     let path = step_slt_file.as_ref().canonicalize()?;
-    let records = parse_file(&path).map_err(|e| Error(anyhow!("parsing slt file failed: {e}")))?;
+    let records =
+        parse_file(&path).map_err(|e| Error(anyhow!("parsing slt file failed: {e}")))?;
 
     for record in records {
         if let Err(err) = runner.run_async(record).await {

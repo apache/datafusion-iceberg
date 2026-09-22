@@ -42,7 +42,9 @@ use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
 /// # Returns
 /// * `Ok(Arc<dyn ExecutionPlan>)` - A SortExec that sorts by partition values
 /// * `Err` - If the partition column is not found
-pub(crate) fn sort_by_partition(input: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
+pub(crate) fn sort_by_partition(
+    input: Arc<dyn ExecutionPlan>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
     let schema = input.schema();
 
     // Find the partition column in the schema
@@ -68,7 +70,9 @@ pub(crate) fn sort_by_partition(input: Arc<dyn ExecutionPlan>) -> DFResult<Arc<d
     // Create a SortExec with preserve_partitioning=true to ensure the output partitioning
     // is the same as the input partitioning, and the data is sorted within each partition
     let lex_ordering = LexOrdering::new(vec![sort_expr]).ok_or_else(|| {
-        DataFusionError::Plan("Failed to create LexOrdering from sort expression".to_string())
+        DataFusionError::Plan(
+            "Failed to create LexOrdering from sort expression".to_string(),
+        )
     })?;
 
     let sort_exec = SortExec::new(lex_ordering, input).with_preserve_partitioning(true);
@@ -109,9 +113,11 @@ mod tests {
             Arc::new(Int32Array::from(vec![3, 1, 2])) as _,
         )]));
 
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![id_array, name_array, partition_array])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![id_array, name_array, partition_array],
+        )
+        .unwrap();
 
         let ctx = SessionContext::new();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
@@ -207,9 +213,11 @@ mod tests {
             ),
         ]));
 
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![id_array, data_array, partition_array])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![id_array, data_array, partition_array],
+        )
+        .unwrap();
 
         let ctx = SessionContext::new();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();

@@ -26,7 +26,8 @@ use datafusion_sqllogictest::DataFusion;
 use iceberg::encryption::kms::MemoryKmsClientFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, TableProperties, Transform, Type, UnboundPartitionSpec,
+    NestedField, PrimitiveType, Schema, TableProperties, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use indicatif::ProgressBar;
@@ -121,9 +122,16 @@ impl DataFusionEngine {
     ) -> anyhow::Result<()> {
         let schema = Schema::builder()
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::required(2, "category", Type::Primitive(PrimitiveType::String)).into(),
-                NestedField::optional(3, "value", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(
+                    2,
+                    "category",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::optional(3, "value", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()?;
 
@@ -155,8 +163,10 @@ impl DataFusionEngine {
     ) -> anyhow::Result<()> {
         let schema = Schema::builder()
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "data", Type::Primitive(PrimitiveType::Binary)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::optional(2, "data", Type::Primitive(PrimitiveType::Binary))
+                    .into(),
             ])
             .build()?;
 
@@ -179,8 +189,10 @@ impl DataFusionEngine {
     ) -> anyhow::Result<()> {
         let schema = Schema::builder()
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
             ])
             .build()?;
 
