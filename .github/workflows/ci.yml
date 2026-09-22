@@ -27,7 +27,7 @@ on:
 # Cancel obsolete runs for the same pull request or branch. The three jobs below
 # keep this workflow well below ASF's 15-job recommended concurrency limit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 # CI needs no credentials beyond reading the source tree.
@@ -69,7 +69,8 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     env:
-      # Reduces cache size while preserving the optimized test build behavior.
+      # Incremental artifacts and debug info go unused in CI and only add cache
+      # size and build time.
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
