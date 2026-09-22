@@ -97,7 +97,8 @@ mod tests {
 
     #[test]
     fn encodes_iceberg_errors_with_native_datafusion_variants() {
-        let error = to_datafusion_error(Error::new(ErrorKind::DataInvalid, "invalid manifest"));
+        let error =
+            to_datafusion_error(Error::new(ErrorKind::DataInvalid, "invalid manifest"));
 
         assert!(matches!(
             error,
@@ -109,7 +110,9 @@ mod tests {
 
     #[test]
     fn maps_non_iceberg_datafusion_errors_to_unexpected() {
-        let error = from_datafusion_error(DataFusionError::Execution("worker failed".to_string()));
+        let error = from_datafusion_error(DataFusionError::Execution(
+            "worker failed".to_string(),
+        ));
 
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert_eq!(

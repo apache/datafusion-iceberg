@@ -263,8 +263,12 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
             SupportedWriter::Unpartitioned(writer) => {
                 writer.close().await.map_err(to_datafusion_error)
             }
-            SupportedWriter::Fanout(writer) => writer.close().await.map_err(to_datafusion_error),
-            SupportedWriter::Clustered(writer) => writer.close().await.map_err(to_datafusion_error),
+            SupportedWriter::Fanout(writer) => {
+                writer.close().await.map_err(to_datafusion_error)
+            }
+            SupportedWriter::Clustered(writer) => {
+                writer.close().await.map_err(to_datafusion_error)
+            }
         }
     }
 }
@@ -461,7 +465,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_writer_partitioned_fanout() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_task_writer_partitioned_fanout()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema_with_partition();
@@ -512,7 +517,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_writer_partitioned_clustered() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_task_writer_partitioned_clustered()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema_with_partition();
