@@ -30,7 +30,7 @@ use iceberg::arrow::{
     PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
     strip_metadata_from_schema,
 };
-use iceberg::spec::{PartitionSpec, SchemaRef};
+use iceberg::spec::{PartitionSpec, SchemaRef as IcebergSchemaRef};
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
@@ -99,32 +99,27 @@ pub fn project_with_partition(
 
 /// PhysicalExpr implementation for partition value calculation
 ///
-/// The [`PartitionValueCalculator`] cannot be serialized, so the spec and schema
-/// it was built from are retained: [`Self::try_new`] rebuilds from those.
+/// The [`PartitionValueCalculator`] cannot be serialized, so the spec and schema it
+/// was built from are retained for [`Self::try_new`] to rebuild from.
 #[derive(Debug, Clone)]
 pub struct PartitionExpr {
     calculator: Arc<PartitionValueCalculator>,
     partition_spec: Arc<PartitionSpec>,
-    table_schema: SchemaRef,
+    table_schema: IcebergSchemaRef,
 }
 
 impl PartitionExpr {
-    /// Builds the expression from the two inputs that define it.
+    /// Builds the expression from the spec and schema that define it.
     ///
-    /// The [`PartitionValueCalculator`] is built here rather than passed in, so the
-    /// retained spec and schema cannot drift from the calculator derived from them.
-    /// [`Self::partition_spec`] and [`Self::table_schema`] read them back, which is
-    /// what lets a distributed engine serialize the pair and rebuild an equal
-    /// expression on a worker.
+    /// The calculator is built here rather than passed in, so it cannot drift from
+    /// the retained inputs.
     ///
     /// # Errors
     ///
-    /// Returns an error if the spec cannot be bound to the schema: the spec is
-    /// unpartitioned, a partition field's `source_id` names no column in the
-    /// schema, or a transform is not supported for its source type.
+    /// Returns an error if the spec cannot be bound to the schema.
     pub fn try_new(
         partition_spec: Arc<PartitionSpec>,
-        table_schema: SchemaRef,
+        table_schema: IcebergSchemaRef,
     ) -> DFResult<Self> {
         let calculator = PartitionValueCalculator::try_new(
             partition_spec.as_ref(),
@@ -138,29 +133,22 @@ impl PartitionExpr {
         })
     }
 
-    /// The partition spec this expression computes values for.
-    ///
-    /// With [`Self::table_schema`], this is everything [`Self::try_new`] needs to
-    /// rebuild an equal expression.
+    /// The partition spec this expression computes values for. With
+    /// [`Self::table_schema`], all [`Self::try_new`] needs to rebuild an equal one.
     pub fn partition_spec(&self) -> &Arc<PartitionSpec> {
         &self.partition_spec
     }
 
-    /// The table schema the partition spec is bound to.
-    ///
-    /// Needed alongside [`Self::partition_spec`] to rebuild the expression: the spec
-    /// refers to columns by `source_id`, and only the schema resolves those to real
-    /// columns and fixes the partition type.
-    pub fn table_schema(&self) -> &SchemaRef {
+    /// The table schema the spec is bound to. Needed to rebuild: the spec refers to
+    /// columns by `source_id`, and only the schema resolves those.
+    pub fn table_schema(&self) -> &IcebergSchemaRef {
         &self.table_schema
     }
 }
 
-// Two PartitionExpr are equal when they compute the same partition values, which
-// is decided entirely by the partition spec and table schema. The calculator is
-// derived from those two, so it takes no part in the comparison: comparing it by
-// pointer would make an expression unequal to one rebuilt from its own accessors,
-// which is exactly what `try_new` exists to support.
+// Equal when they compute the same partition values, which the spec and schema
+// decide entirely. The calculator is derived from those two, so it takes no part:
+// comparing it by pointer would make an expression unequal to its own rebuild.
 impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
         self.partition_spec == other.partition_spec
@@ -223,9 +211,8 @@ impl std::fmt::Display for PartitionExpr {
 
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Neither PartitionSpec nor Schema implements Hash, so hash the ids that
-        // identify them. Equal expressions agree on both ids, which is all Hash
-        // requires; unequal ones may collide and are separated by PartialEq.
+        // Neither PartitionSpec nor Schema implements Hash, so hash their ids:
+        // equal expressions agree on both, and collisions fall through to eq.
         self.partition_spec.spec_id().hash(state);
         self.table_schema.schema_id().hash(state);
     }
@@ -233,6 +220,9 @@ impl std::hash::Hash for PartitionExpr {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
@@ -244,8 +234,6 @@ mod tests {
     use super::*;
 
     fn hash_of(expr: &PartitionExpr) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         expr.hash(&mut hasher);
         hasher.finish()
@@ -424,9 +412,8 @@ mod tests {
 
         let expr = PartitionExpr::try_new(partition_spec, table_schema).unwrap();
 
-        // Rebuild the way a codec would: from deep copies of what it read off the
-        // expression, so the two share nothing by pointer. Cloning the Arcs instead
-        // would let a pointer-based impl pass this test.
+        // Rebuild from deep copies, as a codec would; cloning the Arcs instead
+        // would let a pointer-based impl pass.
         let rebuilt = PartitionExpr::try_new(
             Arc::new(expr.partition_spec().as_ref().clone()),
             Arc::new(expr.table_schema().as_ref().clone()),
@@ -439,9 +426,8 @@ mod tests {
         };
         assert_eq!(&eval(&rebuilt), &eval(&expr));
 
-        // Computing the same values is not enough: a rebuilt expression must also
-        // compare and hash as the same expression, or plan-level equality and
-        // dedup treat the original and its round-tripped form as unrelated.
+        // Same values is not enough: it must also compare and hash as the same
+        // expression, or plan-level equality and dedup treat the two as unrelated.
         assert_eq!(rebuilt, expr);
         assert_eq!(hash_of(&rebuilt), hash_of(&expr));
     }
@@ -478,9 +464,8 @@ mod tests {
         // Genuinely different specs stay apart.
         assert_ne!(expr(spec(1, "id")), expr(spec(2, "part")));
 
-        // Equality must look past the ids that Hash uses. These share a spec_id and
-        // partition on different columns, so comparing ids alone would call them
-        // equal and silently conflate two different partitionings.
+        // Same spec_id, different partition column: comparing only the ids that
+        // Hash uses would wrongly call these equal.
         assert_ne!(expr(spec(7, "id")), expr(spec(7, "part")));
     }
 
