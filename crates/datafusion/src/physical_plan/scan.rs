@@ -22,7 +22,7 @@ use std::vec;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::error::Result as DFResult;
+use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -128,15 +128,15 @@ impl ExecutionPlan for IcebergTableScan {
 
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
 
@@ -148,7 +148,7 @@ impl ExecutionPlan for IcebergTableScan {
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
@@ -158,7 +158,7 @@ impl ExecutionPlan for IcebergTableScan {
         let stream = futures::stream::once(fut).try_flatten();
 
         // Apply limit if specified
-        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+        let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
             if let Some(limit) = self.limit {
                 let mut remaining = limit;
                 Box::pin(stream.try_filter_map(move |batch| {
@@ -217,7 +217,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
-) -> DFResult<Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>> {
+) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),

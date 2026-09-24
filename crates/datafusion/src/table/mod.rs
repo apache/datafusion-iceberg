@@ -34,9 +34,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::DataFusionError;
+use datafusion::common::{config_datafusion_err, exec_datafusion_err, not_impl_err};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -45,7 +45,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
-use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
@@ -87,8 +87,14 @@ impl IcebergTableProvider {
         let table_ident = TableIdent::new(namespace, name.into());
 
         // Load table once to get initial schema
-        let table = catalog.load_table(&table_ident).await?;
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
+        let schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
+        );
 
         Ok(IcebergTableProvider {
             catalog,
@@ -102,7 +108,11 @@ impl IcebergTableProvider {
         r#type: MetadataTableType,
     ) -> Result<IcebergMetadataTableProvider> {
         // Load fresh table metadata for metadata table access
-        let table = self.catalog.load_table(&self.table_ident).await?;
+        let table = self
+            .catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)?;
         Ok(IcebergMetadataTableProvider { table, r#type })
     }
 }
@@ -123,7 +133,7 @@ impl TableProvider for IcebergTableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // Load fresh table metadata from catalog
         let table = self
             .catalog
@@ -145,7 +155,7 @@ impl TableProvider for IcebergTableProvider {
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
@@ -155,11 +165,11 @@ impl TableProvider for IcebergTableProvider {
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if _insert_op != InsertOp::Append {
-            return Err(DataFusionError::NotImplemented(format!(
+            return not_impl_err!(
                 "IcebergTableProvider supports only append inserts, got {_insert_op}"
-            )));
+            );
         }
 
         // Load fresh table metadata from catalog
@@ -181,9 +191,7 @@ impl TableProvider for IcebergTableProvider {
         // Step 2: Repartition for parallel processing
         let target_partitions = NonZeroUsize::new(state.config().target_partitions())
             .ok_or_else(|| {
-                DataFusionError::Configuration(
-                    "target_partitions must be greater than 0".to_string(),
-                )
+                config_datafusion_err!("target_partitions must be greater than 0")
             })?;
 
         let repartitioned_plan =
@@ -195,19 +203,12 @@ impl TableProvider for IcebergTableProvider {
             .properties()
             .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
             .map(|value| {
-                value
-                    .parse::<bool>()
-                    .map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Invalid value for {}, expected 'true' or 'false'",
-                                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED
-                            ),
-                        )
-                        .with_source(e)
-                    })
-                    .map_err(to_datafusion_error)
+                value.parse::<bool>().map_err(|e| {
+                    config_datafusion_err!(
+                        "Invalid value for {}, expected 'true' or 'false': {e}",
+                        TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED
+                    )
+                })
             })
             .transpose()?
             .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
@@ -255,7 +256,10 @@ impl IcebergStaticTableProvider {
     ///
     /// Uses the table's current snapshot for all queries. Does not support write operations.
     pub async fn try_new_from_table(table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let schema = Arc::new(
+            schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(to_datafusion_error)?,
+        );
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: None,
@@ -275,16 +279,16 @@ impl IcebergStaticTableProvider {
             .metadata()
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "snapshot id {snapshot_id} not found in table {}",
-                        table.identifier().name()
-                    ),
+                exec_datafusion_err!(
+                    "snapshot id {snapshot_id} not found in table {}",
+                    table.identifier().name()
                 )
             })?;
-        let table_schema = snapshot.schema(table.metadata())?;
-        let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
+        let table_schema = snapshot
+            .schema(table.metadata())
+            .map_err(to_datafusion_error)?;
+        let schema =
+            Arc::new(schema_to_arrow_schema(&table_schema).map_err(to_datafusion_error)?);
         Ok(IcebergStaticTableProvider {
             table,
             snapshot_id: Some(snapshot_id),
@@ -309,7 +313,7 @@ impl TableProvider for IcebergStaticTableProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
         Ok(Arc::new(IcebergTableScan::new(
             self.table.clone(),
@@ -324,7 +328,7 @@ impl TableProvider for IcebergStaticTableProvider {
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
@@ -334,13 +338,11 @@ impl TableProvider for IcebergStaticTableProvider {
         _state: &dyn Session,
         _input: Arc<dyn ExecutionPlan>,
         _insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Err(to_datafusion_error(Error::new(
-            ErrorKind::FeatureUnsupported,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        not_impl_err!(
             "Write operations are not supported on IcebergStaticTableProvider. \
              Use IcebergTableProvider with a catalog for write support."
-                .to_string(),
-        )))
+        )
     }
 }
 
@@ -350,6 +352,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::common::Column;
+    use datafusion::error::DataFusionError;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
     use iceberg::io::FileIO;

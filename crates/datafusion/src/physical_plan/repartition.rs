@@ -18,7 +18,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::common::plan_err;
+use datafusion::error::Result;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -90,7 +91,7 @@ pub(crate) fn repartition(
     input: Arc<dyn ExecutionPlan>,
     table_metadata: TableMetadataRef,
     target_partitions: NonZeroUsize,
-) -> DFResult<Arc<dyn ExecutionPlan>> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     let partitioning_strategy =
         determine_partitioning_strategy(&input, &table_metadata, target_partitions)?;
 
@@ -125,7 +126,7 @@ fn determine_partitioning_strategy(
     input: &Arc<dyn ExecutionPlan>,
     table_metadata: &TableMetadata,
     target_partitions: NonZeroUsize,
-) -> DFResult<Partitioning> {
+) -> Result<Partitioning> {
     let partition_spec = table_metadata.default_partition_spec();
     let input_schema = input.schema();
     let target_partition_count = target_partitions.get();
@@ -158,10 +159,10 @@ fn determine_partitioning_strategy(
         }
 
         // Case 2: Partitioned table missing _partition column (normally this should not happen)
-        (true, Err(_)) => Err(DataFusionError::Plan(format!(
+        (true, Err(_)) => plan_err!(
             "Partitioned table input missing {PROJECTED_PARTITION_VALUE_COLUMN} column. \
              Ensure projection happens before repartitioning."
-        ))),
+        ),
 
         // Case 3: Unpartitioned table, always use RoundRobinBatch
         (false, _) => Ok(Partitioning::RoundRobinBatch(target_partition_count)),

@@ -44,8 +44,6 @@ github:
   protected_branches:
     main:
       required_status_checks:
-        # Require branches to be up-to-date before merging.
-        strict: true
         contexts:
           - "Format"
           - "Clippy"

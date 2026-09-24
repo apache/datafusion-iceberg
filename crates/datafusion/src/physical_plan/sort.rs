@@ -20,8 +20,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
-use datafusion::common::Result as DFResult;
-use datafusion::error::DataFusionError;
+use datafusion::common::plan_datafusion_err;
+use datafusion::error::Result;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::expressions::Column;
@@ -44,17 +44,15 @@ use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
 /// * `Err` - If the partition column is not found
 pub(crate) fn sort_by_partition(
     input: Arc<dyn ExecutionPlan>,
-) -> DFResult<Arc<dyn ExecutionPlan>> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = input.schema();
 
     // Find the partition column in the schema
     let (partition_column_index, _partition_field) = schema
         .column_with_name(PROJECTED_PARTITION_VALUE_COLUMN)
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in schema. Ensure the plan has been extended with partition values using project_with_partition."
-            ))
-        })?;
+        .ok_or_else(|| plan_datafusion_err!(
+            "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in schema. Ensure the plan has been extended with partition values using project_with_partition."
+        ))?;
 
     // Create a single sort expression for the partition column
     let column_expr = Arc::new(Column::new(
@@ -70,9 +68,7 @@ pub(crate) fn sort_by_partition(
     // Create a SortExec with preserve_partitioning=true to ensure the output partitioning
     // is the same as the input partitioning, and the data is sorted within each partition
     let lex_ordering = LexOrdering::new(vec![sort_expr]).ok_or_else(|| {
-        DataFusionError::Plan(
-            "Failed to create LexOrdering from sort expression".to_string(),
-        )
+        plan_datafusion_err!("Failed to create LexOrdering from sort expression")
     })?;
 
     let sort_exec = SortExec::new(lex_ordering, input).with_preserve_partitioning(true);

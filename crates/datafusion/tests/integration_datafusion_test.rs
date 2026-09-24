@@ -18,6 +18,7 @@
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
@@ -34,8 +35,8 @@ use iceberg::spec::{
 };
 use iceberg::test_utils::check_record_batches;
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result, TableCreation,
-    TableIdent,
+    Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
+    TableCreation, TableIdent,
 };
 use tempfile::TempDir;
 
@@ -65,7 +66,7 @@ fn get_struct_type() -> StructType {
 async fn set_test_namespace(
     catalog: &MemoryCatalog,
     namespace: &NamespaceIdent,
-) -> Result<()> {
+) -> IcebergResult<()> {
     let properties = HashMap::new();
 
     catalog.create_namespace(namespace, properties).await?;
@@ -77,7 +78,7 @@ fn get_table_creation(
     location: impl ToString,
     name: impl ToString,
     schema: Option<Schema>,
-) -> Result<TableCreation> {
+) -> IcebergResult<TableCreation> {
     let schema = match schema {
         None => Schema::builder()
             .with_schema_id(0)
@@ -102,7 +103,7 @@ fn get_table_creation(
 }
 
 #[tokio::test]
-async fn test_provider_plan_stream_schema() -> Result<()> {
+async fn test_provider_plan_stream_schema() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_provider_get_table_schema".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -155,7 +156,7 @@ async fn test_provider_plan_stream_schema() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_provider_list_table_names() -> Result<()> {
+async fn test_provider_list_table_names() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_provider_list_table_names".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -188,7 +189,7 @@ async fn test_provider_list_table_names() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_provider_list_schema_names() -> Result<()> {
+async fn test_provider_list_schema_names() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_provider_list_schema_names".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -213,7 +214,7 @@ async fn test_provider_list_schema_names() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_table_projection() -> Result<()> {
+async fn test_table_projection() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("ns".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -282,7 +283,7 @@ async fn test_table_projection() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_table_predict_pushdown() -> Result<()> {
+async fn test_table_predict_pushdown() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("ns".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -328,7 +329,7 @@ async fn test_table_predict_pushdown() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_metadata_table() -> Result<()> {
+async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("ns".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -455,7 +456,7 @@ async fn test_metadata_table() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_insert_into() -> Result<()> {
+async fn test_insert_into() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_insert_into".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -581,7 +582,7 @@ fn get_nested_struct_type() -> StructType {
 }
 
 #[tokio::test]
-async fn test_insert_into_nested() -> Result<()> {
+async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_insert_nested".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
@@ -839,7 +840,7 @@ async fn test_insert_into_nested() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_insert_into_partitioned() -> Result<()> {
+async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;

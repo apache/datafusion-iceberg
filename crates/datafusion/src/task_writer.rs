@@ -21,7 +21,7 @@
 //! of RecordBatch data to Iceberg tables.
 
 use datafusion::arrow::array::RecordBatch;
-use iceberg::Result;
+use datafusion::error::Result;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use iceberg::writer::IcebergWriterBuilder;
@@ -29,6 +29,8 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
+
+use crate::to_datafusion_error;
 
 /// High-level writer for DataFusion that handles partitioning and routing of RecordBatch data.
 ///
@@ -138,7 +140,8 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
                 RecordBatchPartitionSplitter::try_new_with_precomputed_values(
                     schema.clone(),
                     partition_spec.clone(),
-                )?,
+                )
+                .map_err(to_datafusion_error)?,
             )
         } else {
             None
@@ -183,7 +186,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         match &mut self.writer {
             SupportedWriter::Unpartitioned(writer) => {
                 // Unpartitioned: write directly without splitting
-                writer.write(batch).await
+                writer.write(batch).await.map_err(to_datafusion_error)
             }
             SupportedWriter::Fanout(writer) => {
                 Self::write_partitioned_batches(writer, &self.partition_splitter, &batch)
@@ -220,11 +223,14 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let splitter = partition_splitter
             .as_ref()
             .expect("Partition splitter should be initialized");
-        let partitioned_batches = splitter.split(batch)?;
+        let partitioned_batches = splitter.split(batch).map_err(to_datafusion_error)?;
 
         // Write each partition
         for (partition_key, partition_batch) in partitioned_batches {
-            writer.write(partition_key, partition_batch).await?;
+            writer
+                .write(partition_key, partition_batch)
+                .await
+                .map_err(to_datafusion_error)?;
         }
 
         Ok(())
@@ -254,9 +260,15 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     /// ```
     pub async fn close(self) -> Result<Vec<DataFile>> {
         match self.writer {
-            SupportedWriter::Unpartitioned(writer) => writer.close().await,
-            SupportedWriter::Fanout(writer) => writer.close().await,
-            SupportedWriter::Clustered(writer) => writer.close().await,
+            SupportedWriter::Unpartitioned(writer) => {
+                writer.close().await.map_err(to_datafusion_error)
+            }
+            SupportedWriter::Fanout(writer) => {
+                writer.close().await.map_err(to_datafusion_error)
+            }
+            SupportedWriter::Clustered(writer) => {
+                writer.close().await.map_err(to_datafusion_error)
+            }
         }
     }
 }
@@ -287,7 +299,7 @@ mod tests {
 
     use super::*;
 
-    fn create_test_schema() -> Result<Arc<iceberg::spec::Schema>> {
+    fn create_test_schema() -> iceberg::Result<Arc<iceberg::spec::Schema>> {
         Ok(Arc::new(
             iceberg::spec::Schema::builder()
                 .with_schema_id(1)
@@ -358,7 +370,7 @@ mod tests {
     fn create_writer_builder(
         temp_dir: &TempDir,
         schema: Arc<iceberg::spec::Schema>,
-    ) -> Result<
+    ) -> iceberg::Result<
         DataFileWriterBuilder<
             ParquetWriterBuilder,
             DefaultLocationGenerator,
@@ -386,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_writer_unpartitioned() -> Result<()> {
+    async fn test_task_writer_unpartitioned() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema();
@@ -453,7 +465,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_writer_partitioned_fanout() -> Result<()> {
+    async fn test_task_writer_partitioned_fanout()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema_with_partition();
@@ -504,7 +517,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_writer_partitioned_clustered() -> Result<()> {
+    async fn test_task_writer_partitioned_clustered()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let schema = create_test_schema()?;
         let arrow_schema = create_arrow_schema_with_partition();

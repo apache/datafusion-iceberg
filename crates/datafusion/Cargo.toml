@@ -29,7 +29,6 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 dashmap = "6"
 datafusion = { workspace = true }
