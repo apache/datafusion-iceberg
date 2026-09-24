@@ -118,7 +118,6 @@ impl PartitionExpr {
     /// # Errors
     ///
     /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
-    /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
     ///
     /// # Example
     ///
@@ -150,6 +149,7 @@ impl PartitionExpr {
     /// assert_eq!(expr, rebuilt);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    pub fn try_new(
         partition_spec: Arc<PartitionSpec>,
         table_schema: IcebergSchemaRef,
     ) -> Result<Self> {
