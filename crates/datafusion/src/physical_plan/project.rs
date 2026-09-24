@@ -118,7 +118,38 @@ impl PartitionExpr {
     /// # Errors
     ///
     /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
-    pub fn try_new(
+    /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use datafusion_iceberg::physical_plan::PartitionExpr;
+    /// use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
+    ///
+    /// let schema = Arc::new(
+    ///     Schema::builder()
+    ///         .with_fields(vec![
+    ///             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    ///         ])
+    ///         .build()?,
+    /// );
+    /// let spec = Arc::new(
+    ///     PartitionSpec::builder(schema.clone())
+    ///         .add_partition_field("id", "id_bucket", Transform::Bucket(16))?
+    ///         .build()?,
+    /// );
+    /// let expr = PartitionExpr::try_new(spec, schema)?;
+    ///
+    /// // A worker rebuilds an equal expression from the two retained inputs.
+    /// let rebuilt = PartitionExpr::try_new(
+    ///     Arc::new(expr.partition_spec().as_ref().clone()),
+    ///     Arc::new(expr.table_schema().as_ref().clone()),
+    /// )?;
+    /// assert_eq!(expr, rebuilt);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
         partition_spec: Arc<PartitionSpec>,
         table_schema: IcebergSchemaRef,
     ) -> Result<Self> {
