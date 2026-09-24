@@ -116,7 +116,7 @@ impl PartitionExpr {
     ///
     /// # Errors
     ///
-    /// Returns an error if the spec cannot be bound to the schema.
+    /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
     pub fn try_new(
         partition_spec: Arc<PartitionSpec>,
         table_schema: IcebergSchemaRef,
@@ -146,9 +146,9 @@ impl PartitionExpr {
     }
 }
 
-// Equal when they compute the same partition values, which the spec and schema
-// decide entirely. The calculator is derived from those two, so it takes no part:
-// comparing it by pointer would make an expression unequal to its own rebuild.
+// Equal when the spec and schema are equal. The calculator is derived from them, so
+// it takes no part. Both comparisons include `spec_id` and `schema_id`, which `Hash`
+// relies on.
 impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
         self.partition_spec == other.partition_spec
@@ -237,6 +237,22 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         expr.hash(&mut hasher);
         hasher.finish()
+    }
+
+    // `part` typed per caller, so a spec built against one schema can be paired with
+    // a schema that no longer matches it, as happens when a codec rebuilds.
+    fn schema_with_part(part_type: PrimitiveType) -> IcebergSchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "part", Type::Primitive(part_type)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -433,6 +449,58 @@ mod tests {
     }
 
     #[test]
+    fn test_try_new_error_paths() {
+        let int_schema = schema_with_part(PrimitiveType::Int);
+        let on_part = |transform| {
+            Arc::new(
+                PartitionSpec::builder(int_schema.clone())
+                    .add_partition_field("part", "p", transform)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let without_part = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // try_new takes the spec and schema separately, so a codec can pair two that
+        // do not fit. project_with_partition reaches none of these: it returns early
+        // when unpartitioned and reads both from the same table metadata.
+        let cases = [
+            (
+                Arc::new(PartitionSpec::builder(int_schema.clone()).build().unwrap()),
+                int_schema.clone(),
+                "unpartitioned",
+            ),
+            (
+                on_part(Transform::Identity),
+                without_part,
+                "Field not found",
+            ),
+            (
+                on_part(Transform::Bucket(4)),
+                schema_with_part(PrimitiveType::Boolean),
+                "not a valid input type of bucket transform",
+            ),
+        ];
+
+        for (spec, schema, expected) in cases {
+            let err = PartitionExpr::try_new(spec, schema)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "expected {expected:?}, got {err}");
+        }
+    }
+
+    #[test]
     fn test_partition_expr_equality_is_value_based() {
         let table_schema = Arc::new(
             Schema::builder()
@@ -467,6 +535,32 @@ mod tests {
         // Same spec_id, different partition column: comparing only the ids that
         // Hash uses would wrongly call these equal.
         assert_ne!(expr(spec(7, "id")), expr(spec(7, "part")));
+    }
+
+    #[test]
+    fn test_partition_expr_differs_on_schema_with_shared_id() {
+        // Two tables can both be on schema 0 with `part` typed differently, which
+        // changes the partition type. The ids Hash uses are identical here, so only
+        // the struct comparison in eq separates these. Narrowing eq to those ids
+        // would wrongly call them equal.
+        let int_schema = schema_with_part(PrimitiveType::Int);
+        let long_schema = schema_with_part(PrimitiveType::Long);
+        let shared = Arc::new(
+            PartitionSpec::builder(int_schema.clone())
+                .add_partition_field("part", "p", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let on_int = PartitionExpr::try_new(shared.clone(), int_schema).unwrap();
+        let on_long = PartitionExpr::try_new(shared, long_schema).unwrap();
+
+        assert_eq!(
+            on_int.table_schema().schema_id(),
+            on_long.table_schema().schema_id()
+        );
+        assert_ne!(on_int, on_long);
     }
 
     #[test]
