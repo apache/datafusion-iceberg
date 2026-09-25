@@ -9,6 +9,19 @@ The table uses the stable URI prefix `s3://iceberg-test/warehouse/taxi/` in
 its metadata. Tests map that prefix to this checked-in directory, so the
 metadata stays valid regardless of where the repository is cloned.
 
+## Git LFS setup
+
+The Parquet data files are tracked with Git LFS. Install Git LFS and run the
+following before cloning the repository so the fixture files are fetched rather
+than their LFS pointer files:
+
+```shell
+git lfs install
+```
+
+For an existing clone made before Git LFS was configured, run `git lfs pull` to
+fetch the fixture files.
+
 ## Selection
 
 - Source: `yellow_tripdata_2024-01.parquet`, published by the NYC TLC.
