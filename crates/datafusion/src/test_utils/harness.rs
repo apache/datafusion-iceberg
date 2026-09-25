@@ -8,7 +8,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
@@ -31,6 +31,8 @@ impl IcebergTestHarness {
     pub async fn new() -> Result<Self> {
         let state = SessionStateBuilder::new()
             .with_default_features()
+            // Plan snapshots must not vary with the runner's CPU count.
+            .with_config(SessionConfig::new().with_target_partitions(16))
             .with_table_factory(
                 "ICEBERG".to_string(),
                 Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
