@@ -46,7 +46,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use metadata_table::IcebergMetadataTableProvider;
+pub use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
@@ -113,7 +113,17 @@ impl IcebergTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
-        Ok(IcebergMetadataTableProvider { table, r#type })
+        Ok(IcebergMetadataTableProvider::new(table, r#type))
+    }
+
+    /// The catalog this provider loads its table from and commits through.
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// The identifier of the table this provider reads and writes.
+    pub fn table_ident(&self) -> &TableIdent {
+        &self.table_ident
     }
 }
 
@@ -149,7 +159,7 @@ impl TableProvider for IcebergTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
@@ -295,6 +305,17 @@ impl IcebergStaticTableProvider {
             schema,
         })
     }
+
+    /// The table as loaded when this provider was built.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// The snapshot this provider reads, or `None` for the current snapshot of
+    /// [`Self::table`].
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
 }
 
 #[async_trait]
@@ -322,7 +343,7 @@ impl TableProvider for IcebergStaticTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
@@ -949,5 +970,26 @@ mod tests {
             None,
             "Limit should be None when not specified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_rejects_out_of_range_projection() {
+        let table = get_test_table_from_metadata_file().await;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+            .await
+            .unwrap();
+        let schema = provider.schema();
+        let out_of_range = schema.fields().len();
+
+        let err = IcebergTableScan::new_with_predicate(
+            table,
+            None,
+            schema,
+            Some(&[0, out_of_range]),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("project index"), "{err}");
     }
 }

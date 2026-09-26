@@ -24,9 +24,18 @@ use std::vec;
 
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion_iceberg::IcebergCatalogProvider;
+use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion_iceberg::physical_plan::{
+    IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
+};
+use datafusion_iceberg::{
+    IcebergCatalogProvider, IcebergMetadataTableProvider, IcebergStaticTableProvider,
+    IcebergTableProvider,
+};
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -974,6 +983,124 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// Executes the single partition of `plan` and renders its rows as a table.
+async fn run(
+    plan: &dyn ExecutionPlan,
+    ctx: &SessionContext,
+) -> Result<String, Box<dyn Error>> {
+    let stream = plan.execute(0, ctx.task_ctx())?;
+    let batches = datafusion::physical_plan::common::collect(stream).await?;
+    Ok(pretty_format_batches(&batches)?.to_string())
+}
+
+/// Returns the first node of type `T` in `plan`, depth first.
+fn find_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> Option<&T> {
+    plan.downcast_ref::<T>()
+        .or_else(|| plan.children().into_iter().find_map(find_node::<T>))
+}
+
+/// The plan nodes and providers can be named and inspected from outside this
+/// crate, and rebuilt from their parts, as a codec that serializes them does.
+#[tokio::test]
+async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_plan_nodes".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
+
+    let ctx = SessionContext::new();
+    let catalog = IcebergCatalogProvider::try_new(client.clone()).await?;
+    ctx.register_catalog("catalog", Arc::new(catalog));
+    let provider = ctx
+        .table_provider("catalog.test_plan_nodes.my_table")
+        .await?;
+    let provider = provider
+        .downcast_ref::<IcebergTableProvider>()
+        .expect("a catalog-backed provider");
+    assert_eq!(provider.table_ident(), &ident);
+    assert!(Arc::ptr_eq(provider.catalog(), &client));
+
+    // Write path: a commit above a write, both holding the table, and the
+    // commit going through the provider's catalog.
+    let insert = ctx
+        .sql("INSERT INTO catalog.test_plan_nodes.my_table VALUES (1, 'alan'), (2, 'turing')")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let commit = insert
+        .downcast_ref::<IcebergCommitExec>()
+        .expect("the insert plan is rooted at a commit");
+    assert_eq!(commit.table().identifier(), &ident);
+    assert!(Arc::ptr_eq(commit.catalog(), &client));
+    let write = find_node::<IcebergWriteExec>(&insert).expect("a write below the commit");
+    assert_eq!(write.table().identifier(), &ident);
+    collect(insert, ctx.task_ctx()).await?;
+
+    // Read path: a scan pinned to a snapshot, rebuilt from its parts,
+    // returns the same rows.
+    let table = client.load_table(&ident).await?;
+    let snapshot_id = table.metadata().current_snapshot_id().unwrap();
+    let pinned =
+        IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
+            .await?;
+    assert_eq!(pinned.snapshot_id(), Some(snapshot_id));
+    ctx.register_table("pinned", Arc::new(pinned.clone()))?;
+    let plan = ctx
+        .sql("SELECT foo2 FROM pinned WHERE foo1 = 1")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let scan = find_node::<IcebergTableScan>(&plan).expect("a scan");
+    assert!(scan.predicates().is_some(), "the filter is pushed down");
+    let schema = pinned.schema();
+    let projection = scan
+        .projection()
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| schema.index_of(name))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let rebuilt = IcebergTableScan::new_with_predicate(
+        pinned.table().clone(),
+        scan.snapshot_id(),
+        schema,
+        projection.as_deref(),
+        scan.predicates().cloned(),
+        scan.limit(),
+    )?;
+    let expected = run(scan, &ctx).await?;
+    assert!(
+        expected.contains("alan") && !expected.contains("turing"),
+        "{expected}"
+    );
+    assert_eq!(run(&rebuilt, &ctx).await?, expected);
+
+    // Metadata tables: a scan rebuilt from a metadata scan's parts reads the
+    // same rows.
+    let plan = ctx
+        .sql("SELECT * FROM catalog.test_plan_nodes.\"my_table$snapshots\"")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let metadata_scan = find_node::<IcebergMetadataScan>(&plan).expect("a metadata scan");
+    let provider = metadata_scan.provider();
+    assert_eq!(provider.table().identifier(), &ident);
+    let rebuilt = IcebergMetadataScan::new(IcebergMetadataTableProvider::new(
+        provider.table().clone(),
+        provider.metadata_type().clone(),
+    ));
+    let expected = run(metadata_scan, &ctx).await?;
+    assert!(expected.contains(&snapshot_id.to_string()), "{expected}");
+    assert_eq!(run(&rebuilt, &ctx).await?, expected);
 
     Ok(())
 }
