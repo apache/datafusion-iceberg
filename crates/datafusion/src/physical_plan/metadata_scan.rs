@@ -27,6 +27,7 @@ use futures::TryStreamExt;
 
 use crate::metadata_table::IcebergMetadataTableProvider;
 
+/// Scans an Iceberg metadata table, such as `$snapshots`.
 #[derive(Debug)]
 pub struct IcebergMetadataScan {
     provider: IcebergMetadataTableProvider,
@@ -34,6 +35,7 @@ pub struct IcebergMetadataScan {
 }
 
 impl IcebergMetadataScan {
+    /// Creates a scan of the metadata table `provider` reads.
     pub fn new(provider: IcebergMetadataTableProvider) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(provider.schema()),
@@ -45,6 +47,11 @@ impl IcebergMetadataScan {
             provider,
             properties,
         }
+    }
+
+    /// The provider this node scans.
+    pub fn provider(&self) -> &IcebergMetadataTableProvider {
+        &self.provider
     }
 }
 

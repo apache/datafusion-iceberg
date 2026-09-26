@@ -64,23 +64,134 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Self {
-        let output_schema = match projection {
-            None => schema.clone(),
-            Some(projection) => Arc::new(schema.project(projection).unwrap()),
-        };
-        let plan_properties = Self::compute_properties(output_schema.clone());
-        let projection = get_column_names(schema.clone(), projection);
-        let predicates = convert_filters_to_predicate(filters);
+    ) -> Result<Self> {
+        Self::new_with_predicate(
+            table,
+            snapshot_id,
+            schema,
+            projection.map(Vec::as_slice),
+            convert_filters_to_predicate(filters),
+            limit,
+        )
+    }
 
-        Self {
+    /// Creates a scan of `table` from an already-converted Iceberg
+    /// [`Predicate`] rather than DataFusion filters, for rebuilding a scan from
+    /// its parts, such as after sending them to another process. A predicate
+    /// cannot be converted back to the filters it came from.
+    ///
+    /// The arguments mean what the matching accessors return:
+    ///
+    /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
+    ///   snapshot.
+    /// - `schema`: the Arrow schema of the table the scan reads, as its
+    ///   provider reports it.
+    /// - `projection`: indices into `schema` of the columns to read, or `None`
+    ///   for all. The columns are read from the table by name.
+    /// - `predicate`: pushed down to Iceberg to skip data files and rows. The
+    ///   table providers report their filters as
+    ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
+    ///   so DataFusion still applies them above the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `projection` holds an index outside `schema`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    ///
+    /// use datafusion::catalog::TableProvider;
+    /// use datafusion::physical_plan::ExecutionPlan;
+    /// use datafusion::prelude::{SessionContext, col, lit};
+    /// use datafusion_iceberg::IcebergStaticTableProvider;
+    /// use datafusion_iceberg::physical_plan::IcebergTableScan;
+    /// use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    /// use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    /// use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    ///
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
+    /// # let warehouse = tempfile::tempdir()?;
+    /// # let props = HashMap::from([(
+    /// #     MEMORY_CATALOG_WAREHOUSE.to_string(),
+    /// #     warehouse.path().display().to_string(),
+    /// # )]);
+    /// # let catalog = MemoryCatalogBuilder::default().load("memory", props).await?;
+    /// # let namespace = NamespaceIdent::new("ns".to_string());
+    /// # catalog.create_namespace(&namespace, HashMap::new()).await?;
+    /// # let schema = Schema::builder()
+    /// #     .with_fields(vec![
+    /// #         NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    /// #         NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
+    /// #             .into(),
+    /// #     ])
+    /// #     .build()?;
+    /// # let creation = TableCreation::builder().name("t".to_string()).schema(schema).build();
+    /// # let table = catalog.create_table(&namespace, creation).await?;
+    /// let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+    /// let ctx = SessionContext::new();
+    /// let filters = [col("id").gt(lit(1))];
+    /// let plan = provider
+    ///     .scan(&ctx.state(), Some(&vec![1]), &filters, None)
+    ///     .await?;
+    /// let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+    ///
+    /// // Rebuild an equivalent scan from the original's parts.
+    /// let schema = provider.schema();
+    /// let projection = scan
+    ///     .projection()
+    ///     .map(|names| {
+    ///         names
+    ///             .iter()
+    ///             .map(|name| schema.index_of(name))
+    ///             .collect::<Result<Vec<_>, _>>()
+    ///     })
+    ///     .transpose()?;
+    /// let rebuilt = IcebergTableScan::new_with_predicate(
+    ///     scan.table().clone(),
+    ///     scan.snapshot_id(),
+    ///     schema,
+    ///     projection.as_deref(),
+    ///     scan.predicates().cloned(),
+    ///     scan.limit(),
+    /// )?;
+    /// assert_eq!(rebuilt.schema(), scan.schema());
+    /// assert_eq!(rebuilt.predicates(), scan.predicates());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_with_predicate(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&[usize]>,
+        predicate: Option<Predicate>,
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        let output_schema = match projection {
+            None => schema,
+            Some(projection) => Arc::new(schema.project(projection)?),
+        };
+        // The columns to read, by name; `None` reads them all.
+        let projection = projection.map(|_| {
+            output_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        });
+        let plan_properties = Self::compute_properties(output_schema);
+
+        Ok(Self {
             table,
             snapshot_id,
             plan_properties,
             projection,
-            predicates,
+            predicates: predicate,
             limit,
-        }
+        })
     }
 
     pub fn table(&self) -> &Table {
@@ -238,15 +349,4 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
-}
-
-fn get_column_names(
-    schema: ArrowSchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> Option<Vec<String>> {
-    projection.map(|v| {
-        v.iter()
-            .map(|p| schema.field(*p).name().clone())
-            .collect::<Vec<String>>()
-    })
 }
