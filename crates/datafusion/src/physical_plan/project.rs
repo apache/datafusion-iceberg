@@ -48,7 +48,14 @@ use crate::to_datafusion_error;
 ///
 /// # Returns
 /// * `Ok(Arc<dyn ExecutionPlan>)` - Extended plan with partition values column
-/// * `Err` - If partition spec is not found or transformation fails
+/// * `Err` - If `input`'s schema does not fit the table's schema, or the
+///   partition spec is not found or transformation fails
+///
+/// `input`'s schema fits the table's when it has the same columns, in the same
+/// order, with the same types, ignoring field metadata. A column may be
+/// non-nullable where the table's is optional, at any nesting depth, since its
+/// values are valid in either. A nullable column where the table's is required
+/// does not fit.
 pub fn project_with_partition(
     input: Arc<dyn ExecutionPlan>,
     table: &Table,
@@ -72,9 +79,11 @@ pub fn project_with_partition(
     let expected_schema_cleaned = strip_metadata_from_schema(&expected_arrow_schema)
         .map_err(to_datafusion_error)?;
 
-    if input_schema_cleaned != expected_schema_cleaned {
+    // `contains` rather than equality, so that a non-nullable input column fits
+    // an optional table column; see the function docs.
+    if !expected_schema_cleaned.contains(&input_schema_cleaned) {
         return plan_err!(
-            "Input schema does not match Iceberg table schema.\n\
+            "Input schema is not compatible with Iceberg table schema.\n\
              Expected schema: {expected_schema_cleaned}\n\
              Input schema: {input_schema_cleaned}"
         );
@@ -252,14 +261,18 @@ impl std::hash::Hash for PartitionExpr {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
+    use iceberg::TableIdent;
+    use iceberg::io::FileIO;
     use iceberg::spec::{
-        NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, StructType,
+        TableMetadataBuilder, Transform, Type,
     };
     use iceberg::test_utils::test_runtime;
 
@@ -675,215 +688,142 @@ mod tests {
         assert_eq!(city_partition.value(1), "Los Angeles");
     }
 
-    #[test]
-    fn test_schema_validation_matching_schemas() {
-        use iceberg::TableIdent;
-        use iceberg::io::FileIO;
-        use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-
-        let table_schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
-                        .into(),
-                    NestedField::required(
-                        2,
-                        "name",
-                        Type::Primitive(PrimitiveType::String),
-                    )
-                    .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
+    /// A table with `fields`, partitioned by identity on its `id` column.
+    fn table_partitioned_by_id(fields: Vec<NestedField>) -> Table {
+        let table_schema = Schema::builder()
+            .with_fields(fields.into_iter().map(Arc::new))
+            .build()
+            .unwrap();
         let partition_spec = PartitionSpec::builder(table_schema.clone())
             .add_partition_field("id", "id_partition", Transform::Identity)
             .unwrap()
             .build()
             .unwrap();
-
-        let sort_order = iceberg::spec::SortOrder::builder()
-            .build(&table_schema)
-            .unwrap();
-
-        let table_metadata_builder = iceberg::spec::TableMetadataBuilder::new(
-            (*table_schema).clone(),
-            partition_spec,
-            sort_order,
-            "/test/table".to_string(),
-            FormatVersion::V2,
-            std::collections::HashMap::new(),
-        )
-        .unwrap();
-
-        let table_metadata = table_metadata_builder.build().unwrap();
-
-        // Create Arrow schema matching the table schema
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-
-        let input = Arc::new(EmptyExec::new(arrow_schema));
-
-        let table = Table::builder()
-            .metadata(table_metadata.metadata)
-            .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
-            .file_io(FileIO::new_with_fs())
-            .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
-            .build()
-            .unwrap();
-
-        let result = project_with_partition(input, &table);
-        assert!(result.is_ok(), "Schema validation should pass");
-    }
-
-    #[test]
-    fn test_schema_validation_mismatched_schemas() {
-        use iceberg::TableIdent;
-        use iceberg::io::FileIO;
-        use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-
-        let table_schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
-                        .into(),
-                    NestedField::required(
-                        2,
-                        "name",
-                        Type::Primitive(PrimitiveType::String),
-                    )
-                    .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
-        let partition_spec = PartitionSpec::builder(table_schema.clone())
-            .add_partition_field("id", "id_partition", Transform::Identity)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let sort_order = iceberg::spec::SortOrder::builder()
-            .build(&table_schema)
-            .unwrap();
-
-        let table_metadata_builder = iceberg::spec::TableMetadataBuilder::new(
-            (*table_schema).clone(),
-            partition_spec,
-            sort_order,
-            "/test/table".to_string(),
-            FormatVersion::V2,
-            std::collections::HashMap::new(),
-        )
-        .unwrap();
-
-        let table_metadata = table_metadata_builder.build().unwrap();
-
-        // Create Arrow schema with different field name (mismatched)
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("different_name", DataType::Utf8, false), // Wrong field name
-        ]));
-
-        let input = Arc::new(EmptyExec::new(arrow_schema));
-
-        let table = Table::builder()
-            .metadata(table_metadata.metadata)
-            .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
-            .file_io(FileIO::new_with_fs())
-            .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
-            .build()
-            .unwrap();
-
-        let result = project_with_partition(input, &table);
-        assert!(
-            result.is_err(),
-            "Schema validation should fail for mismatched schemas"
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Input schema does not match Iceberg table schema")
-        );
-    }
-
-    #[test]
-    fn test_schema_validation_with_metadata_differences() {
-        use std::collections::HashMap;
-
-        use iceberg::TableIdent;
-        use iceberg::io::FileIO;
-        use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-
-        let table_schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
-                        .into(),
-                    NestedField::required(
-                        2,
-                        "name",
-                        Type::Primitive(PrimitiveType::String),
-                    )
-                    .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
-        let partition_spec = PartitionSpec::builder(table_schema.clone())
-            .add_partition_field("id", "id_partition", Transform::Identity)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let sort_order = iceberg::spec::SortOrder::builder()
-            .build(&table_schema)
-            .unwrap();
-
-        let table_metadata_builder = iceberg::spec::TableMetadataBuilder::new(
-            (*table_schema).clone(),
+        let sort_order = SortOrder::builder().build(&table_schema).unwrap();
+        let metadata = TableMetadataBuilder::new(
+            table_schema,
             partition_spec,
             sort_order,
             "/test/table".to_string(),
             FormatVersion::V2,
             HashMap::new(),
         )
-        .unwrap();
-
-        let table_metadata = table_metadata_builder.build().unwrap();
-
-        // Create Arrow schema with metadata (should be ignored in comparison)
-        let mut metadata = HashMap::new();
-        metadata.insert("extra".to_string(), "metadata".to_string());
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false).with_metadata(metadata.clone()),
-            Field::new("name", DataType::Utf8, false).with_metadata(metadata),
-        ]));
-
-        let input = Arc::new(EmptyExec::new(arrow_schema));
-
-        let table = Table::builder()
-            .metadata(table_metadata.metadata)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        Table::builder()
+            .metadata(metadata)
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json")
             .runtime(test_runtime())
             .build()
-            .unwrap();
+            .unwrap()
+    }
 
-        let result = project_with_partition(input, &table);
-        assert!(
-            result.is_ok(),
-            "Schema validation should pass even with metadata differences"
-        );
+    /// Required `id: int` and `name: string` columns.
+    fn id_and_name_table() -> Table {
+        table_partitioned_by_id(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+            NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)),
+        ])
+    }
+
+    fn input_of(fields: Vec<Field>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(EmptyExec::new(Arc::new(ArrowSchema::new(fields))))
+    }
+
+    const INCOMPATIBLE: &str = "Input schema is not compatible with Iceberg table schema";
+
+    #[test]
+    fn test_schema_validation_matching_schemas() {
+        let input = input_of(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        assert!(project_with_partition(input, &id_and_name_table()).is_ok());
+    }
+
+    #[test]
+    fn test_schema_validation_mismatched_schemas() {
+        let input = input_of(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("different_name", DataType::Utf8, false),
+        ]);
+        let err = project_with_partition(input, &id_and_name_table())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(INCOMPATIBLE), "{err}");
+    }
+
+    #[test]
+    fn test_schema_validation_nullability() {
+        let id = |nullable| input_of(vec![Field::new("id", DataType::Int32, nullable)]);
+        let int = Type::Primitive(PrimitiveType::Int);
+
+        // A non-nullable input fits an optional column, e.g. an INSERT from a
+        // NOT NULL source.
+        let optional =
+            table_partitioned_by_id(vec![NestedField::optional(1, "id", int.clone())]);
+        assert!(project_with_partition(id(false), &optional).is_ok());
+        assert!(project_with_partition(id(true), &optional).is_ok());
+
+        // A nullable input could write nulls into a required column.
+        let required = table_partitioned_by_id(vec![NestedField::required(1, "id", int)]);
+        assert!(project_with_partition(id(false), &required).is_ok());
+        let err = project_with_partition(id(true), &required)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(INCOMPATIBLE), "{err}");
+    }
+
+    #[test]
+    fn test_schema_validation_nested_nullability() {
+        let child = |nullable| Field::new("x", DataType::Int32, nullable);
+        let input = |nullable| {
+            input_of(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "s",
+                    DataType::Struct(Fields::from(vec![child(nullable)])),
+                    false,
+                ),
+            ])
+        };
+        let table = |x: NestedField| {
+            table_partitioned_by_id(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+                NestedField::required(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![Arc::new(x)])),
+                ),
+            ])
+        };
+        let int = Type::Primitive(PrimitiveType::Int);
+
+        // The same rule applies inside a struct.
+        let optional = table(NestedField::optional(3, "x", int.clone()));
+        assert!(project_with_partition(input(false), &optional).is_ok());
+        assert!(project_with_partition(input(true), &optional).is_ok());
+
+        let required = table(NestedField::required(3, "x", int));
+        assert!(project_with_partition(input(false), &required).is_ok());
+        let err = project_with_partition(input(true), &required)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(INCOMPATIBLE), "{err}");
+    }
+
+    #[test]
+    fn test_schema_validation_with_metadata_differences() {
+        // Field metadata is ignored in the comparison.
+        let metadata = HashMap::from([("extra".to_string(), "metadata".to_string())]);
+        let input = input_of(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(metadata.clone()),
+            Field::new("name", DataType::Utf8, false).with_metadata(metadata),
+        ]);
+        assert!(project_with_partition(input, &id_and_name_table()).is_ok());
     }
 }
