@@ -37,8 +37,8 @@ datafusion = "55.0.0"
 datafusion-cli = "55.0.0"
 datafusion-iceberg = { path = "crates/datafusion" }
 datafusion-sqllogictest = "55.0.0"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "665c64e48e8d33797ecb1a421f327edd9b024879" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "665c64e48e8d33797ecb1a421f327edd9b024879" }
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "8cb2adeddb4f8da1ca7bd86ca303337f011c12e2" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "8cb2adeddb4f8da1ca7bd86ca303337f011c12e2" }
 tokio = { version = "1.47", default-features = false, features = ["sync", "rt-multi-thread"] }
 toml = "1.1"
 tracing = "0.1.41"
