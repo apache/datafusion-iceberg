@@ -2297,9 +2297,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-spark"
-version = "55.0.0"
+version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "992dd0b954f24cb576cbeee3555c3083b9cf7a5a5f2448ea25f7a437d444163f"
+checksum = "f7809ecefb16fcb950c6b22ee3df99cb412dca6fae72c329d64c938ae53254f9"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -2347,9 +2347,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sqllogictest"
-version = "55.0.0"
+version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c921345d249b784a513ad2be71fc3df18fd8f019fe6c82233f085a1871154fd"
+checksum = "d408561adfed7077e110911c9945de623551f4101367e1ef55dc5eda7729afb4"
 dependencies = [
  "arrow",
  "async-trait",
