@@ -38,8 +38,8 @@ use crate::to_datafusion_error;
 /// managing access to a [`iceberg::inspect::MetadataTable`].
 #[derive(Debug, Clone)]
 pub struct IcebergMetadataTableProvider {
-    pub(crate) table: Table,
-    pub(crate) r#type: MetadataTableType,
+    table: Table,
+    r#type: MetadataTableType,
 }
 
 #[async_trait]
@@ -70,6 +70,25 @@ impl TableProvider for IcebergMetadataTableProvider {
 }
 
 impl IcebergMetadataTableProvider {
+    /// Creates a provider for the `metadata_type` metadata table of an
+    /// already loaded table.
+    pub fn new(table: Table, metadata_type: MetadataTableType) -> Self {
+        Self {
+            table,
+            r#type: metadata_type,
+        }
+    }
+
+    /// The table whose metadata this provider reads.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Which metadata table of [`Self::table`] this provider reads.
+    pub fn metadata_type(&self) -> &MetadataTableType {
+        &self.r#type
+    }
+
     pub async fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let metadata_table = self.table.inspect();
         let stream = match self.r#type {

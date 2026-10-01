@@ -47,8 +47,8 @@ pub struct IcebergTableScan {
     /// Stores certain, often expensive to compute,
     /// plan properties used in query optimization.
     plan_properties: Arc<PlanProperties>,
-    /// Projection column names, None means all columns
-    projection: Option<Vec<String>>,
+    /// The columns to read, by name: the fields of the output schema
+    projection: Vec<String>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
@@ -64,21 +64,117 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self> {
         let output_schema = match projection {
-            None => schema.clone(),
-            Some(projection) => Arc::new(schema.project(projection).unwrap()),
+            None => schema,
+            Some(projection) => Arc::new(schema.project(projection)?),
         };
-        let plan_properties = Self::compute_properties(output_schema.clone());
-        let projection = get_column_names(schema.clone(), projection);
-        let predicates = convert_filters_to_predicate(filters);
+        Ok(Self::new_with_predicate(
+            table,
+            snapshot_id,
+            output_schema,
+            convert_filters_to_predicate(filters),
+            limit,
+        ))
+    }
+
+    /// Creates a scan of `table` from an already-converted Iceberg
+    /// [`Predicate`] rather than DataFusion filters, for rebuilding a scan from
+    /// its parts, such as after sending them to another process. A predicate
+    /// cannot be converted back to the filters it came from.
+    ///
+    /// Each argument takes what the matching accessor returns (`schema` what
+    /// [`ExecutionPlan::schema`] does, and `predicate` what
+    /// [`Self::predicates`] does):
+    ///
+    /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
+    ///   snapshot.
+    /// - `schema`: the Arrow schema the scan outputs. The scan reads the
+    ///   columns of the same names from the snapshot it scans, and no others.
+    ///   A name that snapshot's schema lacks fails the scan when it runs.
+    /// - `predicate`: pushed down to Iceberg to skip data files and rows. The
+    ///   table providers report their filters as
+    ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
+    ///   so DataFusion still applies them above the scan.
+    /// - `limit`: the most rows the scan returns, or `None` for all of them.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    ///
+    /// use datafusion::catalog::TableProvider;
+    /// use datafusion::physical_plan::ExecutionPlan;
+    /// use datafusion::prelude::{SessionContext, col, lit};
+    /// use datafusion_iceberg::IcebergStaticTableProvider;
+    /// use datafusion_iceberg::physical_plan::IcebergTableScan;
+    /// use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    /// use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    /// use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    ///
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
+    /// # let warehouse = tempfile::tempdir()?;
+    /// # let props = HashMap::from([(
+    /// #     MEMORY_CATALOG_WAREHOUSE.to_string(),
+    /// #     warehouse.path().display().to_string(),
+    /// # )]);
+    /// # let catalog = MemoryCatalogBuilder::default().load("memory", props).await?;
+    /// # let namespace = NamespaceIdent::new("ns".to_string());
+    /// # catalog.create_namespace(&namespace, HashMap::new()).await?;
+    /// # let schema = Schema::builder()
+    /// #     .with_fields(vec![
+    /// #         NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    /// #         NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
+    /// #             .into(),
+    /// #     ])
+    /// #     .build()?;
+    /// # let creation = TableCreation::builder().name("t".to_string()).schema(schema).build();
+    /// # let table = catalog.create_table(&namespace, creation).await?;
+    /// let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+    /// let ctx = SessionContext::new();
+    /// let filters = [col("id").gt(lit(1))];
+    /// let plan = provider
+    ///     .scan(&ctx.state(), Some(&vec![1]), &filters, None)
+    ///     .await?;
+    /// let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+    ///
+    /// // Rebuild an equivalent scan from the original's accessors alone.
+    /// let rebuilt = IcebergTableScan::new_with_predicate(
+    ///     scan.table().clone(),
+    ///     scan.snapshot_id(),
+    ///     scan.schema(),
+    ///     scan.predicates().cloned(),
+    ///     scan.limit(),
+    /// );
+    /// assert_eq!(rebuilt.schema(), scan.schema());
+    /// assert_eq!(rebuilt.projection(), scan.projection());
+    /// assert_eq!(rebuilt.predicates(), scan.predicates());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_with_predicate(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        predicate: Option<Predicate>,
+        limit: Option<usize>,
+    ) -> Self {
+        // Reading the columns by name, rather than all of them, keeps the
+        // batches matching `schema` even when the table has columns it lacks.
+        let projection = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let plan_properties = Self::compute_properties(schema);
 
         Self {
             table,
             snapshot_id,
             plan_properties,
             projection,
-            predicates,
+            predicates: predicate,
             limit,
         }
     }
@@ -91,8 +187,10 @@ impl IcebergTableScan {
         self.snapshot_id
     }
 
+    /// The names of the columns the scan reads, which are the fields of its
+    /// schema. Always `Some`.
     pub fn projection(&self) -> Option<&[String]> {
-        self.projection.as_deref()
+        Some(&self.projection)
     }
 
     pub fn predicates(&self) -> Option<&Predicate> {
@@ -193,9 +291,7 @@ impl DisplayAs for IcebergTableScan {
         write!(
             f,
             "IcebergTableScan projection:[{}] predicate:[{}]",
-            self.projection
-                .clone()
-                .map_or(String::new(), |v| v.join(",")),
+            self.projection.join(","),
             self.predicates
                 .clone()
                 .map_or(String::from(""), |p| format!("{p}"))
@@ -215,7 +311,7 @@ impl DisplayAs for IcebergTableScan {
 async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
-    column_names: Option<Vec<String>>,
+    column_names: Vec<String>,
     predicates: Option<Predicate>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
@@ -223,10 +319,7 @@ async fn get_batch_stream(
         None => table.scan(),
     };
 
-    let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
-        None => scan_builder.select_all(),
-    };
+    let mut scan_builder = scan_builder.select(column_names);
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
@@ -238,15 +331,4 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
-}
-
-fn get_column_names(
-    schema: ArrowSchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> Option<Vec<String>> {
-    projection.map(|v| {
-        v.iter()
-            .map(|p| schema.field(*p).name().clone())
-            .collect::<Vec<String>>()
-    })
 }
