@@ -18,7 +18,7 @@
 [package]
 edition = { workspace = true }
 homepage = { workspace = true }
-name = "datafusion-iceberg"
+name = "iceberg-datafusion"
 publish = true
 version = { workspace = true }
 

@@ -26,7 +26,6 @@ use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion_iceberg::IcebergCatalogProvider;
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -38,6 +37,7 @@ use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
 };
+use iceberg_datafusion::IcebergCatalogProvider;
 use tempfile::TempDir;
 
 fn temp_path() -> String {

@@ -24,7 +24,7 @@ on:
       - main
   merge_group:
 
-# Cancel obsolete runs for the same pull request or branch. The three jobs below
+# Cancel obsolete runs for the same pull request or branch. The four jobs below
 # keep this workflow well below ASF's 15-job recommended concurrency limit.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -82,3 +82,18 @@ jobs:
         with:
           cache: "true"
       - run: cargo test --workspace --locked
+
+  rat:
+    name: RAT
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Audit a source archive so the check covers exactly what a release
+      # tarball contains, including the hidden directories that RAT skips
+      # when given a directory.
+      - name: Audit license headers
+        run: |
+          git archive --prefix=source/ HEAD | gzip > "$RUNNER_TEMP/source.tar.gz"
+          ./dev/release/run-rat.sh "$RUNNER_TEMP/source.tar.gz"

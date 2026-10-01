@@ -124,7 +124,7 @@ impl PartitionExpr {
     /// ```
     /// use std::sync::Arc;
     ///
-    /// use datafusion_iceberg::physical_plan::PartitionExpr;
+    /// use iceberg_datafusion::physical_plan::PartitionExpr;
     /// use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
     ///
     /// let schema = Arc::new(
