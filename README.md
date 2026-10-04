@@ -17,7 +17,7 @@
   ~ under the License.
 -->
 
-# Apache Iceberg DataFusion Integration
+# Apache Iceberg Table Provider for Apache DataFusion
 
 This repository connects [Apache Iceberg](https://iceberg.apache.org/) tables to
 [Apache DataFusion](https://datafusion.apache.org/). The `datafusion-iceberg`
