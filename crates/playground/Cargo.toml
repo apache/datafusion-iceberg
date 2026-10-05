@@ -36,7 +36,7 @@ fs-err = "3.1.0"
 home = "0.5.12"
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-datafusion-iceberg = { workspace = true }
+iceberg-datafusion = { workspace = true }
 mimalloc = "0.1.46"
 stacker = "0.1.20"
 tokio = { workspace = true }

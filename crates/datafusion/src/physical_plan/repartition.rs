@@ -77,7 +77,7 @@ use iceberg::spec::{TableMetadata, TableMetadataRef, Transform};
 ///
 /// ```ignore
 /// use std::num::NonZeroUsize;
-/// use datafusion_iceberg::physical_plan::project_with_partition;
+/// use iceberg_datafusion::physical_plan::project_with_partition;
 ///
 /// let plan_with_partition = project_with_partition(input_plan, &table)?;
 ///
