@@ -33,7 +33,7 @@ use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
-use super::expr_to_predicate::convert_filters_to_predicate;
+use super::predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
@@ -107,7 +107,7 @@ impl IcebergTableScan {
     /// use datafusion::physical_plan::ExecutionPlan;
     /// use datafusion::prelude::{SessionContext, col, lit};
     /// use datafusion_iceberg::IcebergStaticTableProvider;
-    /// use datafusion_iceberg::physical_plan::IcebergTableScan;
+    /// use datafusion_iceberg::read::IcebergTableScan;
     /// use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     /// use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     /// use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};

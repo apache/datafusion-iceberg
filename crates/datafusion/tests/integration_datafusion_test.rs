@@ -34,12 +34,11 @@ use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
-use datafusion_iceberg::physical_plan::{
-    IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
-};
+use datafusion_iceberg::metadata::{IcebergMetadataScan, IcebergMetadataTableProvider};
+use datafusion_iceberg::read::IcebergTableScan;
+use datafusion_iceberg::write::{IcebergCommitExec, IcebergWriteExec};
 use datafusion_iceberg::{
-    IcebergCatalogProvider, IcebergMetadataTableProvider, IcebergStaticTableProvider,
-    IcebergTableProvider,
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
@@ -1048,11 +1047,11 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .table_provider("catalog.test_plan_nodes.my_table")
         .await?;
     let provider = provider
-        .downcast_ref::<IcebergTableProvider>()
+        .downcast_ref::<IcebergCatalogTableProvider>()
         .expect("a catalog-backed provider");
     assert_eq!(provider.table_ident(), &ident);
     assert!(Arc::ptr_eq(provider.catalog(), &client));
-    let rebuilt = IcebergTableProvider::try_new(
+    let rebuilt = IcebergCatalogTableProvider::try_new(
         provider.catalog().clone(),
         provider.table_ident().namespace().clone(),
         provider.table_ident().name(),
@@ -1300,7 +1299,8 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
     let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
 
     let provider = Arc::new(
-        IcebergTableProvider::try_new(client.clone(), namespace, "my_table").await?,
+        IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
+            .await?,
     );
     let ctx = SessionContext::new();
     ctx.register_table("t", provider.clone())?;
@@ -1322,7 +1322,7 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
 
     // A scan reads the schema of the snapshot it reads, so write a snapshot
     // with the new column, through a provider that sees it.
-    let evolved = IcebergTableProvider::try_new(
+    let evolved = IcebergCatalogTableProvider::try_new(
         client.clone(),
         ident.namespace().clone(),
         ident.name(),

@@ -1684,9 +1684,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-cli"
-version = "55.1.0"
+version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffb9833a102f01a257994de966c73fbf7441d8347207d8676c821b7318c03ee6"
+checksum = "5d8b87ff78e243da48b836ced274799a1799b4a2fd321700e4b8f3426c01aa7e"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2297,9 +2297,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-spark"
-version = "55.1.0"
+version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7809ecefb16fcb950c6b22ee3df99cb412dca6fae72c329d64c938ae53254f9"
+checksum = "992dd0b954f24cb576cbeee3555c3083b9cf7a5a5f2448ea25f7a437d444163f"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -2347,9 +2347,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sqllogictest"
-version = "55.1.0"
+version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d408561adfed7077e110911c9945de623551f4101367e1ef55dc5eda7729afb4"
+checksum = "2c921345d249b784a513ad2be71fc3df18fd8f019fe6c82233f085a1871154fd"
 dependencies = [
  "arrow",
  "async-trait",

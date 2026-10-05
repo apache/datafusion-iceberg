@@ -15,20 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod commit;
-pub(crate) mod expr_to_predicate;
-pub(crate) mod metadata_scan;
-pub(crate) mod project;
-pub(crate) mod repartition;
-pub(crate) mod scan;
-pub(crate) mod sort;
-pub(crate) mod write;
+mod provider;
+mod schema;
 
-pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
-
-pub use commit::IcebergCommitExec;
-pub use expr_to_predicate::convert_filters_to_predicate;
-pub use metadata_scan::IcebergMetadataScan;
-pub use project::{PartitionExpr, project_with_partition};
-pub use scan::IcebergTableScan;
-pub use write::IcebergWriteExec;
+pub use provider::IcebergCatalogProvider;

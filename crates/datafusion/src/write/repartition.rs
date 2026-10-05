@@ -46,7 +46,7 @@ use iceberg::spec::{TableMetadata, TableMetadataRef, Transform};
 /// ## Requirements
 ///
 /// - **For partitioned tables**: The input MUST include the `_partition` column.
-///   Add it by calling [`project_with_partition`](crate::physical_plan::project_with_partition) before [`repartition`].
+///   Add it by calling [`project_with_partition`](crate::write::project_with_partition) before [`repartition`].
 /// - **For unpartitioned tables**: No special preparation needed.
 /// - Returns an error if a partitioned table is missing the `_partition` column.
 ///
@@ -58,7 +58,7 @@ use iceberg::spec::{TableMetadata, TableMetadataRef, Transform};
 /// # Arguments
 ///
 /// * `input` - The input [`ExecutionPlan`]. For partitioned tables, must include the `_partition`
-///   column (added via [`project_with_partition`](crate::physical_plan::project_with_partition)).
+///   column (added via [`project_with_partition`](crate::write::project_with_partition)).
 /// * `table_metadata` - Iceberg table metadata containing partition spec.
 /// * `target_partitions` - Target number of partitions for parallel processing (must be > 0).
 ///
@@ -77,7 +77,7 @@ use iceberg::spec::{TableMetadata, TableMetadataRef, Transform};
 ///
 /// ```ignore
 /// use std::num::NonZeroUsize;
-/// use datafusion_iceberg::physical_plan::project_with_partition;
+/// use datafusion_iceberg::write::project_with_partition;
 ///
 /// let plan_with_partition = project_with_partition(input_plan, &table)?;
 ///

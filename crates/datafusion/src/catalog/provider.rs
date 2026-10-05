@@ -23,7 +23,7 @@ use datafusion::error::Result;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 
-use crate::schema::IcebergSchemaProvider;
+use super::schema::IcebergSchemaProvider;
 use crate::to_datafusion_error;
 
 /// Provides an interface to manage and access multiple schemas

@@ -267,7 +267,7 @@ fn scalar_function_to_iceberg_predicate(
 /// Multiplication/division by zero and `c / x` are intentionally rejected: e.g.
 /// `x * 0` is NaN when `x` is `±inf`, so it does not imply `x` is NaN.
 ///
-/// [`IcebergTableProvider::supports_filters_pushdown`]: crate::table::IcebergTableProvider
+/// [`IcebergTableProvider::supports_filters_pushdown`]: crate::table_provider::IcebergCatalogTableProvider
 fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),

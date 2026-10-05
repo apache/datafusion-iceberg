@@ -32,7 +32,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
-use crate::table::IcebergTableProvider;
+use crate::table_provider::IcebergCatalogTableProvider;
 use crate::to_datafusion_error;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
@@ -47,7 +47,7 @@ pub(crate) struct IcebergSchemaProvider {
     /// and values are dynamic references to objects implementing the
     /// [`TableProvider`] trait.
     /// Wrapped in Arc to allow sharing across async boundaries in register_table.
-    tables: Arc<DashMap<String, Arc<IcebergTableProvider>>>,
+    tables: Arc<DashMap<String, Arc<IcebergCatalogTableProvider>>>,
 }
 
 impl IcebergSchemaProvider {
@@ -78,7 +78,11 @@ impl IcebergSchemaProvider {
             table_names
                 .iter()
                 .map(|name| {
-                    IcebergTableProvider::try_new(client.clone(), namespace.clone(), name)
+                    IcebergCatalogTableProvider::try_new(
+                        client.clone(),
+                        namespace.clone(),
+                        name,
+                    )
                 })
                 .collect::<Vec<_>>(),
         )
@@ -187,7 +191,7 @@ impl SchemaProvider for IcebergSchemaProvider {
                     .map_err(to_datafusion_error)?;
 
                 // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
+                let table_provider = IcebergCatalogTableProvider::try_new(
                     catalog.clone(),
                     namespace.clone(),
                     name_clone.clone(),

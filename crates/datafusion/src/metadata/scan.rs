@@ -25,7 +25,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::TryStreamExt;
 
-use crate::metadata_table::IcebergMetadataTableProvider;
+use super::table::IcebergMetadataTableProvider;
 
 /// Scans an Iceberg metadata table, such as `$snapshots`.
 #[derive(Debug)]

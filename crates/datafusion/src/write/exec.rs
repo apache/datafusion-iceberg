@@ -46,9 +46,10 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use uuid::Uuid;
 
-use crate::physical_plan::DATA_FILES_COL_NAME;
-use crate::task_writer::TaskWriter;
+use super::task_writer::TaskWriter;
 use crate::to_datafusion_error;
+
+pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
 
 /// An execution plan node that writes data to an Iceberg table.
 ///

@@ -15,16 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+pub(crate) mod scan;
+pub(crate) mod table;
 
-mod error;
-pub use error::*;
-
-pub mod metadata;
-pub mod read;
-pub mod table_provider;
-pub use table_provider::{
-    IcebergCatalogTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
-};
-pub mod write;
+pub use scan::IcebergMetadataScan;
+pub use table::IcebergMetadataTableProvider;

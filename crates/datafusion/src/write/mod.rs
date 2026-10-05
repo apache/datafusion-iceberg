@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+pub(crate) mod commit;
+pub(crate) mod exec;
+pub(crate) mod project;
+pub(crate) mod repartition;
+pub(crate) mod sort;
+pub(crate) mod task_writer;
 
-mod error;
-pub use error::*;
-
-pub mod metadata;
-pub mod read;
-pub mod table_provider;
-pub use table_provider::{
-    IcebergCatalogTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
-};
-pub mod write;
+pub use commit::IcebergCommitExec;
+pub use exec::IcebergWriteExec;
+pub use project::{PartitionExpr, project_with_partition};

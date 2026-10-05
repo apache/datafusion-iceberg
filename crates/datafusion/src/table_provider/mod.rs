@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
+//! Iceberg table providers for DataFusion.
+//!
+//! The catalog-backed provider refreshes table metadata for reads and writes.
+//! The static provider reads a fixed table snapshot.
 
-mod error;
-pub use error::*;
+mod catalog_table_provider;
+mod factory;
+mod static_table_provider;
 
-pub mod metadata;
-pub mod read;
-pub mod table_provider;
-pub use table_provider::{
-    IcebergCatalogTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
-};
-pub mod write;
+pub use catalog_table_provider::IcebergCatalogTableProvider;
+pub use factory::IcebergTableProviderFactory;
+pub use static_table_provider::IcebergStaticTableProvider;

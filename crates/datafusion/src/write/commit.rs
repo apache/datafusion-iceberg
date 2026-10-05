@@ -39,7 +39,7 @@ use iceberg::spec::{DataFile, deserialize_data_file_from_json};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
-use crate::physical_plan::DATA_FILES_COL_NAME;
+use super::exec::DATA_FILES_COL_NAME;
 use crate::to_datafusion_error;
 
 /// IcebergCommitExec is responsible for collecting the files written and use
@@ -348,8 +348,7 @@ mod tests {
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
     use super::*;
-    use crate::physical_plan::DATA_FILES_COL_NAME;
-    use crate::table::IcebergTableProvider;
+    use crate::table_provider::IcebergCatalogTableProvider;
 
     // A mock execution plan that returns record batches with serialized data files
     #[derive(Debug)]
@@ -811,7 +810,7 @@ mod tests {
             Arc::new(MemTable::try_new(Arc::clone(&arrow_schema), partitions)?);
         ctx.register_table("source_table", source_table)?;
 
-        let iceberg_table_provider = IcebergTableProvider::try_new(
+        let iceberg_table_provider = IcebergCatalogTableProvider::try_new(
             catalog.clone(),
             namespace.clone(),
             table_name.to_string(),

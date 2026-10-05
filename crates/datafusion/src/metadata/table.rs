@@ -31,7 +31,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
 
-use crate::physical_plan::metadata_scan::IcebergMetadataScan;
+use super::scan::IcebergMetadataScan;
 use crate::to_datafusion_error;
 
 /// Represents a [`TableProvider`] for the Iceberg [`iceberg::Catalog`],
