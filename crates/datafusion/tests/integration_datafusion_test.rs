@@ -22,8 +22,12 @@ use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, Int32Array, RecordBatch, StringArray, UInt64Array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion_iceberg::IcebergCatalogProvider;
@@ -973,6 +977,75 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     assert!(
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
+    );
+
+    Ok(())
+}
+
+/// An INSERT from a NOT NULL source into a partitioned table whose columns
+/// are optional writes the rows.
+#[tokio::test]
+async fn test_insert_not_null_source_into_partitioned_table() -> Result<(), Box<dyn Error>>
+{
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_not_null_source".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "category", Transform::Identity)?
+        .build();
+    let creation = TableCreation::builder()
+        .name("t".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let ctx = SessionContext::new();
+    let catalog = IcebergCatalogProvider::try_new(Arc::new(iceberg_catalog)).await?;
+    ctx.register_catalog("catalog", Arc::new(catalog));
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("category", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["books", "games"])),
+        ],
+    )?;
+    let source = MemTable::try_new(source_schema, vec![vec![batch]])?;
+    ctx.register_table("source", Arc::new(source))?;
+
+    ctx.sql("INSERT INTO catalog.test_not_null_source.t SELECT * FROM source")
+        .await?
+        .collect()
+        .await?;
+
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_not_null_source.t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        pretty_format_batches(&batches)?.to_string(),
+        "+----+----------+\n\
+         | id | category |\n\
+         +----+----------+\n\
+         | 1  | books    |\n\
+         | 2  | games    |\n\
+         +----+----------+"
     );
 
     Ok(())
