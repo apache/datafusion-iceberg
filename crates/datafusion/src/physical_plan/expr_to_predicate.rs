@@ -165,7 +165,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             // Only support simple prefix patterns (e.g., 'prefix%')
             // Note: Iceberg's StartsWith operator is case-sensitive, so we cannot
             // push down case-insensitive LIKE (ILIKE) patterns
-            // Escape characters are also not supported for pushdown
+            // An explicit ESCAPE clause is also not supported for pushdown
             if escape_char.is_some() || *case_insensitive {
                 return TransformedResult::NotTransformed;
             }
@@ -180,12 +180,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             };
 
             // Check if it's a simple prefix pattern (ends with % and no other wildcards)
-            if pattern_str.ends_with('%')
-                && !pattern_str[..pattern_str.len() - 1].contains(['%', '_'])
-            {
-                // Extract the prefix (remove trailing %)
-                let prefix = pattern_str[..pattern_str.len() - 1].to_string();
-
+            if let Some(prefix) = like_prefix(&pattern_str) {
                 // Get the column reference
                 let column = match to_iceberg_predicate(expr) {
                     TransformedResult::Column(r) => r,
@@ -210,6 +205,24 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         }
         _ => TransformedResult::NotTransformed,
     }
+}
+
+/// Returns the literal prefix of a `prefix%` LIKE pattern, or `None` for any other
+/// pattern. Without an `ESCAPE` clause, DataFusion and Arrow treat `\` as an escape
+/// character: `\c` matches a literal `c`, and a trailing `\` matches itself. The prefix
+/// is unescaped the same way, and an escaped trailing `%` is not a wildcard.
+fn like_prefix(pattern: &str) -> Option<String> {
+    let mut prefix = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => prefix.push(chars.next().unwrap_or('\\')),
+            '%' => return chars.as_str().is_empty().then_some(prefix),
+            '_' => return None,
+            c => prefix.push(c),
+        }
+    }
+    None
 }
 
 fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
@@ -855,6 +868,55 @@ mod tests {
         assert_eq!(
             predicate,
             Reference::new("bar").starts_with(Datum::string("测试"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_trailing_percent() {
+        // 'a\%' matches only the literal string "a%", so it is not a prefix pattern
+        let sql = r"bar LIKE 'a\%'";
+        let predicate = convert_to_iceberg_predicate(sql);
+        assert_eq!(predicate, None);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_wildcards_in_prefix() {
+        let sql = r"bar LIKE 'a\%b\_c%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string("a%b_c"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_backslash() {
+        let sql = r"bar LIKE 'a\\%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string(r"a\"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_regular_character() {
+        // An escaped character that isn't a wildcard matches itself
+        let sql = r"bar LIKE 'a\b%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string("ab"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_not_like_escaped_prefix() {
+        let sql = r"bar NOT LIKE 'a\%%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").not_starts_with(Datum::string("a%"))
         );
     }
 
