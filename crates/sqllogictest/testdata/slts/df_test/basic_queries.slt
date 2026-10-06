@@ -43,7 +43,7 @@ INSERT INTO default.default.query_test_table VALUES
 ----
 10
 
-# Verify EXPLAIN shows limit is pushed down to IcebergTableScan
+# Verify EXPLAIN shows limit is pushed down to DataSourceExec
 query TT
 EXPLAIN SELECT * FROM default.default.query_test_table LIMIT 3
 ----
@@ -51,9 +51,8 @@ logical_plan
 01)Limit: skip=0, fetch=3
 02)--TableScan: default.default.query_test_table projection=[id, name, score, category], fetch=3
 physical_plan
-01)GlobalLimitExec: skip=0, fetch=3
-02)--CooperativeExec
-03)----IcebergTableScan projection:[id,name,score,category] predicate:[] limit:[3]
+01)CooperativeExec
+02)--DataSourceExec: format=iceberg, projection=[id, name, score, category], fetch=3
 
 # Test SELECT * with ORDER BY and LIMIT
 query ITRT

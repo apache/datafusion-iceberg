@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{exec_datafusion_err, not_impl_err};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
@@ -30,7 +31,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
 use crate::error::to_datafusion_error;
-use crate::read::scan::IcebergTableScan;
+use crate::read::IcebergDataSource;
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -125,7 +126,7 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        Ok(Arc::new(IcebergTableScan::new(
+        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
             self.table.clone(),
             self.snapshot_id,
             self.schema.clone(),
@@ -281,14 +282,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
+        // Verify that the scan plan wraps an IcebergDataSource.
         let iceberg_scan = scan_plan
-            .downcast_ref::<IcebergTableScan>()
-            .expect("Expected IcebergTableScan");
+            .downcast_ref::<DataSourceExec>()
+            .expect("Expected DataSourceExec")
+            .data_source()
+            .downcast_ref::<IcebergDataSource>()
+            .expect("Expected IcebergDataSource");
 
         // Verify the limit is set
         assert_eq!(
-            iceberg_scan.limit(),
+            iceberg_scan.fetch(),
             Some(10),
             "Limit should be set to 10 in the scan plan"
         );
@@ -310,14 +314,17 @@ mod tests {
         // Test scan without limit
         let scan_plan = table_provider.scan(&state, None, &[], None).await.unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
+        // Verify that the scan plan wraps an IcebergDataSource.
         let iceberg_scan = scan_plan
-            .downcast_ref::<IcebergTableScan>()
-            .expect("Expected IcebergTableScan");
+            .downcast_ref::<DataSourceExec>()
+            .expect("Expected DataSourceExec")
+            .data_source()
+            .downcast_ref::<IcebergDataSource>()
+            .expect("Expected IcebergDataSource");
 
         // Verify the limit is None
         assert_eq!(
-            iceberg_scan.limit(),
+            iceberg_scan.fetch(),
             None,
             "Limit should be None when not specified"
         );

@@ -17,91 +17,88 @@
 
 use std::sync::Arc;
 
-use datafusion::catalog::TableProvider;
+use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::source::DataSource;
+use datafusion::error::Result;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use futures::TryStreamExt;
 
 use super::table::IcebergMetadataTableProvider;
 
-/// Scans an Iceberg metadata table, such as `$snapshots`.
-#[derive(Debug)]
-pub struct IcebergMetadataScan {
+/// Reads rows from an Iceberg metadata table through DataFusion's `DataSource` API.
+#[derive(Debug, Clone)]
+pub struct IcebergMetadataDataSource {
     provider: IcebergMetadataTableProvider,
-    properties: Arc<PlanProperties>,
 }
 
-impl IcebergMetadataScan {
-    /// Creates a scan of the metadata table `provider` reads.
+impl IcebergMetadataDataSource {
     pub fn new(provider: IcebergMetadataTableProvider) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(provider.schema()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        Self {
-            provider,
-            properties,
-        }
+        Self { provider }
     }
 
-    /// The provider this node scans.
+    /// The provider this source scans.
     pub fn provider(&self) -> &IcebergMetadataTableProvider {
         &self.provider
     }
 }
 
-impl DisplayAs for IcebergMetadataScan {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "IcebergMetadataScan")
-    }
-}
-
-impl ExecutionPlan for IcebergMetadataScan {
-    fn name(&self) -> &str {
-        "IcebergMetadataScan"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(
-            &Arc<dyn PhysicalExpr>,
-        ) -> datafusion::error::Result<TreeNodeRecursion>,
-    ) -> datafusion::error::Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
+impl DataSource for IcebergMetadataDataSource {
+    fn open(
         &self,
         _partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
         let fut = self.provider.clone().scan();
         let stream = futures::stream::once(fut).try_flatten();
         let schema = self.provider.schema();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "format=iceberg_metadata")
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(1)
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new(self.provider.schema())
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.provider.schema())))
+    }
+
+    fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        None
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        None
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn DataSource>>> {
+        Ok(None)
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 }

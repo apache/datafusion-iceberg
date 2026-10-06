@@ -18,5 +18,5 @@
 pub(crate) mod scan;
 pub(crate) mod table;
 
-pub use scan::IcebergMetadataScan;
+pub use scan::IcebergMetadataDataSource;
 pub use table::IcebergMetadataTableProvider;

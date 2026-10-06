@@ -19,4 +19,4 @@ pub(crate) mod predicate;
 pub(crate) mod scan;
 
 pub use predicate::convert_filters_to_predicate;
-pub use scan::IcebergTableScan;
+pub use scan::IcebergDataSource;

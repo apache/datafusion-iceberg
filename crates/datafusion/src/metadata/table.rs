@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::Expr;
@@ -31,7 +32,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
 
-use super::scan::IcebergMetadataScan;
+use super::scan::IcebergMetadataDataSource;
 use crate::to_datafusion_error;
 
 /// Represents a [`TableProvider`] for the Iceberg [`iceberg::Catalog`],
@@ -65,7 +66,9 @@ impl TableProvider for IcebergMetadataTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(IcebergMetadataScan::new(self.clone())))
+        Ok(DataSourceExec::from_data_source(
+            IcebergMetadataDataSource::new(self.clone()),
+        ))
     }
 }
 

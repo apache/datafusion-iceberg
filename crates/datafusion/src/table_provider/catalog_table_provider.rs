@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{config_datafusion_err, not_impl_err};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
@@ -35,7 +36,7 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
-use crate::read::scan::IcebergTableScan;
+use crate::read::IcebergDataSource;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -138,7 +139,7 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        Ok(Arc::new(IcebergTableScan::new(
+        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
             table,
             None, // Always use current snapshot for catalog-backed provider
             self.schema.clone(),
@@ -429,14 +430,17 @@ mod tests {
         // Test scan with limit
         let scan_plan = provider.scan(&state, None, &[], Some(5)).await.unwrap();
 
-        // Verify that the scan plan is an IcebergTableScan
+        // Verify that the scan plan wraps an IcebergDataSource.
         let iceberg_scan = scan_plan
-            .downcast_ref::<IcebergTableScan>()
-            .expect("Expected IcebergTableScan");
+            .downcast_ref::<DataSourceExec>()
+            .expect("Expected DataSourceExec")
+            .data_source()
+            .downcast_ref::<IcebergDataSource>()
+            .expect("Expected IcebergDataSource");
 
         // Verify the limit is set
         assert_eq!(
-            iceberg_scan.limit(),
+            iceberg_scan.fetch(),
             Some(5),
             "Limit should be set to 5 in the scan plan"
         );
@@ -452,7 +456,7 @@ mod tests {
             Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
         let out_of_range = schema.fields().len();
 
-        let err = IcebergTableScan::new(
+        let err = IcebergDataSource::new(
             table,
             None,
             schema,

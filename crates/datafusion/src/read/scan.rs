@@ -17,17 +17,18 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
+use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
@@ -38,25 +39,24 @@ use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
-#[derive(Debug)]
-pub struct IcebergTableScan {
+#[derive(Debug, Clone)]
+pub struct IcebergDataSource {
     /// A table in the catalog.
     table: Table,
     /// Snapshot of the table to scan.
     snapshot_id: Option<i64>,
-    /// Stores certain, often expensive to compute,
-    /// plan properties used in query optimization.
-    plan_properties: Arc<PlanProperties>,
-    /// The columns to read, by name: the fields of the output schema
+    /// Schema returned by this data source after projection.
+    schema: ArrowSchemaRef,
+    /// Projection column names in the output schema.
     projection: Vec<String>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
     /// Optional limit on the number of rows to return
-    limit: Option<usize>,
+    fetch: Option<usize>,
 }
 
-impl IcebergTableScan {
-    /// Creates a new [`IcebergTableScan`] object.
+impl IcebergDataSource {
+    /// Creates a new [`IcebergDataSource`] object.
     pub(crate) fn new(
         table: Table,
         snapshot_id: Option<i64>,
@@ -78,104 +78,30 @@ impl IcebergTableScan {
         ))
     }
 
-    /// Creates a scan of `table` from an already-converted Iceberg
-    /// [`Predicate`] rather than DataFusion filters, for rebuilding a scan from
-    /// its parts, such as after sending them to another process. A predicate
-    /// cannot be converted back to the filters it came from.
+    /// Rebuilds a source from the parts needed to scan an Iceberg table.
     ///
-    /// Each argument takes what the matching accessor returns (`schema` what
-    /// [`ExecutionPlan::schema`] does, and `predicates` what
-    /// [`Self::predicates`] does):
-    ///
-    /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
-    ///   snapshot.
-    /// - `schema`: the Arrow schema the scan outputs. The scan reads the
-    ///   columns of the same names from the snapshot it scans, and no others.
-    ///   A name that snapshot's schema lacks fails the scan when it runs.
-    /// - `predicates`: pushed down to Iceberg to skip data files and rows. The
-    ///   table providers report their filters as
-    ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
-    ///   so DataFusion still applies them above the scan.
-    /// - `limit`: the most rows the scan returns, or `None` for all of them.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use std::collections::HashMap;
-    ///
-    /// use datafusion::catalog::TableProvider;
-    /// use datafusion::physical_plan::ExecutionPlan;
-    /// use datafusion::prelude::{SessionContext, col, lit};
-    /// use datafusion_iceberg::IcebergStaticTableProvider;
-    /// use datafusion_iceberg::read::IcebergTableScan;
-    /// use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    /// use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    /// use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
-    ///
-    /// # tokio::runtime::Runtime::new()?.block_on(async {
-    /// # let warehouse = tempfile::tempdir()?;
-    /// # let props = HashMap::from([(
-    /// #     MEMORY_CATALOG_WAREHOUSE.to_string(),
-    /// #     warehouse.path().display().to_string(),
-    /// # )]);
-    /// # let catalog = MemoryCatalogBuilder::default().load("memory", props).await?;
-    /// # let namespace = NamespaceIdent::new("ns".to_string());
-    /// # catalog.create_namespace(&namespace, HashMap::new()).await?;
-    /// # let schema = Schema::builder()
-    /// #     .with_fields(vec![
-    /// #         NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-    /// #         NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
-    /// #             .into(),
-    /// #     ])
-    /// #     .build()?;
-    /// # let creation = TableCreation::builder().name("t".to_string()).schema(schema).build();
-    /// # let table = catalog.create_table(&namespace, creation).await?;
-    /// let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-    /// let ctx = SessionContext::new();
-    /// let filters = [col("id").gt(lit(1))];
-    /// let plan = provider
-    ///     .scan(&ctx.state(), Some(&vec![1]), &filters, None)
-    ///     .await?;
-    /// let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
-    ///
-    /// // Rebuild an equivalent scan from the original's accessors alone.
-    /// let rebuilt = IcebergTableScan::new_with_predicate(
-    ///     scan.table().clone(),
-    ///     scan.snapshot_id(),
-    ///     scan.schema(),
-    ///     scan.predicates().cloned(),
-    ///     scan.limit(),
-    /// );
-    /// assert_eq!(rebuilt.schema(), scan.schema());
-    /// assert_eq!(rebuilt.projection(), scan.projection());
-    /// assert_eq!(rebuilt.predicates(), scan.predicates());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # })?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
+    /// The supplied schema determines both the source's output schema and the
+    /// columns read from Iceberg. Callers can recreate a source from its
+    /// accessors after transporting those values to another process.
     pub fn new_with_predicate(
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
         predicates: Option<Predicate>,
-        limit: Option<usize>,
+        fetch: Option<usize>,
     ) -> Self {
-        // Reading the columns by name, rather than all of them, keeps the
-        // batches matching `schema` even when the table has columns it lacks.
         let projection = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        let plan_properties = Self::compute_properties(schema);
-
         Self {
             table,
             snapshot_id,
-            plan_properties,
+            schema,
             projection,
             predicates,
-            limit,
+            fetch,
         }
     }
 
@@ -187,8 +113,10 @@ impl IcebergTableScan {
         self.snapshot_id
     }
 
-    /// The names of the columns the scan reads, which are the fields of its
-    /// schema.
+    pub fn schema(&self) -> ArrowSchemaRef {
+        self.schema.clone()
+    }
+
     pub fn projection(&self) -> &[String] {
         &self.projection
     }
@@ -197,33 +125,12 @@ impl IcebergTableScan {
         self.predicates.as_ref()
     }
 
-    pub fn limit(&self) -> Option<usize> {
-        self.limit
-    }
-
-    /// Computes [`PlanProperties`] used in query optimization.
-    fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
-        // TODO:
-        // This is more or less a placeholder, to be replaced
-        // once we support output-partitioning
-        Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ))
+    pub fn fetch(&self) -> Option<usize> {
+        self.fetch
     }
 }
 
-impl ExecutionPlan for IcebergTableScan {
-    fn name(&self) -> &str {
-        "IcebergTableScan"
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
-        vec![]
-    }
-
+impl DataSource for IcebergDataSource {
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -231,18 +138,7 @@ impl ExecutionPlan for IcebergTableScan {
         Ok(TreeNodeRecursion::Continue)
     }
 
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn execute(
+    fn open(
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
@@ -250,14 +146,14 @@ impl ExecutionPlan for IcebergTableScan {
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
-            self.projection.clone(),
+            Some(self.projection.clone()),
             self.predicates.clone(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
-        // Apply limit if specified
+        // Apply the fetch if specified.
         let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(limit) = self.limit {
+            if let Some(limit) = self.fetch {
                 let mut remaining = limit;
                 Box::pin(stream.try_filter_map(move |batch| {
                     futures::future::ready(if remaining == 0 {
@@ -276,30 +172,54 @@ impl ExecutionPlan for IcebergTableScan {
             };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
+            self.schema.clone(),
             limited_stream,
         )))
     }
-}
 
-impl DisplayAs for IcebergTableScan {
     fn fmt_as(
         &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
+        _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(
-            f,
-            "IcebergTableScan projection:[{}] predicate:[{}]",
-            self.projection.join(","),
-            self.predicates
-                .clone()
-                .map_or(String::from(""), |p| format!("{p}"))
-        )?;
-        if let Some(limit) = self.limit {
-            write!(f, " limit:[{limit}]")?;
+        write!(f, "format=iceberg",)?;
+        write!(f, ", projection=[{}]", self.projection.join(", "))?;
+        if let Some(predicate) = &self.predicates {
+            write!(f, ", predicate={predicate}")?;
+        }
+        if let Some(fetch) = self.fetch {
+            write!(f, ", fetch={fetch}")?;
         }
         Ok(())
+    }
+
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::UnknownPartitioning(1)
+    }
+
+    fn eq_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new(self.schema.clone())
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+    }
+
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        let mut source = self.clone();
+        source.fetch = fetch;
+        Some(Arc::new(source))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    fn try_swapping_with_projection(
+        &self,
+        _projection: &ProjectionExprs,
+    ) -> Result<Option<Arc<dyn DataSource>>> {
+        Ok(None)
     }
 }
 
@@ -311,7 +231,7 @@ impl DisplayAs for IcebergTableScan {
 async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
-    column_names: Vec<String>,
+    column_names: Option<Vec<String>>,
     predicates: Option<Predicate>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
@@ -319,7 +239,10 @@ async fn get_batch_stream(
         None => table.scan(),
     };
 
-    let mut scan_builder = scan_builder.select(column_names);
+    let mut scan_builder = match column_names {
+        Some(column_names) => scan_builder.select(column_names),
+        None => scan_builder.select_all(),
+    };
     if let Some(pred) = predicates {
         scan_builder = scan_builder.with_filter(pred);
     }
