@@ -61,7 +61,7 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 `IcebergCatalogProvider` wraps an `iceberg::Catalog` and builds one `IcebergSchemaProvider` per namespace, each holding an `IcebergTableProvider` per table. Namespaces and tables are listed once, at construction, and are never refreshed. Tables created by other clients after that point are invisible.
 
 - Names like `<table>$snapshots`, `$manifests`, and `$history` resolve to `IcebergMetadataTableProvider`.
-- SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods, which call the async catalog through `spawn_blocking` + `block_on`. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.
+- SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods. On a multi-thread Tokio runtime they run the async catalog through `block_in_place` + `Handle::block_on`; without a caller runtime they create a current-thread runtime for the operation. Calls from a current-thread runtime return an error because blocking would stop that runtime from driving catalog I/O. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.
 
 ### Table providers (`table/`)
 

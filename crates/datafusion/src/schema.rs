@@ -32,6 +32,7 @@ use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
@@ -174,7 +175,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let name_clone = name.clone();
 
-        run_on_catalog_runtime("create-table", async move {
+        block_on_catalog("create-table", async move {
             // Verify the input table is empty - CREATE TABLE only accepts schema definition
             ensure_table_is_empty(&table).await?;
 
@@ -209,7 +210,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let table_name = name.to_string();
 
-        run_on_catalog_runtime("drop-table", async move {
+        block_on_catalog("drop-table", async move {
             let table_ident = TableIdent::new(namespace, table_name.clone());
 
             // Drop the table from the Iceberg catalog
@@ -228,35 +229,36 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 }
 
-/// Runs an async catalog operation on its own Tokio runtime thread.
+/// Runs a synchronous catalog operation without blocking a runtime that must drive it.
 ///
-/// `SchemaProvider` exposes synchronous registration methods. Blocking the caller's
-/// runtime while polling an async catalog operation can starve its I/O and timer
-/// drivers, and relying on `Handle::current()` also fails for synchronous callers
-/// outside a Tokio runtime.
-fn run_on_catalog_runtime<T, F>(operation: &'static str, future: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T>> + Send + 'static,
-{
-    std::thread::Builder::new()
-        .name(format!("iceberg-{operation}"))
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    exec_datafusion_err!(
-                        "Failed to create Tokio runtime for {operation}: {error}"
-                    )
-                })?;
-            runtime.block_on(future)
-        })
-        .map_err(|error| {
-            exec_datafusion_err!("Failed to spawn {operation} thread: {error}")
-        })?
-        .join()
-        .map_err(|_| exec_datafusion_err!("{operation} thread panicked"))?
+/// A multi-thread runtime can continue driving I/O while this worker blocks, so run the
+/// future on that runtime using `block_in_place`. A current-thread runtime cannot make
+/// progress while its caller blocks and must return an error. Synchronous callers with
+/// no current runtime can drive the future on a runtime created for the call.
+fn block_on_catalog<T>(
+    operation: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            RuntimeFlavor::CurrentThread => {
+                exec_err!("{operation} requires a multi-thread Tokio runtime")
+            }
+            _ => exec_err!("{operation} requires a multi-thread Tokio runtime"),
+        },
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                exec_datafusion_err!(
+                    "Failed to create Tokio runtime for {operation}: {error}"
+                )
+            })?
+            .block_on(future),
+    }
 }
 
 /// Verifies that a table provider contains no data by scanning with LIMIT 1.
@@ -326,7 +328,18 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct DelayedCatalog(Arc<dyn Catalog>);
+    struct DelayedCatalog(Arc<dyn Catalog>, Handle);
+
+    impl DelayedCatalog {
+        async fn delay_on_owner_runtime(&self) {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.1.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let _ = sender.send(());
+            });
+            receiver.await.unwrap();
+        }
+    }
 
     #[async_trait::async_trait]
     impl Catalog for DelayedCatalog {
@@ -386,7 +399,7 @@ mod tests {
             namespace: &NamespaceIdent,
             creation: TableCreation,
         ) -> iceberg::Result<Table> {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.delay_on_owner_runtime().await;
             self.0.create_table(namespace, creation).await
         }
 
@@ -395,7 +408,7 @@ mod tests {
         }
 
         async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.delay_on_owner_runtime().await;
             self.0.drop_table(table).await
         }
 
@@ -428,7 +441,9 @@ mod tests {
         }
     }
 
-    async fn create_delayed_test_schema_provider() -> (IcebergSchemaProvider, TempDir) {
+    async fn create_delayed_test_schema_provider(
+        with_existing_table: bool,
+    ) -> (IcebergSchemaProvider, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
         let catalog = MemoryCatalogBuilder::default()
@@ -443,7 +458,24 @@ mod tests {
             .create_namespace(&namespace, HashMap::new())
             .await
             .unwrap();
-        let catalog: Arc<dyn Catalog> = Arc::new(DelayedCatalog(Arc::new(catalog)));
+        if with_existing_table {
+            let arrow_schema =
+                ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]);
+            let iceberg_schema =
+                arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("existing_table".to_string())
+                        .schema(iceberg_schema)
+                        .build(),
+                )
+                .await
+                .unwrap();
+        }
+        let catalog: Arc<dyn Catalog> =
+            Arc::new(DelayedCatalog(Arc::new(catalog), Handle::current()));
         let provider = IcebergSchemaProvider::try_new(catalog, namespace)
             .await
             .unwrap();
@@ -451,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_register_table_with_async_catalog_on_current_thread_runtime() {
+    fn test_sync_catalog_operations_reject_current_thread_runtime() {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -460,7 +492,7 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let (schema_provider, _temp_dir) =
-                    create_delayed_test_schema_provider().await;
+                    create_delayed_test_schema_provider(true).await;
                 let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
                     "id",
                     DataType::Int32,
@@ -470,28 +502,54 @@ mod tests {
                 let mem_table =
                     MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
 
-                let result = schema_provider
+                let register_error = schema_provider
                     .register_table("async_table".to_string(), Arc::new(mem_table))
-                    .and_then(|_| {
-                        schema_provider.deregister_table("async_table").map(|_| ())
-                    })
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(result);
+                    .unwrap_err()
+                    .to_string();
+                let deregister_error = schema_provider
+                    .deregister_table("existing_table")
+                    .unwrap_err()
+                    .to_string();
+                let _ = sender.send((register_error, deregister_error));
             });
         });
 
-        let result = receiver
+        let (register_error, deregister_error) = receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("registration deadlocked the current-thread runtime");
-        assert!(
-            result.is_ok(),
-            "expected table registration and deregistration to complete: {result:?}"
-        );
+            .expect("catalog calls must return instead of deadlocking a current-thread runtime");
+        assert!(register_error.contains("requires a multi-thread"));
+        assert!(deregister_error.contains("requires a multi-thread"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sync_catalog_operations_on_multi_thread_runtime() {
+        let (schema_provider, _temp_dir) =
+            create_delayed_test_schema_provider(false).await;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]]).unwrap();
+
+        schema_provider
+            .register_table("async_table".to_string(), Arc::new(mem_table))
+            .unwrap();
+        assert!(schema_provider.table_exist("async_table"));
+        assert!(
+            schema_provider
+                .deregister_table("async_table")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!schema_provider.table_exist("async_table"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_table_registration_without_caller_runtime() {
-        let (schema_provider, _temp_dir) = create_delayed_test_schema_provider().await;
+        let (schema_provider, _temp_dir) =
+            create_delayed_test_schema_provider(false).await;
 
         std::thread::spawn(move || {
             let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -512,7 +570,7 @@ mod tests {
         .expect("synchronous schema methods should work without a caller runtime");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_table_with_data_fails() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -546,7 +604,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_empty_table_succeeds() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -570,7 +628,7 @@ mod tests {
         assert!(schema_provider.table_exist("empty_table"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_duplicate_table_fails() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -604,7 +662,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_deregister_table_succeeds() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
@@ -633,7 +691,7 @@ mod tests {
         assert!(!schema_provider.table_exist("drop_me"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_deregister_nonexistent_table_returns_none() {
         let (schema_provider, _temp_dir) = create_test_schema_provider().await;
 
