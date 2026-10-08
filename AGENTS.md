@@ -73,6 +73,8 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 `IcebergTableScan` converts the projection to column names and the filters to a single Iceberg `Predicate` (`physical_plan/expr_to_predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
 
+With the session option `iceberg.planning.preserve_data_ordering` (`config.rs`; off by default), `TableProvider::scan` lists the data files up front. If there are at most `iceberg.planning.max_merge_files` of them and all record the same resolvable sort order, the scan reports that order's leading fields as its output ordering and k-way merges one reader per file in `execute()`. Only identity transforms of projected top-level columns are reported, stopping at the first float, double, or UUID field, because Arrow orders -0.0 and NaN differently from Spark-written files. Otherwise the scan is built exactly as without the option. A scan rebuilt from its accessors must be given `sorted_tasks()` through `with_sorted_tasks`, or it will read the files unordered under a plan that relies on their order.
+
 Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `expr_to_predicate.rs`; for example, it is why date casts and some NaN arithmetic are deliberately not pushed down.
 
 ### Write path (`IcebergTableProvider::insert_into`)

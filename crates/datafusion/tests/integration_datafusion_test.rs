@@ -22,31 +22,45 @@ use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, AsArray, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    StructArray, UInt64Array,
+};
+use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::{
     cast, concat_batches, sort_to_indices, take_record_batch,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Int32Type, Int64Type, Schema as ArrowSchema,
+};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
-use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::joins::SortMergeJoinExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::prelude::SessionConfig;
 use datafusion_iceberg::physical_plan::{
     IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
 };
 use datafusion_iceberg::{
-    IcebergCatalogProvider, IcebergMetadataTableProvider, IcebergStaticTableProvider,
-    IcebergTableProvider,
+    IcebergCatalogProvider, IcebergDataFusionConfig, IcebergMetadataTableProvider,
+    IcebergStaticTableProvider, IcebergTableProvider,
 };
 use expect_test::expect;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    DataContentType, DataFileBuilder, DataFileFormat, ListType, NestedField, NullOrder,
+    PrimitiveType, Schema, SortDirection, SortField, SortOrder, Struct, StructType,
+    Transform, Type, UnboundPartitionSpec,
 };
+use iceberg::table::Table;
 use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
@@ -1382,5 +1396,564 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         +------+--------+"#]]
     .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
 
+    Ok(())
+}
+
+/// The id of the sort order of the tables `create_sorted_table` creates.
+const SORTED: Option<i32> = Some(1);
+
+/// Creates table `name`, sorted by `id` ascending, with columns `id`, `data`,
+/// a struct `info` and a list `tags`, whose values are derived from `id`. Each
+/// entry of `files` becomes one data file of the given ids, in the given order,
+/// which records the given sort order id.
+async fn create_sorted_table(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    name: &str,
+    files: &[(Option<i32>, &[i32])],
+) -> Result<Table, Box<dyn Error>> {
+    let sort_order = SortOrder::builder()
+        .with_sort_field(
+            SortField::builder()
+                .source_id(1)
+                .transform(Transform::Identity)
+                .direction(SortDirection::Ascending)
+                .null_order(NullOrder::First)
+                .build(),
+        )
+        .build_unbound()?;
+    let creation = TableCreation::builder()
+        .location(temp_path())
+        .name(name.to_string())
+        .schema(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(
+                        2,
+                        "data",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        3,
+                        "info",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                4,
+                                "tag",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        5,
+                        "tags",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                6,
+                                Type::Primitive(PrimitiveType::Int),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()?,
+        )
+        .sort_order(sort_order)
+        .build();
+    let table = catalog.create_table(namespace, creation).await?;
+    assert_eq!(
+        Some(table.metadata().default_sort_order_id() as i32),
+        SORTED
+    );
+
+    let arrow_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+    let (DataType::Struct(info_fields), DataType::List(tags_field)) = (
+        arrow_schema.field(2).data_type().clone(),
+        arrow_schema.field(3).data_type().clone(),
+    ) else {
+        unreachable!("info is a struct and tags a list");
+    };
+    let data_dir = format!("{}/data", table.metadata().location());
+    std::fs::create_dir_all(&data_dir)?;
+    let mut data_files = Vec::new();
+    for (i, (sort_order_id, ids)) in files.iter().enumerate() {
+        let path = format!("{data_dir}/{i}.parquet");
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|id| format!("row {id}")),
+                )),
+                Arc::new(StructArray::new(
+                    info_fields.clone(),
+                    vec![Arc::new(StringArray::from_iter_values(
+                        ids.iter().map(|id| format!("tag {id}")),
+                    ))],
+                    None,
+                )),
+                Arc::new(ListArray::new(
+                    tags_field.clone(),
+                    OffsetBuffer::from_lengths(ids.iter().map(|_| 2)),
+                    Arc::new(Int32Array::from_iter_values(
+                        ids.iter().flat_map(|id| [*id, -id]),
+                    )),
+                    None,
+                )),
+            ],
+        )?;
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path)?,
+            arrow_schema.clone(),
+            None,
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(DataContentType::Data)
+            .file_path(path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(std::fs::metadata(&path)?.len())
+            .record_count(ids.len() as u64)
+            .partition_spec_id(0)
+            .partition(Struct::empty());
+        if let Some(sort_order_id) = sort_order_id {
+            builder.sort_order_id(*sort_order_id);
+        }
+        data_files.push(builder.build()?);
+    }
+    let tx = Transaction::new(&table);
+    let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
+    Ok(tx.commit(catalog.as_ref()).await?)
+}
+
+/// A session that registers the Iceberg options, with
+/// `iceberg.planning.preserve_data_ordering` set to `preserve`.
+async fn ordering_session(
+    preserve: bool,
+    target_partitions: usize,
+) -> Result<SessionContext, Box<dyn Error>> {
+    let config = SessionConfig::new()
+        .with_target_partitions(target_partitions)
+        .with_option_extension(IcebergDataFusionConfig::default());
+    let ctx = SessionContext::new_with_config(config);
+    ctx.sql(&format!(
+        "SET iceberg.planning.preserve_data_ordering = {preserve}"
+    ))
+    .await?
+    .collect()
+    .await?;
+    Ok(ctx)
+}
+
+/// Plans `table` as a full scan in `ctx`.
+async fn plan_sorted_scan(
+    table: &Table,
+    ctx: &SessionContext,
+) -> Result<Arc<dyn ExecutionPlan>, Box<dyn Error>> {
+    let provider = IcebergStaticTableProvider::try_new_from_table(table.clone()).await?;
+    Ok(provider.scan(&ctx.state(), None, &[], None).await?)
+}
+
+/// The values of the `id` column, which must be the first, of `batches`.
+fn ids(batches: &[RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+async fn sorted_namespace() -> Result<(Arc<dyn Catalog>, NamespaceIdent), Box<dyn Error>>
+{
+    let catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("sorted".to_string());
+    set_test_namespace(&catalog, &namespace).await?;
+    Ok((Arc::new(catalog), namespace))
+}
+
+#[tokio::test]
+async fn test_sorted_scan_merges_files_with_overlapping_ranges()
+-> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[
+            (SORTED, &[1, 4, 7, 7]),
+            (SORTED, &[2, 4, 8]),
+            (SORTED, &[3, 5, 9]),
+        ],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+
+    let plan = plan_sorted_scan(&table, &ctx).await?;
+    let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+    assert_eq!(scan.sorted_tasks().map(<[_]>::len), Some(3));
+    assert_eq!(
+        plan.properties()
+            .output_ordering()
+            .map(|ordering| ordering.to_string()),
+        Some("id@0 ASC".to_string())
+    );
+    expect!["IcebergTableScan projection:[id,data,info,tags] predicate:[] output_ordering:[id@0 ASC] files:[3]"]
+        .assert_eq(displayable(plan.as_ref()).one_line().to_string().trim_end());
+
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    assert_eq!(ids(&batches), vec![1, 2, 3, 4, 4, 5, 7, 7, 8, 9]);
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    for row in 0..batch.num_rows() {
+        let id = batch.column(0).as_primitive::<Int32Type>().value(row);
+        assert_eq!(
+            batch.column(1).as_string::<i32>().value(row),
+            format!("row {id}")
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_struct()
+                .column(0)
+                .as_string::<i32>()
+                .value(row),
+            format!("tag {id}")
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_list::<i32>()
+                .value(row)
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[id, -id]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sorted_scan_merge_honors_limit() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[
+            (SORTED, &[1, 4, 7]),
+            (SORTED, &[2, 5, 8]),
+            (SORTED, &[3, 6, 9]),
+        ],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+
+    let plan = provider.scan(&ctx.state(), None, &[], Some(4)).await?;
+    assert!(plan.properties().output_ordering().is_some());
+    assert_eq!(
+        ids(&run_batches(plan.as_ref(), &ctx).await?),
+        vec![1, 2, 3, 4]
+    );
+    Ok(())
+}
+
+/// A scan reports no order, and is planned as it is without the option, when
+/// its files do not all record the same resolvable sort order.
+#[tokio::test]
+async fn test_sorted_scan_reports_no_order_unless_files_agree()
+-> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let cases: [(&str, [Option<i32>; 2]); 5] = [
+        ("unresolvable", [SORTED, Some(99)]),
+        ("missing", [SORTED, None]),
+        ("unsorted", [SORTED, Some(0)]),
+        ("all_unsorted", [Some(0), Some(0)]),
+        ("all_missing", [None, None]),
+    ];
+    let on = ordering_session(true, 4).await?;
+    let off = ordering_session(false, 4).await?;
+    for (name, [first, second]) in cases {
+        let table = create_sorted_table(
+            &catalog,
+            &namespace,
+            name,
+            &[(first, &[1, 3]), (second, &[2, 4])],
+        )
+        .await?;
+
+        let plan = plan_sorted_scan(&table, &on).await?;
+        let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+        assert!(scan.sorted_tasks().is_none(), "{name}");
+        assert!(plan.properties().output_ordering().is_none(), "{name}");
+        assert!(plan.metrics().is_none(), "{name}");
+        let unordered = plan_sorted_scan(&table, &off).await?;
+        assert_eq!(
+            displayable(plan.as_ref()).indent(true).to_string(),
+            displayable(unordered.as_ref()).indent(true).to_string(),
+            "{name}"
+        );
+
+        let mut rows = ids(&run_batches(plan.as_ref(), &on).await?);
+        rows.sort();
+        assert_eq!(rows, vec![1, 2, 3, 4], "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sorted_scan_is_opt_in_and_capped() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &[1]), (SORTED, &[2]), (SORTED, &[3])],
+    )
+    .await?;
+
+    let unregistered = SessionContext::new();
+    let plan = plan_sorted_scan(&table, &unregistered).await?;
+    assert!(plan.properties().output_ordering().is_none());
+
+    let off = ordering_session(false, 4).await?;
+    let plan = plan_sorted_scan(&table, &off).await?;
+    assert!(plan.properties().output_ordering().is_none());
+
+    let capped = ordering_session(true, 4).await?;
+    capped
+        .sql("SET iceberg.planning.max_merge_files = 2")
+        .await?
+        .collect()
+        .await?;
+    let plan = plan_sorted_scan(&table, &capped).await?;
+    assert!(plan.properties().output_ordering().is_none());
+
+    capped
+        .sql("SET iceberg.planning.max_merge_files = 3")
+        .await?
+        .collect()
+        .await?;
+    let plan = plan_sorted_scan(&table, &capped).await?;
+    assert!(plan.properties().output_ordering().is_some());
+    Ok(())
+}
+
+/// Plans and runs `sql` in `ctx`, returning the plan that ran and the ids it
+/// returned.
+async fn plan_and_run(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<(Arc<dyn ExecutionPlan>, Vec<i32>), Box<dyn Error>> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let batches =
+        datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    Ok((plan, ids(&batches)))
+}
+
+#[tokio::test]
+async fn test_sorted_scan_removes_sort_from_order_by() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[
+            (SORTED, &[1, 4, 7]),
+            (SORTED, &[2, 5, 8]),
+            (SORTED, &[3, 6, 9]),
+        ],
+    )
+    .await?;
+    let provider = Arc::new(IcebergStaticTableProvider::try_new_from_table(table).await?);
+    let on = ordering_session(true, 4).await?;
+    on.register_table("t", provider.clone())?;
+    let off = ordering_session(false, 4).await?;
+    off.register_table("t", provider)?;
+
+    let (plan, rows) = plan_and_run(&on, "SELECT id FROM t ORDER BY id").await?;
+    assert!(find_node::<SortExec>(&plan).is_none());
+    assert_eq!(rows, (1..=9).collect::<Vec<_>>());
+
+    let (plan, rows) = plan_and_run(&on, "SELECT id FROM t ORDER BY id LIMIT 4").await?;
+    assert!(find_node::<SortExec>(&plan).is_none());
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+
+    let (plan, rows) = plan_and_run(&on, "SELECT id FROM t ORDER BY id DESC").await?;
+    assert!(find_node::<SortExec>(&plan).is_some());
+    assert_eq!(rows, (1..=9).rev().collect::<Vec<_>>());
+
+    let (plan, rows) = plan_and_run(&off, "SELECT id FROM t ORDER BY id").await?;
+    assert!(find_node::<SortExec>(&plan).is_some());
+    assert_eq!(rows, (1..=9).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sorted_scan_removes_sort_from_sort_merge_join() -> Result<(), Box<dyn Error>>
+{
+    let (catalog, namespace) = sorted_namespace().await?;
+    let left = create_sorted_table(
+        &catalog,
+        &namespace,
+        "l",
+        &[(SORTED, &[1, 3, 5]), (SORTED, &[2, 4, 6])],
+    )
+    .await?;
+    let right = create_sorted_table(
+        &catalog,
+        &namespace,
+        "r",
+        &[(SORTED, &[2, 5]), (SORTED, &[3, 6, 7])],
+    )
+    .await?;
+    let sql = "SELECT l.id FROM l JOIN r ON l.id = r.id ORDER BY l.id";
+    for preserve in [true, false] {
+        let ctx = ordering_session(preserve, 4).await?;
+        ctx.sql("SET datafusion.optimizer.prefer_hash_join = false")
+            .await?
+            .collect()
+            .await?;
+        for (name, table) in [("l", &left), ("r", &right)] {
+            ctx.register_table(
+                name,
+                Arc::new(
+                    IcebergStaticTableProvider::try_new_from_table(table.clone()).await?,
+                ),
+            )?;
+        }
+
+        let (plan, rows) = plan_and_run(&ctx, sql).await?;
+        assert!(find_node::<SortMergeJoinExec>(&plan).is_some());
+        assert_eq!(find_node::<SortExec>(&plan).is_none(), preserve);
+        assert_eq!(rows, vec![2, 3, 5, 6]);
+    }
+    Ok(())
+}
+
+/// A scan rebuilt from the accessors of a sorted scan, and given its sorted
+/// tasks, reports and keeps the same order.
+#[tokio::test]
+async fn test_rebuilt_sorted_scan_keeps_order() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &[1, 3]), (SORTED, &[2, 4])],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    let plan = plan_sorted_scan(&table, &ctx).await?;
+    let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+    let tasks = scan.sorted_tasks().unwrap().to_vec();
+
+    let rebuilt = rebuild_scan(scan).with_sorted_tasks(tasks)?;
+    assert_eq!(
+        rebuilt.properties().output_ordering(),
+        plan.properties().output_ordering()
+    );
+    assert_eq!(ids(&run_batches(&rebuilt, &ctx).await?), vec![1, 2, 3, 4]);
+
+    assert!(rebuild_scan(scan).with_sorted_tasks(vec![]).is_err());
+    Ok(())
+}
+
+/// Returns `task` with `deletes` attached.
+fn with_deletes(
+    task: &FileScanTask,
+    deletes: Vec<FileScanTaskDeleteFile>,
+) -> Result<FileScanTask, Box<dyn Error>> {
+    Ok(FileScanTask::builder()
+        .with_file_size_in_bytes(task.file_size_in_bytes())
+        .with_start(task.start())
+        .with_length(task.length())
+        .with_record_count(task.record_count())
+        .with_data_file_path(task.data_file_path().to_string())
+        .with_data_file_format(task.data_file_format())
+        .with_schema(task.schema_ref())
+        .with_project_field_ids(task.project_field_ids().to_vec())
+        .with_predicate(task.predicate().cloned())
+        .with_deletes(deletes)
+        .with_partition(task.partition().cloned())
+        .with_partition_spec(task.partition_spec().cloned())
+        .with_name_mapping(task.name_mapping().cloned())
+        .with_sort_order_id(task.sort_order_id())
+        .with_sort_order(task.sort_order().cloned())
+        .with_case_sensitive(task.case_sensitive())
+        .build()?)
+}
+
+#[tokio::test]
+async fn test_sorted_scan_applies_position_deletes() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &[1, 4, 7]), (SORTED, &[2, 5, 8])],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    let plan = plan_sorted_scan(&table, &ctx).await?;
+    let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
+    let tasks = scan.sorted_tasks().unwrap();
+
+    // Deletes row 1 of each data file, ids 4 and 5.
+    let delete_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2147483546".to_string(),
+        )])),
+        Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2147483545".to_string(),
+        )])),
+    ]));
+    let mut paths: Vec<&str> = tasks.iter().map(|task| task.data_file_path()).collect();
+    paths.sort();
+    let delete_path = format!("{}/data/deletes.parquet", table.metadata().location());
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&delete_path)?,
+        delete_schema.clone(),
+        None,
+    )?;
+    writer.write(&RecordBatch::try_new(
+        delete_schema,
+        vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(Int64Array::from(vec![1, 1])),
+        ],
+    )?)?;
+    writer.close()?;
+    let delete = FileScanTaskDeleteFile::builder()
+        .with_file_path(delete_path.clone())
+        .with_file_size_in_bytes(std::fs::metadata(&delete_path)?.len())
+        .with_file_type(DataContentType::PositionDeletes)
+        .with_file_format(DataFileFormat::Parquet)
+        .with_partition_spec_id(0)
+        .build();
+    let tasks = tasks
+        .iter()
+        .map(|task| with_deletes(task, vec![delete.clone()]))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let rebuilt = rebuild_scan(scan).with_sorted_tasks(tasks)?;
+    assert_eq!(ids(&run_batches(&rebuilt, &ctx).await?), vec![1, 2, 7, 8]);
     Ok(())
 }
