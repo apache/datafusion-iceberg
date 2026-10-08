@@ -18,7 +18,9 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, UInt64Array,
+};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -35,7 +37,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::Catalog;
-use iceberg::spec::{DataFile, deserialize_data_file_from_json};
+use iceberg::spec::{DataFile, read_data_files_from_avro};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -237,6 +239,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let spec_id = self.table.metadata().default_partition_spec_id();
         let partition_type = self.table.metadata().default_partition_type().clone();
         let current_schema = self.table.metadata().current_schema().clone();
+        let format_version = self.table.metadata().format_version();
 
         let catalog = Arc::clone(&self.catalog);
 
@@ -259,35 +262,39 @@ impl ExecutionPlan for IcebergCommitExec {
                         )
                     })?
                     .as_any()
-                    .downcast_ref::<StringArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .ok_or_else(|| {
                         internal_datafusion_err!(
-                            "Expected 'data_files' column to be StringArray"
+                            "Expected 'data_files' column to be LargeBinaryArray"
                         )
                     })?;
 
-                // Deserialize all data files from the StringArray
-                let batch_files: Vec<DataFile> = files_array
-                    .into_iter()
-                    .flatten()
-                    .map(|f| -> Result<DataFile> {
-                        // Parse JSON to DataFileSerde and convert to DataFile
-                        deserialize_data_file_from_json(
-                            f,
-                            spec_id,
-                            &partition_type,
-                            &current_schema,
+                // Each value is a separate Avro container with one or more data files.
+                files_array.iter().try_for_each(|payload| {
+                    let mut payload = payload.ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Null Avro data file payload".to_string(),
                         )
-                        .map_err(to_datafusion_error)
-                    })
-                    .collect::<Result<_>>()?;
+                    })?;
+                    if payload.is_empty() {
+                        return Err(DataFusionError::Execution(
+                            "Empty Avro data file payload".to_string(),
+                        ));
+                    }
+                    let files = read_data_files_from_avro(
+                        &mut payload,
+                        &current_schema,
+                        spec_id,
+                        &partition_type,
+                        format_version,
+                    )
+                    .map_err(to_datafusion_error)?;
 
-                // add record_counts from the current batch to total record count
-                total_record_count +=
-                    batch_files.iter().map(|f| f.record_count()).sum::<u64>();
-
-                // Add all deserialized files to our collection
-                data_files.extend(batch_files);
+                    total_record_count +=
+                        files.iter().map(|f| f.record_count()).sum::<u64>();
+                    data_files.extend(files);
+                    Ok(())
+                })?;
             }
 
             // If no data files were collected, return a single row with count = 0
@@ -343,7 +350,7 @@ mod tests {
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType,
-        Schema, Struct, Type,
+        Schema, Struct, Type, write_data_files_to_avro,
     };
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
@@ -355,15 +362,15 @@ mod tests {
     #[derive(Debug)]
     struct MockWriteExec {
         schema: Arc<ArrowSchema>,
-        data_files_json: Vec<String>,
+        data_files_avro: Vec<Vec<u8>>,
         plan_properties: Arc<PlanProperties>,
     }
 
     impl MockWriteExec {
-        fn new(data_files_json: Vec<String>) -> Self {
+        fn new(data_files_avro: Vec<Vec<u8>>) -> Self {
             let schema = Arc::new(ArrowSchema::new(vec![Field::new(
                 DATA_FILES_COL_NAME,
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false,
             )]));
 
@@ -376,7 +383,7 @@ mod tests {
 
             Self {
                 schema,
-                data_files_json,
+                data_files_avro,
                 plan_properties,
             }
         }
@@ -419,8 +426,9 @@ mod tests {
             _context: Arc<TaskContext>,
         ) -> Result<SendableRecordBatchStream> {
             // Create a record batch with the serialized data files
-            let array =
-                Arc::new(StringArray::from(self.data_files_json.clone())) as ArrayRef;
+            let array = Arc::new(LargeBinaryArray::from_iter_values(
+                self.data_files_avro.iter(),
+            )) as ArrayRef;
             let batch = RecordBatch::try_new(self.schema.clone(), vec![array])?;
 
             // Create a stream that returns this batch
@@ -439,7 +447,7 @@ mod tests {
                 DisplayFormatType::Default
                 | DisplayFormatType::Verbose
                 | DisplayFormatType::TreeRender => {
-                    write!(f, "MockDataFilesExec: files={}", self.data_files_json.len())
+                    write!(f, "MockDataFilesExec: files={}", self.data_files_avro.len())
                 }
             }
         }
@@ -507,23 +515,27 @@ mod tests {
             .partition(Struct::empty())
             .build()?;
 
-        // Serialize data files to JSON
+        // Serialize each task's files into a separate Avro container
         let partition_type = table.metadata().default_partition_type().clone();
-        let data_file1_json = iceberg::spec::serialize_data_file_to_json(
-            data_file1.clone(),
+        let mut data_file1_avro = Vec::new();
+        write_data_files_to_avro(
+            &mut data_file1_avro,
+            [data_file1.clone()],
             &partition_type,
             table.metadata().format_version(),
         )?;
 
-        let data_file2_json = iceberg::spec::serialize_data_file_to_json(
-            data_file2.clone(),
+        let mut data_file2_avro = Vec::new();
+        write_data_files_to_avro(
+            &mut data_file2_avro,
+            [data_file2.clone()],
             &partition_type,
             table.metadata().format_version(),
         )?;
 
         // Create a mock execution plan that returns the serialized data files
         let input_exec =
-            Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]));
+            Arc::new(MockWriteExec::new(vec![data_file1_avro, data_file2_avro]));
 
         let commit_exec =
             IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec);
@@ -630,12 +642,14 @@ mod tests {
                 .partition_spec_id(table.metadata().default_partition_spec_id())
                 .partition(Struct::empty())
                 .build()?;
-            let json = iceberg::spec::serialize_data_file_to_json(
-                data_file,
+            let mut payload = Vec::new();
+            write_data_files_to_avro(
+                &mut payload,
+                [data_file],
                 &partition_type,
                 table.metadata().format_version(),
             )?;
-            partitions.push(Arc::new(MockWriteExec::new(vec![json])));
+            partitions.push(Arc::new(MockWriteExec::new(vec![payload])));
         }
         let input = UnionExec::try_new(partitions)?;
         assert_eq!(input.properties().partitioning.partition_count(), 2);

@@ -19,7 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
+use datafusion::arrow::array::{ArrayRef, LargeBinaryArray, RecordBatch};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -36,7 +36,9 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use iceberg::arrow::FieldMatchMode;
-use iceberg::spec::{DataFileFormat, serialize_data_file_to_json};
+use iceberg::spec::{
+    DataFile, DataFileFormat, FormatVersion, StructType, write_data_files_to_avro,
+};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -103,9 +105,21 @@ impl IcebergWriteExec {
         ))
     }
 
-    // Create a record batch with serialized data files
-    fn make_result_batch(data_files: Vec<String>) -> Result<RecordBatch> {
-        let files_array = Arc::new(StringArray::from(data_files)) as ArrayRef;
+    // Each row holds one Avro container, amortizing its schema over all files from a task.
+    fn make_result_batch(
+        data_files: Vec<DataFile>,
+        partition_type: &StructType,
+        format_version: FormatVersion,
+    ) -> Result<RecordBatch> {
+        if data_files.is_empty() {
+            return Ok(RecordBatch::new_empty(Self::make_result_schema()));
+        }
+
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(&mut buffer, data_files, partition_type, format_version)
+            .map_err(to_datafusion_error)?;
+        let files_array =
+            Arc::new(LargeBinaryArray::from_vec(vec![buffer.as_slice()])) as ArrayRef;
 
         RecordBatch::try_new(Self::make_result_schema(), vec![files_array]).map_err(|e| {
             DataFusionError::ArrowError(
@@ -119,7 +133,7 @@ impl IcebergWriteExec {
         // Define a schema.
         Arc::new(ArrowSchema::new(vec![Field::new(
             DATA_FILES_COL_NAME,
-            DataType::Utf8,
+            DataType::LargeBinary,
             false,
         )]))
     }
@@ -207,11 +221,12 @@ impl ExecutionPlan for IcebergWriteExec {
     /// +------------------+
     /// | data_files       |
     /// +------------------+
-    /// | "{"file_path":.. |  <- JSON string representing a data file
+    /// | Avro bytes       |  <- Avro container holding the task's data files
     /// +------------------+
     /// ```
     ///
-    /// Each row in the output contains a JSON string representing a data file that was written.
+    /// Each row contains an Avro container with the data files written by this task.
+    /// Tasks that write no files return an empty batch.
     ///
     /// This output can be used by a subsequent operation to commit the added files to the table.
     fn execute(
@@ -304,20 +319,7 @@ impl ExecutionPlan for IcebergWriteExec {
 
             let data_files = task_writer.close().await?;
 
-            // Convert builders to data files and then to JSON strings
-            let data_files_strs: Vec<String> = data_files
-                .into_iter()
-                .map(|data_file| {
-                    serialize_data_file_to_json(
-                        data_file,
-                        &partition_type,
-                        format_version,
-                    )
-                    .map_err(to_datafusion_error)
-                })
-                .collect::<Result<Vec<String>>>()?;
-
-            Self::make_result_batch(data_files_strs)
+            Self::make_result_batch(data_files, &partition_type, format_version)
         })
         .boxed();
 
@@ -349,8 +351,8 @@ mod tests {
     use futures::{StreamExt, stream};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataFileFormat, NestedField, PrimitiveType, Schema, Type,
-        deserialize_data_file_from_json,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField,
+        PrimitiveType, Schema, Struct, Type, read_data_files_from_avro,
     };
     use iceberg::{
         Catalog, CatalogBuilder, Error, ErrorKind, MemoryCatalog, NamespaceIdent,
@@ -488,6 +490,60 @@ mod tests {
             .build()
     }
 
+    #[test]
+    fn test_float_partition_metadata_roundtrip() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "f", Type::Primitive(PrimitiveType::Float))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let files: Vec<_> = [
+            Some(123.456_f32),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, value)| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("memory://data/{i}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(1024)
+                .record_count(1)
+                .partition(Struct::from_iter([value.map(Literal::float)]))
+                .build()
+                .unwrap()
+        })
+        .collect();
+        let batch = IcebergWriteExec::make_result_batch(
+            files.clone(),
+            schema.as_struct(),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let mut payload = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap()
+            .value(0);
+        let decoded = read_data_files_from_avro(
+            &mut payload,
+            &schema,
+            0,
+            schema.as_struct(),
+            FormatVersion::V2,
+        )
+        .unwrap();
+        assert_eq!(decoded, files);
+    }
+
     #[tokio::test]
     async fn test_iceberg_write_exec() -> Result<(), Box<dyn std::error::Error>> {
         // 1. Set up test environment
@@ -568,7 +624,7 @@ mod tests {
             result_batch.schema().as_ref(),
             &ArrowSchema::new(vec![Field::new(
                 DATA_FILES_COL_NAME,
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false
             )])
         );
@@ -576,26 +632,29 @@ mod tests {
         // Check data
         assert_eq!(result_batch.num_rows(), 1, "Expected one data file");
 
-        // Get the data file JSON
-        let data_file_json = result_batch
+        // Get the Avro container
+        let mut data_files_avro = result_batch
             .column(0)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray")
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("Expected LargeBinaryArray")
             .value(0);
 
-        // Deserialize the data file JSON
+        // Deserialize the Avro container
         let partition_type = table.metadata().default_partition_type();
         let spec_id = table.metadata().default_partition_spec_id();
         let schema = table.metadata().current_schema();
 
-        let data_file = deserialize_data_file_from_json(
-            data_file_json,
+        let data_files = read_data_files_from_avro(
+            &mut data_files_avro,
+            schema,
             spec_id,
             partition_type,
-            schema,
+            table.metadata().format_version(),
         )
-        .expect("Failed to deserialize data file JSON");
+        .expect("Failed to deserialize Avro data files");
+        assert_eq!(data_files.len(), 1);
+        let data_file = &data_files[0];
 
         // Verify data file properties
         assert_eq!(
@@ -680,11 +739,16 @@ mod tests {
             write_exec.schema().as_ref(),
             &ArrowSchema::new(vec![Field::new(
                 DATA_FILES_COL_NAME,
-                DataType::Utf8,
+                DataType::LargeBinary,
                 false
             )]),
             "IcebergWriteExec should advertise the data_files schema, not the table schema"
         );
+
+        let mut stream = write_exec.execute(0, Arc::new(TaskContext::default()))?;
+        let batch = stream.next().await.unwrap()?;
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema(), write_exec.schema());
 
         Ok(())
     }
