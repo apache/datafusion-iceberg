@@ -79,6 +79,11 @@ impl IcebergTableProvider {
     ///
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot load the table, or its schema has
+    /// no Arrow equivalent.
     pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -96,11 +101,76 @@ impl IcebergTableProvider {
                 .map_err(to_datafusion_error)?,
         );
 
-        Ok(IcebergTableProvider {
+        Ok(Self::new_with_schema(catalog, table_ident, schema))
+    }
+
+    /// Creates a catalog-backed table provider with a known schema, without
+    /// loading the table.
+    ///
+    /// For rebuilding a provider elsewhere, such as on a distributed engine's
+    /// scheduler, from the parts of one built with [`Self::try_new`]. Each
+    /// argument takes what the matching accessor returns ([`Self::catalog`],
+    /// [`Self::table_ident`], and [`TableProvider::schema`]), and the rebuilt
+    /// provider then plans exactly as the original does, even after the
+    /// table's schema has changed.
+    ///
+    /// Scans read the columns named in `schema` from the table's current
+    /// snapshot. A name the table lacks fails the scan when it runs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use std::sync::Arc;
+    /// #
+    /// use datafusion::catalog::TableProvider;
+    /// use datafusion_iceberg::IcebergTableProvider;
+    /// # use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    /// # use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    /// # use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    ///
+    /// # tokio::runtime::Runtime::new()?.block_on(async {
+    /// # let warehouse = tempfile::tempdir()?;
+    /// # let props = HashMap::from([(
+    /// #     MEMORY_CATALOG_WAREHOUSE.to_string(),
+    /// #     warehouse.path().display().to_string(),
+    /// # )]);
+    /// # let catalog = MemoryCatalogBuilder::default().load("memory", props).await?;
+    /// # let namespace = NamespaceIdent::new("ns".to_string());
+    /// # catalog.create_namespace(&namespace, HashMap::new()).await?;
+    /// # let schema = Schema::builder()
+    /// #     .with_fields(vec![
+    /// #         NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    /// #     ])
+    /// #     .build()?;
+    /// # let creation = TableCreation::builder().name("t".to_string()).schema(schema).build();
+    /// # catalog.create_table(&namespace, creation).await?;
+    /// # let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    /// let original = IcebergTableProvider::try_new(catalog, namespace, "t").await?;
+    ///
+    /// // Rebuild an equivalent provider from the original's accessors alone,
+    /// // without loading the table again.
+    /// let rebuilt = IcebergTableProvider::new_with_schema(
+    ///     original.catalog().clone(),
+    ///     original.table_ident().clone(),
+    ///     original.schema(),
+    /// );
+    /// assert_eq!(rebuilt.table_ident(), original.table_ident());
+    /// assert_eq!(rebuilt.schema(), original.schema());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # })?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_with_schema(
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        schema: ArrowSchemaRef,
+    ) -> Self {
+        IcebergTableProvider {
             catalog,
             table_ident,
             schema,
-        })
+        }
     }
 
     pub(crate) async fn metadata_table(
@@ -371,6 +441,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::common::Column;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::ExecutionPlan;
@@ -379,6 +450,7 @@ mod tests {
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::{StaticTable, Table};
+    use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
 
@@ -996,5 +1068,56 @@ mod tests {
                  bounds, max field {out_of_range}"
             )
         );
+    }
+
+    /// Runs `sql` on `ctx` and renders its rows as a table.
+    async fn query(ctx: &SessionContext, sql: &str) -> String {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        pretty_format_batches(&batches).unwrap().to_string()
+    }
+
+    /// A provider rebuilt from another's parts plans like the original even
+    /// after the table's schema changes: it keeps the schema the original was
+    /// built with, rather than loading the current one.
+    #[tokio::test]
+    async fn test_provider_rebuilt_with_schema_plans_like_the_original() {
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
+        let original =
+            IcebergTableProvider::try_new(catalog.clone(), namespace, table_name)
+                .await
+                .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(original.clone())).unwrap();
+        query(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+
+        // The schema changes after the original provider was built.
+        let table = catalog.load_table(original.table_ident()).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(
+                "email",
+                Type::Primitive(PrimitiveType::String),
+            ))
+            .apply(tx)
+            .unwrap();
+        tx.commit(catalog.as_ref()).await.unwrap();
+
+        let rebuilt = IcebergTableProvider::new_with_schema(
+            original.catalog().clone(),
+            original.table_ident().clone(),
+            original.schema(),
+        );
+
+        let rebuilt_ctx = SessionContext::new();
+        rebuilt_ctx.register_table("t", Arc::new(rebuilt)).unwrap();
+        let expected = "+----+------+\n\
+                        | id | name |\n\
+                        +----+------+\n\
+                        | 1  | a    |\n\
+                        +----+------+";
+        assert_eq!(query(&rebuilt_ctx, "SELECT * FROM t").await, expected);
+        assert_eq!(query(&ctx, "SELECT * FROM t").await, expected);
     }
 }
