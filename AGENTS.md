@@ -82,7 +82,7 @@ input
  → project_with_partition  partitioned tables only: appends a `_partition` struct column computed by `PartitionExpr`
  → repartition             hash on `_partition` for identity/bucket transforms, otherwise round-robin; uses session target_partitions
  → sort_by_partition       only when table property `write.datafusion.fanout.enabled` is false (default: true)
- → IcebergWriteExec        per partition: `TaskWriter` writes Parquet files and emits JSON-serialized DataFiles in a `data_files` column
+ → IcebergWriteExec        per partition: `TaskWriter` writes Parquet files and emits Avro-serialized DataFiles in a `data_files: LargeBinary` column
  → CoalescePartitionsExec
  → IcebergCommitExec       single partition: one `fast_append` transaction; outputs a `count` row
 ```
