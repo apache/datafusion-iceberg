@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::vec;
 
@@ -64,8 +65,8 @@ use iceberg::table::Table;
 use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
-    Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
-    TableCreation, TableIdent,
+    Catalog, CatalogBuilder, MemoryCatalog, MetadataLocation, NamespaceIdent,
+    Result as IcebergResult, TableCreation, TableIdent,
 };
 use tempfile::TempDir;
 
@@ -1027,13 +1028,22 @@ async fn run(
 }
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
-fn rebuild_scan(scan: &IcebergTableScan) -> IcebergTableScan {
+fn rebuild_scan(scan: &IcebergTableScan) -> datafusion::error::Result<IcebergTableScan> {
+    rebuild_scan_with_tasks(scan, scan.sorted_tasks().map(<[_]>::to_vec))
+}
+
+/// Rebuilds `scan` from its accessors, with `sorted_tasks` instead of its own.
+fn rebuild_scan_with_tasks(
+    scan: &IcebergTableScan,
+    sorted_tasks: Option<Vec<FileScanTask>>,
+) -> datafusion::error::Result<IcebergTableScan> {
     IcebergTableScan::new_with_predicate(
         scan.table().clone(),
         scan.snapshot_id(),
         scan.schema(),
         scan.predicates().cloned(),
         scan.limit(),
+        sorted_tasks,
     )
 }
 
@@ -1141,7 +1151,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         scan.predicates().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan)?;
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run(scan, &ctx).await?;
@@ -1159,7 +1169,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
     let scan = plan.downcast_ref::<IcebergTableScan>().expect("a scan");
     assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan)?;
     assert_eq!(rebuilt.limit(), Some(1));
     let expected = run(scan, &ctx).await?;
     expect![[r#"
@@ -1180,7 +1190,8 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         foo2_only,
         None,
         None,
-    );
+        None,
+    )?;
     expect![[r#"
         +--------+
         | foo2   |
@@ -1472,7 +1483,26 @@ async fn create_sorted_table(
         Some(table.metadata().default_sort_order_id() as i32),
         SORTED
     );
+    let files: Vec<_> = files
+        .iter()
+        .map(|(sort_order_id, ids)| {
+            (*sort_order_id, ids.iter().copied().map(Some).collect())
+        })
+        .collect();
+    append_sorted_files(catalog, &table, &files).await
+}
 
+/// Commits one data file of `table` per entry of `files`, with the given ids,
+/// in the given order, recording the given sort order id. The other columns'
+/// values are derived from `id`.
+async fn append_sorted_files(
+    catalog: &Arc<dyn Catalog>,
+    table: &Table,
+    files: &[(Option<i32>, Vec<Option<i32>>)],
+) -> Result<Table, Box<dyn Error>> {
+    if files.is_empty() {
+        return Ok(table.clone());
+    }
     let arrow_schema =
         Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
     let (DataType::Struct(info_fields), DataType::List(tags_field)) = (
@@ -1483,29 +1513,35 @@ async fn create_sorted_table(
     };
     let data_dir = format!("{}/data", table.metadata().location());
     std::fs::create_dir_all(&data_dir)?;
+    let snapshots = table.metadata().snapshots().count();
     let mut data_files = Vec::new();
     for (i, (sort_order_id, ids)) in files.iter().enumerate() {
-        let path = format!("{data_dir}/{i}.parquet");
+        let path = format!("{data_dir}/{snapshots}-{i}.parquet");
+        let label = |prefix: &str, id: &Option<i32>| match id {
+            Some(id) => format!("{prefix} {id}"),
+            None => format!("{prefix} null"),
+        };
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![
-                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(Int32Array::from(ids.clone())),
                 Arc::new(StringArray::from_iter_values(
-                    ids.iter().map(|id| format!("row {id}")),
+                    ids.iter().map(|id| label("row", id)),
                 )),
                 Arc::new(StructArray::new(
                     info_fields.clone(),
                     vec![Arc::new(StringArray::from_iter_values(
-                        ids.iter().map(|id| format!("tag {id}")),
+                        ids.iter().map(|id| label("tag", id)),
                     ))],
                     None,
                 )),
                 Arc::new(ListArray::new(
                     tags_field.clone(),
                     OffsetBuffer::from_lengths(ids.iter().map(|_| 2)),
-                    Arc::new(Int32Array::from_iter_values(
-                        ids.iter().flat_map(|id| [*id, -id]),
-                    )),
+                    Arc::new(Int32Array::from_iter_values(ids.iter().flat_map(|id| {
+                        let id = id.unwrap_or_default();
+                        [id, -id]
+                    }))),
                     None,
                 )),
             ],
@@ -1532,9 +1568,48 @@ async fn create_sorted_table(
         }
         data_files.push(builder.build()?);
     }
-    let tx = Transaction::new(&table);
+    let tx = Transaction::new(table);
     let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
     Ok(tx.commit(catalog.as_ref()).await?)
+}
+
+/// Stands in for another engine committing, without writing data, the current
+/// schema of `table` with the field of the same id as `field` replaced by it.
+/// iceberg-rust has no action that makes a column optional or promotes its
+/// type, so this rewrites the table's current metadata file in place.
+async fn replace_field_externally(
+    table: &Table,
+    field: NestedField,
+) -> Result<(), Box<dyn Error>> {
+    let current = table.metadata().current_schema();
+    let schema = Schema::builder()
+        .with_fields(current.as_struct().fields().iter().map(|current| {
+            if current.id == field.id {
+                Arc::new(field.clone())
+            } else {
+                current.clone()
+            }
+        }))
+        .build()?;
+    let metadata = table
+        .metadata()
+        .clone()
+        .into_builder(None)
+        .add_current_schema(schema)?
+        .build()?
+        .metadata;
+    let location = MetadataLocation::from_str(table.metadata_location_result()?)?;
+    metadata.write_to(table.file_io(), &location).await?;
+    Ok(())
+}
+
+/// The values, or nulls, of the `id` column, which must be the first, of
+/// `batches`.
+fn nullable_ids(batches: &[RecordBatch]) -> Vec<Option<i32>> {
+    batches
+        .iter()
+        .flat_map(|batch| batch.column(0).as_primitive::<Int32Type>().iter())
+        .collect()
 }
 
 /// A session that registers the Iceberg options, with
@@ -1846,8 +1921,8 @@ async fn test_sorted_scan_removes_sort_from_sort_merge_join() -> Result<(), Box<
     Ok(())
 }
 
-/// A scan rebuilt from the accessors of a sorted scan, and given its sorted
-/// tasks, reports and keeps the same order.
+/// A scan rebuilt from the accessors of a sorted scan reports and keeps the
+/// same order.
 #[tokio::test]
 async fn test_rebuilt_sorted_scan_keeps_order() -> Result<(), Box<dyn Error>> {
     let (catalog, namespace) = sorted_namespace().await?;
@@ -1861,16 +1936,16 @@ async fn test_rebuilt_sorted_scan_keeps_order() -> Result<(), Box<dyn Error>> {
     let ctx = ordering_session(true, 4).await?;
     let plan = plan_sorted_scan(&table, &ctx).await?;
     let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
-    let tasks = scan.sorted_tasks().unwrap().to_vec();
+    assert_eq!(scan.sorted_tasks().map(<[_]>::len), Some(2));
 
-    let rebuilt = rebuild_scan(scan).with_sorted_tasks(tasks)?;
+    let rebuilt = rebuild_scan(scan)?;
     assert_eq!(
         rebuilt.properties().output_ordering(),
         plan.properties().output_ordering()
     );
     assert_eq!(ids(&run_batches(&rebuilt, &ctx).await?), vec![1, 2, 3, 4]);
 
-    assert!(rebuild_scan(scan).with_sorted_tasks(vec![]).is_err());
+    assert!(rebuild_scan_with_tasks(scan, Some(vec![])).is_err());
     Ok(())
 }
 
@@ -1953,7 +2028,131 @@ async fn test_sorted_scan_applies_position_deletes() -> Result<(), Box<dyn Error
         .map(|task| with_deletes(task, vec![delete.clone()]))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let rebuilt = rebuild_scan(scan).with_sorted_tasks(tasks)?;
+    let rebuilt = rebuild_scan_with_tasks(scan, Some(tasks))?;
     assert_eq!(ids(&run_batches(&rebuilt, &ctx).await?), vec![1, 2, 7, 8]);
+    Ok(())
+}
+
+/// A provider created while `id` is required declares it non-nullable, and
+/// DataFusion ignores the null order of a non-nullable column. Once another
+/// engine makes `id` optional and writes a NULL, the scan must report no order,
+/// or `ORDER BY id`, which puts NULLs last, would keep the file's NULL first.
+#[tokio::test]
+async fn test_sorted_scan_reports_no_order_for_stale_nullability()
+-> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(&catalog, &namespace, "t", &[]).await?;
+    let provider = Arc::new(
+        IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), "t").await?,
+    );
+    let id = NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int));
+    replace_field_externally(&table, id).await?;
+    let table = catalog.load_table(table.identifier()).await?;
+    append_sorted_files(&catalog, &table, &[(SORTED, vec![None, Some(0), Some(7)])])
+        .await?;
+
+    for preserve in [false, true] {
+        let ctx = ordering_session(preserve, 4).await?;
+        ctx.register_table("t", provider.clone())?;
+        let plan = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let scan = find_node::<IcebergTableScan>(&plan).unwrap();
+        assert!(scan.sorted_tasks().is_none(), "preserve = {preserve}");
+        let batches =
+            datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+        assert_eq!(
+            nullable_ids(&batches),
+            vec![Some(0), Some(7), None],
+            "preserve = {preserve}"
+        );
+    }
+    Ok(())
+}
+
+/// Another engine promotes `id` from int to long without writing data. A
+/// provider created afterwards declares a long `id`, while the scan reads the
+/// snapshot's int, which the merge could not compare as declared.
+#[tokio::test]
+async fn test_sorted_scan_reports_no_order_for_promoted_type()
+-> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(
+        &catalog,
+        &namespace,
+        "t",
+        &[(SORTED, &[1, 3]), (SORTED, &[2, 4])],
+    )
+    .await?;
+    let id = NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long));
+    replace_field_externally(&table, id).await?;
+    let provider =
+        Arc::new(IcebergTableProvider::try_new(catalog.clone(), namespace, "t").await?);
+
+    for preserve in [false, true] {
+        let ctx = ordering_session(preserve, 4).await?;
+        ctx.register_table("t", provider.clone())?;
+        let plan = ctx
+            .sql("SELECT * FROM t")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let scan = find_node::<IcebergTableScan>(&plan).unwrap();
+        assert!(scan.sorted_tasks().is_none(), "preserve = {preserve}");
+        let batches =
+            datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 4, "preserve = {preserve}");
+    }
+    Ok(())
+}
+
+/// Iceberg sorts ascending fields with NULLs first by default, while
+/// DataFusion's `ORDER BY id` puts them last, so on a nullable sort column only
+/// `ORDER BY id NULLS FIRST` can use the order the scan reports.
+#[tokio::test]
+async fn test_sorted_scan_on_nullable_key() -> Result<(), Box<dyn Error>> {
+    let (catalog, namespace) = sorted_namespace().await?;
+    let table = create_sorted_table(&catalog, &namespace, "t", &[]).await?;
+    let id = NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int));
+    replace_field_externally(&table, id).await?;
+    let table = catalog.load_table(table.identifier()).await?;
+    let table = append_sorted_files(
+        &catalog,
+        &table,
+        &[
+            (SORTED, vec![None, Some(1), Some(4)]),
+            (SORTED, vec![None, Some(2), Some(3)]),
+        ],
+    )
+    .await?;
+    let ctx = ordering_session(true, 4).await?;
+    ctx.register_table(
+        "t",
+        Arc::new(IcebergStaticTableProvider::try_new_from_table(table).await?),
+    )?;
+
+    for (sql, sorts, expected) in [
+        (
+            "SELECT id FROM t ORDER BY id NULLS FIRST",
+            false,
+            vec![None, None, Some(1), Some(2), Some(3), Some(4)],
+        ),
+        (
+            "SELECT id FROM t ORDER BY id",
+            true,
+            vec![Some(1), Some(2), Some(3), Some(4), None, None],
+        ),
+    ] {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let scan = find_node::<IcebergTableScan>(&plan).unwrap();
+        assert_eq!(scan.sorted_tasks().map(<[_]>::len), Some(2), "{sql}");
+        assert_eq!(find_node::<SortExec>(&plan).is_some(), sorts, "{sql}");
+        let batches =
+            datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+        assert_eq!(nullable_ids(&batches), expected, "{sql}");
+    }
     Ok(())
 }

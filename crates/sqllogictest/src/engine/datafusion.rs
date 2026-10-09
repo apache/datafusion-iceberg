@@ -19,16 +19,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
 use datafusion::catalog::CatalogProvider;
+use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_iceberg::IcebergCatalogProvider;
+use datafusion_iceberg::{IcebergCatalogProvider, IcebergDataFusionConfig};
 use datafusion_sqllogictest::DataFusion;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::encryption::kms::MemoryKmsClientFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, TableProperties, Transform, Type,
-    UnboundPartitionSpec,
+    DataContentType, DataFileBuilder, DataFileFormat, NestedField, NullOrder,
+    PrimitiveType, Schema, SortDirection, SortField, SortOrder, Struct, TableProperties,
+    Transform, Type, UnboundPartitionSpec,
 };
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use indicatif::ProgressBar;
 
@@ -67,7 +72,8 @@ impl DataFusionEngine {
     pub async fn new(catalog_config: Option<DatafusionCatalogConfig>) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(4)
-            .with_information_schema(true);
+            .with_information_schema(true)
+            .with_option_extension(IcebergDataFusionConfig::default());
         let ctx = SessionContext::new_with_config(session_config);
         ctx.register_catalog(
             "default",
@@ -107,6 +113,7 @@ impl DataFusionEngine {
         Self::create_partitioned_table(&catalog, &namespace).await?;
         Self::create_binary_table(&catalog, &namespace).await?;
         Self::create_encrypted_table(&catalog, &namespace).await?;
+        Self::create_sorted_table(&catalog, &namespace).await?;
 
         Ok(Arc::new(
             IcebergCatalogProvider::try_new(Arc::new(catalog)).await?,
@@ -210,6 +217,88 @@ impl DataFusionEngine {
                     .build(),
             )
             .await?;
+
+        Ok(())
+    }
+
+    /// Create a table sorted by `id`, with two data files whose ids overlap,
+    /// each recording that sort order
+    /// TODO: this can be removed when INSERT writes sorted data files
+    async fn create_sorted_table(
+        catalog: &impl Catalog,
+        namespace: &NamespaceIdent,
+    ) -> anyhow::Result<()> {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()?;
+        let sort_order = SortOrder::builder()
+            .with_sort_field(
+                SortField::builder()
+                    .source_id(1)
+                    .transform(Transform::Identity)
+                    .direction(SortDirection::Ascending)
+                    .null_order(NullOrder::First)
+                    .build(),
+            )
+            .build_unbound()?;
+        let table = catalog
+            .create_table(
+                namespace,
+                TableCreation::builder()
+                    .name("test_sorted_table".to_string())
+                    .schema(schema)
+                    .sort_order(sort_order)
+                    .build(),
+            )
+            .await?;
+
+        let arrow_schema =
+            Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let mut data_files = Vec::new();
+        for (i, ids) in [[1, 3, 5], [2, 3, 4]].iter().enumerate() {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from_iter_values(
+                        ids.iter().map(|id| format!("name {id}")),
+                    )),
+                ],
+            )?;
+            let mut bytes = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut bytes, arrow_schema.clone(), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+
+            let path = format!("{}/data/sorted-{i}.parquet", table.metadata().location());
+            let file_size_in_bytes = bytes.len() as u64;
+            table
+                .file_io()
+                .new_output(&path)?
+                .write(bytes.into())
+                .await?;
+            data_files.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(path)
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(file_size_in_bytes)
+                    .record_count(ids.len() as u64)
+                    .partition_spec_id(0)
+                    .partition(Struct::empty())
+                    .sort_order_id(table.metadata().default_sort_order_id() as i32)
+                    .build()?,
+            );
+        }
+        let tx = Transaction::new(&table);
+        let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
+        tx.commit(catalog).await?;
 
         Ok(())
     }

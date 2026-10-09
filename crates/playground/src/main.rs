@@ -27,6 +27,7 @@ use datafusion_cli::exec;
 use datafusion_cli::object_storage::instrumented::InstrumentedObjectStoreRegistry;
 use datafusion_cli::print_format::PrintFormat;
 use datafusion_cli::print_options::{MaxRows, PrintOptions};
+use datafusion_iceberg::IcebergDataFusionConfig;
 use iceberg_playground::{ICEBERG_PLAYGROUND_VERSION, IcebergCatalogList};
 
 #[derive(Debug, Parser, PartialEq)]
@@ -80,7 +81,9 @@ async fn main_inner() -> anyhow::Result<()> {
         println!("ICEBERG PLAYGROUND v{ICEBERG_PLAYGROUND_VERSION}");
     }
 
-    let session_config = SessionConfig::from_env()?.with_information_schema(true);
+    let session_config = SessionConfig::from_env()?
+        .with_information_schema(true)
+        .with_option_extension(IcebergDataFusionConfig::default());
 
     let rt_builder = RuntimeEnvBuilder::new();
 

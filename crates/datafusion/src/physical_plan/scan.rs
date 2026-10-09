@@ -42,6 +42,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::spec::{
@@ -98,25 +99,24 @@ impl IcebergTableScan {
             None => schema,
             Some(projection) => Arc::new(schema.project(projection)?),
         };
-        Ok(Self::new_with_predicate(
+        Self::new_with_predicate(
             table,
             snapshot_id,
             output_schema,
             convert_filters_to_predicate(filters),
             limit,
-        ))
+            None,
+        )
     }
 
     /// Creates a scan of `table` from an already-converted Iceberg
     /// [`Predicate`] rather than DataFusion filters, for rebuilding a scan from
     /// its parts, such as after sending them to another process. A predicate
-    /// cannot be converted back to the filters it came from. A scan with
-    /// [`Self::sorted_tasks`] is only rebuilt once they are also passed to
-    /// [`Self::with_sorted_tasks`].
+    /// cannot be converted back to the filters it came from.
     ///
     /// Each argument takes what the matching accessor returns (`schema` what
-    /// [`ExecutionPlan::schema`] does, and `predicates` what
-    /// [`Self::predicates`] does):
+    /// [`ExecutionPlan::schema`] does, and `predicates` and `sorted_tasks`
+    /// what [`Self::predicates`] and [`Self::sorted_tasks`] do):
     ///
     /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
     ///   snapshot.
@@ -128,6 +128,15 @@ impl IcebergTableScan {
     ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
     ///   so DataFusion still applies them above the scan.
     /// - `limit`: the most rows the scan returns, or `None` for all of them.
+    /// - `sorted_tasks`: the data files to merge in the sort order they all
+    ///   record, which the scan then reports to DataFusion, or `None` to list
+    ///   the files when the scan runs and report no order. A plan built over a
+    ///   scan with sorted tasks may rely on their order, so a scan rebuilt from
+    ///   it must be given them.
+    ///
+    /// Fails if `sorted_tasks` do not all record a sort order the scan can
+    /// report over `schema`, or are read with a snapshot schema whose columns
+    /// do not match `schema`.
     ///
     /// # Example
     ///
@@ -176,7 +185,8 @@ impl IcebergTableScan {
     ///     scan.schema(),
     ///     scan.predicates().cloned(),
     ///     scan.limit(),
-    /// );
+    ///     scan.sorted_tasks().map(<[_]>::to_vec),
+    /// )?;
     /// assert_eq!(rebuilt.schema(), scan.schema());
     /// assert_eq!(rebuilt.projection(), scan.projection());
     /// assert_eq!(rebuilt.predicates(), scan.predicates());
@@ -190,7 +200,8 @@ impl IcebergTableScan {
         schema: ArrowSchemaRef,
         predicates: Option<Predicate>,
         limit: Option<usize>,
-    ) -> Self {
+        sorted_tasks: Option<Vec<FileScanTask>>,
+    ) -> Result<Self> {
         // Reading the columns by name, rather than all of them, keeps the
         // batches matching `schema` even when the table has columns it lacks.
         let projection = schema
@@ -198,9 +209,9 @@ impl IcebergTableScan {
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        let plan_properties = Self::compute_properties(schema, None);
+        let plan_properties = Self::compute_properties(schema.clone(), None);
 
-        Self {
+        let scan = Self {
             table,
             snapshot_id,
             plan_properties,
@@ -209,7 +220,18 @@ impl IcebergTableScan {
             limit,
             sorted: None,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
+        };
+        let Some(tasks) = sorted_tasks else {
+            return Ok(scan);
+        };
+        let Some(ordering) = shared_ordering(&tasks, &schema) else {
+            return plan_err!(
+                "IcebergTableScan cannot report an order for the given data files: \
+                 they do not all record the same sort order, or are read with a \
+                 schema that does not match the scan's"
+            );
+        };
+        Ok(scan.with_sorted(SortedTasks { tasks, ordering }))
     }
 
     /// Lists the scan's data files and reports the sort order they all record,
@@ -264,22 +286,6 @@ impl IcebergTableScan {
             Some(ordering) => self.with_sorted(SortedTasks { tasks, ordering }),
             None => self,
         })
-    }
-
-    /// Makes the scan read `tasks`, as returned by [`Self::sorted_tasks`], and
-    /// merge them in the sort order they all record, which it reports to
-    /// DataFusion. A scan rebuilt from the accessors of one that has sorted
-    /// tasks must be given them, as the plan above it may rely on that order.
-    ///
-    /// Fails if `tasks` do not all record a sort order the scan can report.
-    pub fn with_sorted_tasks(self, tasks: Vec<FileScanTask>) -> Result<Self> {
-        let Some(ordering) = shared_ordering(&tasks, &self.schema()) else {
-            return plan_err!(
-                "IcebergTableScan cannot report an order for the given data files: \
-                 they do not all record the same sort order over its columns"
-            );
-        };
-        Ok(self.with_sorted(SortedTasks { tasks, ordering }))
     }
 
     fn with_sorted(mut self, sorted: SortedTasks) -> Self {
@@ -348,13 +354,8 @@ impl IcebergTableScan {
         partition: usize,
         context: &TaskContext,
     ) -> Result<SendableRecordBatchStream> {
-        // The builder defaults to the reader settings `TableScan::to_arrow`
-        // uses, and a limit of one data file keeps a stream in its file's order.
-        let reader = self
-            .table
-            .reader_builder()
-            .with_data_file_concurrency_limit(1)
-            .build();
+        // The builder defaults to the reader settings `TableScan::to_arrow` uses.
+        let reader = self.table.reader_builder().build();
         let mut streams = sorted
             .tasks
             .iter()
@@ -543,7 +544,8 @@ fn build_table_scan(
 }
 
 /// The order of the columns of `output` that every one of `tasks` is sorted
-/// in, or `None` if they record different sort orders, or one records none.
+/// in, or `None` if they record different sort orders, one records none, or
+/// the schema they are read with does not match `output`.
 fn shared_ordering(tasks: &[FileScanTask], output: &ArrowSchema) -> Option<LexOrdering> {
     let first = tasks.first()?;
     let order = first.sort_order()?;
@@ -552,7 +554,27 @@ fn shared_ordering(tasks: &[FileScanTask], output: &ArrowSchema) -> Option<LexOr
     }) {
         return None;
     }
+    if !reads_as_declared(first.schema(), output) {
+        return None;
+    }
     lex_ordering(order, first.schema(), output)
+}
+
+/// Whether reading `schema`, the snapshot schema the tasks are read with,
+/// yields every column of `output` with the type it declares, and no nulls
+/// where it declares none. A provider's schema can be older than the
+/// snapshot's, and DataFusion ignores the null order of a non-nullable
+/// column, while the merge requires its input to match `output`.
+fn reads_as_declared(schema: &Schema, output: &ArrowSchema) -> bool {
+    let Ok(read) = schema_to_arrow_schema(schema) else {
+        return false;
+    };
+    output.fields().iter().all(|field| {
+        read.field_with_name(field.name()).is_ok_and(|read| {
+            read.data_type() == field.data_type()
+                && (field.is_nullable() || !read.is_nullable())
+        })
+    })
 }
 
 /// The longest leading part of `order` that DataFusion can merge and report as
@@ -611,7 +633,6 @@ fn orders_like_writers(field_type: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::arrow::schema_to_arrow_schema;
     use iceberg::spec::{NestedField, SortField, StructType};
 
     use super::*;

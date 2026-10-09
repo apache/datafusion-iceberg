@@ -26,7 +26,9 @@ extensions_options! {
     /// `SET iceberg.<group>.<option> = <value>` only works once this extension
     /// is registered on the session, with
     /// [`SessionConfig::with_option_extension`](datafusion::prelude::SessionConfig::with_option_extension).
-    /// Without it, every option keeps its default.
+    /// Without it, every option keeps its default. DataFusion lists these
+    /// options in `information_schema.df_settings` by their last name alone,
+    /// such as `max_merge_files`, and `SHOW` and `RESET` do not support them.
     pub struct IcebergDataFusionConfig {
         /// Options for planning table scans.
         pub planning: IcebergPlanningConfig, default = IcebergPlanningConfig::default()
@@ -45,6 +47,12 @@ extensions_options! {
         /// projected top-level columns are reported, stopping at the first
         /// floating point or UUID field, whose orders in Iceberg writers and in
         /// DataFusion can differ.
+        ///
+        /// Iceberg sorts ascending fields with nulls first by default, while
+        /// DataFusion's `ORDER BY c` puts them last. On a nullable sort column,
+        /// only `ORDER BY c NULLS FIRST`, or a session with
+        /// `datafusion.sql_parser.default_null_ordering = 'nulls_min'`, can
+        /// skip its sort. Other queries sort the merged output again.
         pub preserve_data_ordering: bool, default = false
         /// The most data files a scan merges to preserve their sort order.
         /// A scan of more files reports no order, and DataFusion sorts its
