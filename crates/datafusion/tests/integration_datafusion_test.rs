@@ -29,7 +29,7 @@ use datafusion::arrow::compute::{
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -860,7 +860,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
-    // Create a schema with a partition column
+    // Create a schema with string and nullable float partition columns
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -869,13 +869,20 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
                 .into(),
             NestedField::required(3, "value", Type::Primitive(PrimitiveType::String))
                 .into(),
+            NestedField::optional(
+                4,
+                "float_partition",
+                Type::Primitive(PrimitiveType::Float),
+            )
+            .into(),
         ])
         .build()?;
 
-    // Create partition spec with identity transform on category
+    // Identity-partition on both category and the float value
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
         .add_partition_field(2, "category", Transform::Identity)?
+        .add_partition_field(4, "float_partition", Transform::Identity)?
         .build();
 
     // Create the partitioned table
@@ -892,7 +899,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let client = Arc::new(iceberg_catalog);
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
 
-    let ctx = SessionContext::new();
+    // One task must return all five partition files in the same Avro payload.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     ctx.register_catalog("catalog", catalog);
 
     // Insert data with multiple partition values in a single batch
@@ -901,11 +910,12 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
             r#"
             INSERT INTO catalog.test_partitioned_write.partitioned_table 
             VALUES 
-                (1, 'electronics', 'laptop'),
-                (2, 'electronics', 'phone'),
-                (3, 'books', 'novel'),
-                (4, 'books', 'textbook'),
-                (5, 'clothing', 'shirt')
+                (1, 'electronics', 'laptop', CAST(123.456 AS REAL)),
+                (2, 'electronics', 'phone', CAST(123.456 AS REAL)),
+                (3, 'books', 'novel', CAST('NaN' AS REAL)),
+                (4, 'books', 'textbook', CAST('Infinity' AS REAL)),
+                (5, 'clothing', 'shirt', CAST('-Infinity' AS REAL)),
+                (6, 'clothing', 'coat', CAST(NULL AS REAL))
             "#,
         )
         .await
@@ -919,9 +929,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
-    assert_eq!(rows_inserted.value(0), 5);
+    assert_eq!(rows_inserted.value(0), 6);
 
-    // Query the table to verify data
+    // Read all rows without a filter, including NaN, infinities, and null.
     let df = ctx
         .sql("SELECT * FROM catalog.test_partitioned_write.partitioned_table ORDER BY id")
         .await
@@ -935,7 +945,8 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
             Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} },
+            Field { "float_partition": nullable Float32, metadata: {"PARQUET:field_id": "4"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
@@ -944,6 +955,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               3,
               4,
               5,
+              6,
             ],
             category: StringArray
             [
@@ -951,6 +963,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               "electronics",
               "books",
               "books",
+              "clothing",
               "clothing",
             ],
             value: StringArray
@@ -960,14 +973,41 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               "novel",
               "textbook",
               "shirt",
+              "coat",
+            ],
+            float_partition: PrimitiveArray<Float32>
+            [
+              123.456,
+              123.456,
+              NaN,
+              inf,
+              -inf,
+              null,
             ]"#]],
         &[],
         Some("id"),
     );
 
-    // Verify that data files exist under correct partition paths
+    // Verify all five partition files and six rows were committed.
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
     let table = client.load_table(&table_ident).await?;
+
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut file_count = 0;
+    let mut row_count = 0;
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        file_count += manifest.entries().len();
+        row_count += manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().record_count())
+            .sum::<u64>();
+    }
+    assert_eq!(file_count, 5);
+    assert_eq!(row_count, 6);
+
     let table_location = table.metadata().location();
     let file_io = table.file_io();
 
