@@ -73,6 +73,8 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 `IcebergTableScan` converts the projection to column names and the filters to a single Iceberg `Predicate` (`physical_plan/expr_to_predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
 
+With the session option `iceberg.planning.preserve_data_ordering` (`config.rs`; off by default), `TableProvider::scan` lists the data files up front. If there are at most `iceberg.planning.max_merge_files` of them and all record the same resolvable sort order, the scan reports that order's leading fields as its output ordering and k-way merges one reader per file in `execute()`. Only identity transforms of projected top-level columns are reported, stopping at the first float, double, or UUID field, because Arrow orders -0.0 and NaN differently from Spark-written files. Otherwise the scan is built exactly as without the option. A scan rebuilt with `new_with_predicate` must be given what `sorted_tasks()` returns, or it will read the files unordered under a plan that relies on their order. The order is also not reported unless the provider's declared schema matches the snapshot schema the files are read with, since DataFusion ignores the null order of a column declared non-nullable.
+
 Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `expr_to_predicate.rs`; for example, it is why date casts and some NaN arithmetic are deliberately not pushed down.
 
 ### Write path (`IcebergTableProvider::insert_into`)
@@ -98,11 +100,12 @@ Library code returns `datafusion::error::Result`. Convert iceberg errors with `t
 ## sqllogictest harness (`crates/sqllogictest`)
 
 - It's a custom `harness = false` runner using libtest-mimic. Each TOML file in `testdata/schedules/` is one test: it declares engines and ordered `[[steps]]` that point at `.slt` files under `testdata/slts/`. An `.slt` file that no schedule references never runs.
-- Each schedule gets a fresh `SessionContext` (`target_partitions = 4`, information_schema enabled) and a fresh in-memory Iceberg catalog. The catalog is registered as `default` with namespace `default`, so SQL addresses tables as `default.default.<table>`. `datafusion` is the only engine type. The `catalog` setting in a schedule is parsed but ignored.
+- Each schedule gets a fresh `SessionContext` (`target_partitions = 4`, information_schema enabled, `IcebergDataFusionConfig` registered) and a fresh in-memory Iceberg catalog. The catalog is registered as `default` with namespace `default`, so SQL addresses tables as `default.default.<table>`. `datafusion` is the only engine type. The `catalog` setting in a schedule is parsed but ignored.
 - `engine/datafusion.rs` pre-creates the tables SQL can't express yet:
   - `test_partitioned_table`: identity-partitioned on `category`
   - `test_binary_table`
   - `test_encrypted_round_trip`: format V3, encrypted with in-memory KMS key `test-master-key`
+  - `test_sorted_table`: sorted by `id`, with two data files whose ids overlap, each recording that sort order
 
   All other tables are created by `CREATE TABLE` inside the `.slt` files.
 - Several `.slt` files assert `EXPLAIN` output, such as `IcebergTableScan projection:[...] predicate:[...] limit:[...]`. Changes to the scan's `DisplayAs`, to pushdown, or to the DataFusion version require updating those expectations by hand; the harness has no auto-complete mode.

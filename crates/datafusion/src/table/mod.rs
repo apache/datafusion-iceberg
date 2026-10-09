@@ -139,7 +139,7 @@ impl TableProvider for IcebergTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -152,14 +152,15 @@ impl TableProvider for IcebergTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        Ok(Arc::new(IcebergTableScan::new(
+        let scan = IcebergTableScan::new(
             table,
             None, // Always use current snapshot for catalog-backed provider
             self.schema.clone(),
             projection,
             filters,
             limit,
-        )?))
+        )?;
+        Ok(Arc::new(scan.plan_sort_order(state).await?))
     }
 
     fn supports_filters_pushdown(
@@ -329,20 +330,21 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        Ok(Arc::new(IcebergTableScan::new(
+        let scan = IcebergTableScan::new(
             self.table.clone(),
             self.snapshot_id,
             self.schema.clone(),
             projection,
             filters,
             limit,
-        )?))
+        )?;
+        Ok(Arc::new(scan.plan_sort_order(state).await?))
     }
 
     fn supports_filters_pushdown(
