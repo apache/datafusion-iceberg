@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, LargeBinaryArray, RecordBatch};
+use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -118,8 +119,11 @@ impl IcebergWriteExec {
         let mut buffer = Vec::new();
         write_data_files_to_avro(&mut buffer, data_files, partition_type, format_version)
             .map_err(to_datafusion_error)?;
-        let files_array =
-            Arc::new(LargeBinaryArray::from_vec(vec![buffer.as_slice()])) as ArrayRef;
+        let files_array = Arc::new(LargeBinaryArray::new(
+            OffsetBuffer::from_lengths([buffer.len()]),
+            Buffer::from_vec(buffer),
+            None,
+        )) as ArrayRef;
 
         RecordBatch::try_new(Self::make_result_schema(), vec![files_array]).map_err(|e| {
             DataFusionError::ArrowError(
