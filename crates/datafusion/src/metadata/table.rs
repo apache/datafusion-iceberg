@@ -62,12 +62,12 @@ impl TableProvider for IcebergMetadataTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(DataSourceExec::from_data_source(
-            IcebergMetadataDataSource::new(self.clone()),
+            IcebergMetadataDataSource::try_new(self.clone(), projection)?,
         ))
     }
 }

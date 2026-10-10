@@ -476,6 +476,114 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn test_metadata_table_projections() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("ns".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let creation = get_table_creation(temp_path(), "t1", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client).await?);
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    // commit twice to create two snapshots
+    ctx.sql("INSERT INTO catalog.ns.t1 VALUES (1, 'foo')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    ctx.sql("INSERT INTO catalog.ns.t1 VALUES (2, 'bar')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let single_projected_column_result = ctx
+        .sql("SELECT operation FROM catalog.ns.t1$snapshots")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    check_record_batches(
+        single_projected_column_result,
+        expect![[
+            r#"Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} }"#
+        ]],
+        expect![[r#"
+            operation: StringArray
+            [
+              "append",
+              "append",
+            ]"#]],
+        &[],
+        None,
+    );
+
+    let multiple_projected_columns_result = ctx
+        .sql("SELECT operation, snapshot_id FROM catalog.ns.t1$snapshots")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    check_record_batches(
+        multiple_projected_columns_result,
+        expect![[r#"
+            Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
+            Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} }"#]],
+        expect![[r#"
+            operation: StringArray
+            [
+              "append",
+              "append",
+            ],
+            snapshot_id: (skipped)"#]],
+        &["snapshot_id"],
+        None,
+    );
+
+    let aggregated_columns_result = ctx
+        .sql("SELECT count(*) FROM catalog.ns.t1$snapshots")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    check_record_batches(
+        aggregated_columns_result,
+        expect![[r#"Field { "count(*)": Int64 }"#]],
+        expect![[r#"
+            count(*): PrimitiveArray<Int64>
+            [
+              2,
+            ]"#]],
+        &[],
+        None,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_insert_into".to_string());
@@ -650,8 +758,8 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     // Insert data with nested structs
     let insert_sql = r#"
     INSERT INTO catalog.test_insert_nested.nested_table
-    SELECT 
-        1 as id, 
+    SELECT
+        1 as id,
         'Alice' as name,
         named_struct(
             'address', named_struct(
@@ -665,8 +773,8 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
             )
         ) as profile
     UNION ALL
-    SELECT 
-        2 as id, 
+    SELECT
+        2 as id,
         'Bob' as name,
         named_struct(
             'address', named_struct(
@@ -788,15 +896,15 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let df = ctx
         .sql(
             r#"
-            SELECT 
-                id, 
+            SELECT
+                id,
                 name,
                 profile.address.street,
                 profile.address.city,
                 profile.address.zip,
                 profile.contact.email,
                 profile.contact.phone
-            FROM catalog.test_insert_nested.nested_table 
+            FROM catalog.test_insert_nested.nested_table
             ORDER BY id
         "#,
         )
@@ -904,8 +1012,8 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let df = ctx
         .sql(
             r#"
-            INSERT INTO catalog.test_partitioned_write.partitioned_table 
-            VALUES 
+            INSERT INTO catalog.test_partitioned_write.partitioned_table
+            VALUES
                 (1, 'electronics', 'laptop'),
                 (2, 'electronics', 'phone'),
                 (3, 'books', 'novel'),
@@ -1214,10 +1322,13 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .expect("an Iceberg metadata source");
     let provider = metadata_scan.provider();
     assert_eq!(provider.table().identifier(), &ident);
-    let rebuilt = IcebergMetadataDataSource::new(IcebergMetadataTableProvider::new(
-        provider.table().clone(),
-        provider.metadata_type().clone(),
-    ));
+    let rebuilt = IcebergMetadataDataSource::try_new(
+        IcebergMetadataTableProvider::new(
+            provider.table().clone(),
+            provider.metadata_type().clone(),
+        ),
+        None,
+    )?;
     let batches = run_batches(metadata_exec, &ctx).await?;
     // Snapshots come back in no set order, so put the first, which has no
     // parent, first. Their ids, times and paths differ on every run, so each

@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::TableProvider;
@@ -27,7 +28,7 @@ use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use super::table::IcebergMetadataTableProvider;
 
@@ -35,11 +36,25 @@ use super::table::IcebergMetadataTableProvider;
 #[derive(Debug, Clone)]
 pub struct IcebergMetadataDataSource {
     provider: IcebergMetadataTableProvider,
+    schema: ArrowSchemaRef,
+    projection: Option<Vec<usize>>,
 }
 
 impl IcebergMetadataDataSource {
-    pub fn new(provider: IcebergMetadataTableProvider) -> Self {
-        Self { provider }
+    /// Creates a source with the requested output columns.
+    pub fn try_new(
+        provider: IcebergMetadataTableProvider,
+        projection: Option<&Vec<usize>>,
+    ) -> Result<Self> {
+        let schema = match projection {
+            Some(indices) => Arc::new(provider.schema().project(indices)?),
+            None => provider.schema(),
+        };
+        Ok(Self {
+            provider,
+            schema,
+            projection: projection.cloned(),
+        })
     }
 
     /// The provider this source scans.
@@ -55,9 +70,25 @@ impl DataSource for IcebergMetadataDataSource {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let fut = self.provider.clone().scan();
-        let stream = futures::stream::once(fut).try_flatten();
-        let schema = self.provider.schema();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        let projection = self.projection.clone();
+
+        // TODO: Push these projections down into the scan layer instead of manually iterating over the result set
+        // and applying them.
+        // This will be possible once this issue is addressed in iceberg-rust: https://github.com/apache/iceberg-rust/issues/3391
+        let stream =
+            futures::stream::once(fut)
+                .try_flatten()
+                .map(move |result| -> Result<_> {
+                    let batch = result?;
+                    match &projection {
+                        Some(indices) => Ok(batch.project(indices)?),
+                        None => Ok(batch),
+                    }
+                });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            stream,
+        )))
     }
 
     fn fmt_as(
@@ -73,11 +104,11 @@ impl DataSource for IcebergMetadataDataSource {
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
-        EquivalenceProperties::new(self.provider.schema())
+        EquivalenceProperties::new(self.schema.clone())
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        Ok(Arc::new(Statistics::new_unknown(&self.provider.schema())))
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
     }
 
     fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
