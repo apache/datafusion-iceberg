@@ -18,7 +18,8 @@
 .idea/
 target/
 
-# Apache RAT artifacts (see dev/release/run-rat.sh)
+# Release artifacts (see dev/release/README.md)
+dev/dist
 apache-rat-*.jar
 rat.txt
 filtered_rat.txt
