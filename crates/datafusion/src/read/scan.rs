@@ -31,7 +31,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
-use iceberg::expr::Predicate;
+use iceberg::expr::{Bind, Predicate};
 use iceberg::table::Table;
 
 use super::predicate::convert_filters_to_predicate;
@@ -65,6 +65,18 @@ impl IcebergDataSource {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Self> {
+        let scan_schema = match snapshot_id {
+            Some(id) => table.metadata().snapshot_by_id(id),
+            None => table.metadata().current_snapshot(),
+        }
+        .map(|snapshot| snapshot.schema(table.metadata()))
+        .transpose()
+        .map_err(to_datafusion_error)?
+        .unwrap_or_else(|| table.metadata().current_schema().clone());
+        // DataFusion accepts isnan(integer_column), but Iceberg only supports
+        // IS NAN on floating-point columns.
+        let predicates = convert_filters_to_predicate(filters)
+            .filter(|predicate| predicate.bind(scan_schema, true).is_ok());
         let output_schema = match projection {
             None => schema,
             Some(projection) => Arc::new(schema.project(projection)?),
@@ -73,7 +85,7 @@ impl IcebergDataSource {
             table,
             snapshot_id,
             output_schema,
-            convert_filters_to_predicate(filters),
+            predicates,
             limit,
         ))
     }

@@ -29,6 +29,9 @@ use iceberg::spec::{Datum, PrimitiveLiteral};
 // A datafusion expression could be an Iceberg predicate, column, or literal.
 enum TransformedResult {
     Predicate(Predicate),
+    // A necessary condition obtained by dropping unsupported conjuncts.
+    // It is safe to push down, but must not be negated.
+    PartialPredicate(Predicate),
     Column(Reference),
     Literal(Datum),
     NotTransformed,
@@ -44,6 +47,9 @@ enum OpTransformedResult {
 /// Converts DataFusion filters ([`Expr`]) to an iceberg [`Predicate`].
 /// If none of the filters could be converted, return `None` which adds no predicates to the scan operation.
 /// If the conversion was successful, return the converted predicates combined with an AND operator.
+///
+/// Column casts are not pushed down. Callers must verify that the returned
+/// predicate binds to the scan schema before using it for pushdown.
 pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
     filters
         .iter()
@@ -53,7 +59,8 @@ pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
     match to_iceberg_predicate(expr) {
-        TransformedResult::Predicate(predicate) => Some(predicate),
+        TransformedResult::Predicate(predicate)
+        | TransformedResult::PartialPredicate(predicate) => Some(predicate),
         TransformedResult::Column(column) => {
             // A bare column in a filter context represents a boolean column check
             // Convert it to: column = true
@@ -145,15 +152,12 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
                 _ => TransformedResult::NotTransformed,
             }
         }
-        Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32
-                || *c.field.data_type() == DataType::Date64
-            {
-                // Casts to date truncate the expression, we cannot simply extract it as it
-                // can create erroneous predicates.
-                return TransformedResult::NotTransformed;
+        Expr::Cast(_) => {
+            // Without source-column types we cannot prove a cast safe to remove.
+            match literal_value(expr).as_ref().and_then(scalar_value_to_datum) {
+                Some(datum) => TransformedResult::Literal(datum),
+                None => TransformedResult::NotTransformed,
             }
-            to_iceberg_predicate(&c.expr)
         }
         Expr::Like(Like {
             negated,
@@ -260,10 +264,11 @@ fn scalar_function_to_iceberg_predicate(
 ///
 /// * negation: `-x` is NaN iff `x` is NaN
 /// * `abs(x)`: `abs(x)` is NaN iff `x` is NaN
-/// * casts between numeric types preserve NaN
 /// * `x + c`, `c + x`, `x - c`, `c - x` for a finite literal `c`
 /// * `x * c`, `c * x`, `x / c` for a finite, non-zero literal `c`
 ///
+/// Casts are not unwrapped: the source type is unknown, and an integer or string
+/// column cannot be used in an Iceberg `IS NAN` predicate.
 /// Multiplication/division by zero and `c / x` are intentionally rejected: e.g.
 /// `x * 0` is NaN when `x` is `±inf`, so it does not imply `x` is NaN.
 ///
@@ -272,16 +277,6 @@ fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),
         Expr::Negative(inner) => resolve_nan_preserving_reference(inner),
-        Expr::Cast(cast) => {
-            // Casts to date truncate the value and are not numeric, so they
-            // cannot be treated as NaN-preserving.
-            if *cast.field.data_type() == DataType::Date32
-                || *cast.field.data_type() == DataType::Date64
-            {
-                return None;
-            }
-            resolve_nan_preserving_reference(&cast.expr)
-        }
         Expr::ScalarFunction(ScalarFunction { func, args })
             if func.name() == "abs" && args.len() == 1 =>
         {
@@ -375,8 +370,22 @@ fn to_iceberg_and_predicate(
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.and(right))
         }
-        (TransformedResult::Predicate(left), _) => TransformedResult::Predicate(left),
-        (_, TransformedResult::Predicate(right)) => TransformedResult::Predicate(right),
+        (
+            TransformedResult::Predicate(left)
+            | TransformedResult::PartialPredicate(left),
+            TransformedResult::Predicate(right)
+            | TransformedResult::PartialPredicate(right),
+        ) => TransformedResult::PartialPredicate(left.and(right)),
+        (
+            TransformedResult::Predicate(predicate)
+            | TransformedResult::PartialPredicate(predicate),
+            _,
+        )
+        | (
+            _,
+            TransformedResult::Predicate(predicate)
+            | TransformedResult::PartialPredicate(predicate),
+        ) => TransformedResult::PartialPredicate(predicate),
         _ => TransformedResult::NotTransformed,
     }
 }
@@ -389,6 +398,12 @@ fn to_iceberg_or_predicate(
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.or(right))
         }
+        (
+            TransformedResult::Predicate(left)
+            | TransformedResult::PartialPredicate(left),
+            TransformedResult::Predicate(right)
+            | TransformedResult::PartialPredicate(right),
+        ) => TransformedResult::PartialPredicate(left.or(right)),
         _ => TransformedResult::NotTransformed,
     }
 }
@@ -423,6 +438,16 @@ fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
         PredicateOperator::LessThan => PredicateOperator::GreaterThan,
         PredicateOperator::LessThanOrEq => PredicateOperator::GreaterThanOrEq,
         _ => unreachable!("Reverse {}", op),
+    }
+}
+
+fn literal_value(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(value, _) => Some(value.clone()),
+        Expr::Cast(cast) => literal_value(&cast.expr)?
+            .cast_to(cast.field.data_type())
+            .ok(),
+        _ => None,
     }
 }
 
@@ -663,13 +688,13 @@ mod tests {
         let sql = "ts >= timestamp '2023-01-05T00:00:00'";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
         let expected_predicate = Reference::new("ts")
-            .greater_than_or_equal_to(Datum::string("2023-01-05T00:00:00"));
+            .greater_than_or_equal_to(Datum::timestamp_nanos(1672876800000000000));
         assert_eq!(predicate, expected_predicate);
     }
 
     #[test]
     fn test_predicate_conversion_with_date_cast() {
-        let sql = "ts >= date '2023-01-05T11:00:00'";
+        let sql = "CAST(ts AS DATE) >= DATE '2023-01-05'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
     }
@@ -957,5 +982,73 @@ mod tests {
 
         // Unknown scalar functions are not pushed down.
         assert_eq!(convert_to_iceberg_predicate("isnan(sqrt(qux))"), None);
+    }
+
+    #[test]
+    fn test_cast_pushdown_rejects_column_casts() {
+        for sql in [
+            "CAST(qux AS REAL) = CAST(0.1 AS REAL)",
+            "CAST(foo AS DOUBLE) > 9.5",
+            "CAST(bar AS INT) = 5",
+            "CAST(CAST(bar AS INT) AS BIGINT) = 5",
+            "CAST(qux AS INT) IN (5, 6)",
+            "CAST(qux AS INT) IS NULL",
+            "TRY_CAST(bar AS INT) = 5",
+            "CAST(qux AS VARCHAR) LIKE '5%'",
+            "isnan(CAST(foo AS DOUBLE))",
+            "NOT isnan(CAST(foo AS DOUBLE))",
+            "isnan(abs(CAST(foo AS DOUBLE)))",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_cast_pushdown_evaluates_literal_casts() {
+        use datafusion::logical_expr::{cast, col, lit};
+        use datafusion::scalar::ScalarValue;
+
+        for (literal, expected) in [
+            (lit("05"), Some(Datum::int(5))),
+            (lit(5.7_f64), Some(Datum::int(5))),
+            (lit(-5.7_f64), Some(Datum::int(-5))),
+            (lit("invalid"), None),
+            (lit(i64::MAX), None),
+            (lit(ScalarValue::Utf8(None)), None),
+        ] {
+            let filter = col("foo").eq(cast(literal, DataType::Int32));
+            let expected = expected.map(|value| Reference::new("foo").equal_to(value));
+            assert_eq!(convert_filters_to_predicate(&[filter]), expected);
+        }
+        let filter =
+            col("foo").eq(cast(cast(lit(5.7_f64), DataType::Int32), DataType::Int64));
+        let expected = Some(Reference::new("foo").equal_to(Datum::long(5)));
+        assert_eq!(convert_filters_to_predicate(&[filter]), expected);
+    }
+
+    #[test]
+    fn test_cast_pushdown_preserves_boolean_implication() {
+        let expected = Some(Reference::new("foo").equal_to(Datum::long(1)));
+        assert_eq!(
+            convert_to_iceberg_predicate("foo = 1 AND CAST(bar AS INT) = 5"),
+            expected
+        );
+        for sql in [
+            "foo = 1 OR CAST(bar AS INT) = 5",
+            "NOT (foo = 1 AND CAST(bar AS INT) = 5)",
+            "NOT ((foo = 1 AND CAST(bar AS INT) = 5) OR foo = 2)",
+            "NOT ((foo = 1 AND CAST(bar AS INT) = 5) AND foo = 2)",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "{sql}");
+        }
+        let expected = Some(
+            !Reference::new("foo")
+                .equal_to(Datum::long(1))
+                .and(Reference::new("bar").equal_to(Datum::string("5"))),
+        );
+        assert_eq!(
+            convert_to_iceberg_predicate("NOT (foo = 1 AND bar = '5')"),
+            expected
+        );
     }
 }
