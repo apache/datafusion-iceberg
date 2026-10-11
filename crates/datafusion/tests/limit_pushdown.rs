@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use datafusion_iceberg::test_utils::IcebergTestHarness;
+    use iceberg_datafusion::test_utils::IcebergTestHarness;
 
     #[tokio::test]
     async fn applies_sql_limit_to_the_iceberg_scan_output() -> Result<()> {

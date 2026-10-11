@@ -20,7 +20,7 @@
 # Apache Iceberg Table Provider for Apache DataFusion
 
 This repository connects [Apache Iceberg](https://iceberg.apache.org/) tables to
-[Apache DataFusion](https://datafusion.apache.org/). The `datafusion-iceberg`
+[Apache DataFusion](https://datafusion.apache.org/). The `iceberg-datafusion`
 crate provides table providers for querying Iceberg data and for inserting rows
 through an Iceberg catalog.
 
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_iceberg::IcebergTableProviderFactory;
+use iceberg_datafusion::IcebergTableProviderFactory;
 
 async fn query_table() -> datafusion::error::Result<()> {
     let mut state = SessionStateBuilder::new().with_default_features().build();

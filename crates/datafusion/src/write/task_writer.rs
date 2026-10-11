@@ -49,7 +49,7 @@ use crate::to_datafusion_error;
 /// ```rust,ignore
 /// use iceberg::spec::{PartitionSpec, Schema};
 /// use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-/// use datafusion_iceberg::writer::task_writer::TaskWriter;
+/// use iceberg_datafusion::writer::task_writer::TaskWriter;
 ///
 /// // Create a TaskWriter for an unpartitioned table
 /// let task_writer = TaskWriter::new(
@@ -110,7 +110,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     /// ```rust,ignore
     /// use iceberg::spec::{PartitionSpec, Schema};
     /// use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-    /// use datafusion_iceberg::writer::task_writer::TaskWriter;
+    /// use iceberg_datafusion::writer::task_writer::TaskWriter;
     ///
     /// // Create a TaskWriter for an unpartitioned table
     /// let task_writer = TaskWriter::new(
@@ -177,7 +177,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     ///
     /// ```rust,ignore
     /// use arrow_array::RecordBatch;
-    /// use datafusion_iceberg::writer::task_writer::TaskWriter;
+    /// use iceberg_datafusion::writer::task_writer::TaskWriter;
     ///
     /// // Write a RecordBatch
     /// task_writer.write(record_batch).await?;
@@ -253,7 +253,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use datafusion_iceberg::writer::task_writer::TaskWriter;
+    /// use iceberg_datafusion::writer::task_writer::TaskWriter;
     ///
     /// // Close the writer and get all data files
     /// let data_files = task_writer.close().await?;

@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use datafusion_iceberg::test_utils::IcebergTestHarness;
+    use iceberg_datafusion::test_utils::IcebergTestHarness;
 
     #[tokio::test]
     async fn projects_only_columns_required_by_the_query() -> Result<()> {

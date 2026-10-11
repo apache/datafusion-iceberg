@@ -35,14 +35,6 @@ use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
-use datafusion_iceberg::metadata::{
-    IcebergMetadataDataSource, IcebergMetadataTableProvider,
-};
-use datafusion_iceberg::read::IcebergDataSource;
-use datafusion_iceberg::write::{IcebergCommitExec, IcebergWriteExec};
-use datafusion_iceberg::{
-    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
-};
 use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -54,6 +46,14 @@ use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
+};
+use iceberg_datafusion::metadata::{
+    IcebergMetadataDataSource, IcebergMetadataTableProvider,
+};
+use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
+use iceberg_datafusion::{
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
 use tempfile::TempDir;
 

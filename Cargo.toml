@@ -35,7 +35,7 @@ anyhow = "1.0.72"
 async-trait = "0.1.89"
 datafusion = "55.0.0"
 datafusion-cli = "55.0.0"
-datafusion-iceberg = { path = "crates/datafusion" }
+iceberg-datafusion = { path = "crates/datafusion" }
 datafusion-sqllogictest = "55.0.0"
 iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "8cb2adeddb4f8da1ca7bd86ca303337f011c12e2" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "8cb2adeddb4f8da1ca7bd86ca303337f011c12e2" }

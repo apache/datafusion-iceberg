@@ -2108,26 +2108,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datafusion-iceberg"
-version = "0.10.1"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "datafusion",
- "expect-test",
- "futures",
- "iceberg",
- "insta",
- "parquet",
- "serde",
- "tempfile",
- "tokio",
- "typetag",
- "uuid",
-]
-
-[[package]]
 name = "datafusion-macros"
 version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3260,6 +3240,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-datafusion"
+version = "0.10.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "datafusion",
+ "expect-test",
+ "futures",
+ "iceberg",
+ "insta",
+ "parquet",
+ "serde",
+ "tempfile",
+ "tokio",
+ "typetag",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-playground"
 version = "0.10.1"
 dependencies = [
@@ -3267,12 +3267,12 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-cli",
- "datafusion-iceberg",
  "dirs 7.0.0",
  "fs-err",
  "home",
  "iceberg",
  "iceberg-catalog-rest",
+ "iceberg-datafusion",
  "mimalloc",
  "stacker",
  "tokio",
@@ -3298,11 +3298,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "datafusion",
- "datafusion-iceberg",
  "datafusion-sqllogictest",
  "enum-ordinalize",
  "env_logger",
  "iceberg",
+ "iceberg-datafusion",
  "indicatif",
  "libtest-mimic",
  "log",
