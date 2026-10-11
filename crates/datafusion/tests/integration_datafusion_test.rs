@@ -44,10 +44,12 @@ use datafusion_iceberg::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
 use expect_test::expect;
+use iceberg::expr::Reference;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    Datum, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -1413,5 +1415,104 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         +------+--------+"#]]
     .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cast_pushdown_matches_memtable() -> Result<(), Box<dyn Error>> {
+    let catalog = Arc::new(get_iceberg_catalog().await);
+    let namespace = NamespaceIdent::new("cast_tests".to_string());
+    set_test_namespace(catalog.as_ref(), &namespace).await?;
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "iceberg",
+        Arc::new(IcebergCatalogProvider::try_new(catalog.clone()).await?),
+    );
+    let columns = "(id INT, x REAL, d DOUBLE, i INT, f DOUBLE, s VARCHAR)";
+    for sql in [
+        format!("CREATE TABLE expected {columns}"),
+        format!("CREATE TABLE iceberg.cast_tests.actual {columns}"),
+        "INSERT INTO expected VALUES
+            (1, 0.1, 0.1, 9, 5.7, '05'),
+            (2, 0.2, 0.2, 10, 5.0, '5'),
+            (3, -0.1, -0.1, 11, 6.2, NULL),
+            (4, NULL, NULL, NULL, NULL, NULL),
+            (5, 'NaN', 'NaN', -10, -5.7, '-05'),
+            (6, 'Infinity', 'Infinity', 12, NULL, NULL)"
+            .to_string(),
+        "INSERT INTO iceberg.cast_tests.actual SELECT * FROM expected".to_string(),
+    ] {
+        ctx.sql(&sql).await?.collect().await?;
+    }
+    let table = catalog
+        .load_table(&TableIdent::new(namespace, "actual".to_string()))
+        .await?;
+    ctx.register_table(
+        "static_actual",
+        Arc::new(IcebergStaticTableProvider::try_new_from_table(table).await?),
+    )?;
+
+    for filter in [
+        "x > 0.1",
+        "x >= 0.1",
+        "x < 0.1",
+        "x <= 0.1",
+        "x = 0.1",
+        "x != 0.1",
+        "CAST(d AS REAL) = CAST(0.1 AS REAL)",
+        "i > 9.5",
+        "CAST(f AS INT) = 5",
+        "CAST(s AS INT) = 5",
+        "NOT isnan(i)",
+        "isnan(i)",
+        "isnan(x)",
+        "NOT isnan(x)",
+        "CAST(i AS BIGINT) = 10",
+        "i = CAST('10' AS INT)",
+        "i = CAST(10.9 AS INT)",
+        "CAST(CAST(s AS INT) AS BIGINT) = 5",
+        "CAST(f AS INT) IN (5, 6)",
+        "CAST(f AS INT) NOT IN (5, 6)",
+        "i >= 10 AND CAST(f AS INT) = 5",
+        "i = 9 OR CAST(f AS INT) = 5",
+        "NOT (i = 9 AND CAST(f AS INT) = 5)",
+        "NOT (i = 9 OR CAST(f AS INT) = 5)",
+    ] {
+        let expected = ctx
+            .sql(&format!(
+                "SELECT id FROM expected WHERE {filter} ORDER BY id"
+            ))
+            .await?
+            .collect()
+            .await?;
+        let expected = pretty_format_batches(&expected)?.to_string();
+        for table in ["iceberg.cast_tests.actual", "static_actual"] {
+            let dataframe = ctx
+                .sql(&format!(
+                    "SELECT id FROM {table} WHERE {filter} ORDER BY id"
+                ))
+                .await?;
+            let pushed_predicate = match filter {
+                "CAST(i AS BIGINT) = 10" => {
+                    Some(Reference::new("i").equal_to(Datum::int(10)))
+                }
+                "isnan(x)" => Some(Reference::new("x").is_nan()),
+                _ => None,
+            };
+            if let Some(predicate) = pushed_predicate {
+                let plan = dataframe.create_physical_plan().await?;
+                let scan_exec =
+                    find_node::<DataSourceExec>(&plan).expect("a data source");
+                let scan = scan_exec
+                    .data_source()
+                    .downcast_ref::<IcebergDataSource>()
+                    .expect("an Iceberg data source");
+                assert_eq!(scan.predicates(), Some(&predicate), "{table}: {filter}");
+            }
+            let batches = dataframe.collect().await?;
+            let actual = pretty_format_batches(&batches)?.to_string();
+            assert_eq!(actual, expected, "{table}: {filter}");
+        }
+    }
     Ok(())
 }
