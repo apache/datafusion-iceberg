@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,10 +46,15 @@ const WAREHOUSE_URI: &str = "s3://iceberg-test/warehouse/";
 
 pub struct IcebergTestHarness {
     ctx: SessionContext,
+    #[cfg(test)]
+    parquet_read_bytes: Arc<AtomicU64>,
 }
 
 impl IcebergTestHarness {
     pub async fn new() -> Result<Self> {
+        let storage_factory = FixtureStorageFactory::default();
+        #[cfg(test)]
+        let parquet_read_bytes = storage_factory.parquet_read_bytes.clone();
         let state = SessionStateBuilder::new()
             .with_default_features()
             // Plan snapshots must not vary with the runner's CPU count.
@@ -53,7 +62,7 @@ impl IcebergTestHarness {
             .with_table_factory(
                 "ICEBERG".to_string(),
                 Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
-                    Arc::new(FixtureStorageFactory::default()),
+                    Arc::new(storage_factory),
                 )),
             )
             .build();
@@ -65,7 +74,11 @@ impl IcebergTestHarness {
         .await?
         .collect()
         .await?;
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            #[cfg(test)]
+            parquet_read_bytes,
+        })
     }
 
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
@@ -83,12 +96,17 @@ impl IcebergTestHarness {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FixtureStorageFactory {
     root: PathBuf,
+    #[cfg(test)]
+    #[serde(skip)]
+    parquet_read_bytes: Arc<AtomicU64>,
 }
 
 impl Default for FixtureStorageFactory {
     fn default() -> Self {
         Self {
             root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg"),
+            #[cfg(test)]
+            parquet_read_bytes: Arc::default(),
         }
     }
 }
@@ -98,6 +116,8 @@ impl StorageFactory for FixtureStorageFactory {
     fn build(&self, _config: &StorageConfig) -> IcebergResult<Arc<dyn Storage>> {
         Ok(Arc::new(FixtureStorage {
             root: self.root.clone(),
+            #[cfg(test)]
+            parquet_read_bytes: self.parquet_read_bytes.clone(),
         }))
     }
 }
@@ -105,6 +125,9 @@ impl StorageFactory for FixtureStorageFactory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FixtureStorage {
     root: PathBuf,
+    #[cfg(test)]
+    #[serde(skip)]
+    parquet_read_bytes: Arc<AtomicU64>,
 }
 
 impl FixtureStorage {
@@ -139,7 +162,15 @@ impl Storage for FixtureStorage {
     }
 
     async fn reader(&self, path: &str) -> IcebergResult<Box<dyn FileRead>> {
-        self.local().reader(&self.local_path(path)?).await
+        let reader = self.local().reader(&self.local_path(path)?).await?;
+        #[cfg(test)]
+        if path.ends_with(".parquet") {
+            return Ok(Box::new(CountingFileRead {
+                reader,
+                bytes: self.parquet_read_bytes.clone(),
+            }));
+        }
+        Ok(reader)
     }
 
     async fn write(&self, path: &str, bytes: Bytes) -> IcebergResult<()> {
@@ -175,5 +206,137 @@ impl Storage for FixtureStorage {
 
     fn new_output(&self, path: &str) -> IcebergResult<OutputFile> {
         Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+#[cfg(test)]
+struct CountingFileRead {
+    reader: Box<dyn FileRead>,
+    bytes: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl FileRead for CountingFileRead {
+    async fn read(&self, range: Range<u64>) -> IcebergResult<Bytes> {
+        let bytes = self.reader.read(range).await?;
+        self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+impl IcebergTestHarness {
+    pub(crate) fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    pub(crate) fn take_parquet_read_bytes(&self) -> u64 {
+        self.parquet_read_bytes.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) async fn with_parquet(
+        schema: iceberg::spec::Schema,
+        batch: &datafusion::arrow::array::RecordBatch,
+        properties: parquet::file::properties::WriterProperties,
+        catalog_backed: bool,
+    ) -> Result<(Self, tempfile::TempDir)> {
+        use std::collections::HashMap;
+
+        use datafusion::datasource::TableProvider;
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+        use parquet::arrow::ArrowWriter;
+
+        use crate::{
+            IcebergCatalogTableProvider, IcebergStaticTableProvider, to_datafusion_error,
+        };
+
+        let directory = tempfile::TempDir::new()?;
+        let factory = FixtureStorageFactory {
+            root: directory.path().to_path_buf(),
+            ..Default::default()
+        };
+        let parquet_read_bytes = factory.parquet_read_bytes.clone();
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(factory))
+                .load(
+                    "fixture",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        WAREHOUSE_URI.trim_end_matches('/').to_string(),
+                    )]),
+                )
+                .await
+                .map_err(to_datafusion_error)?,
+        );
+        let namespace = NamespaceIdent::new("default".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .map_err(to_datafusion_error)?;
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("events".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .map_err(to_datafusion_error)?;
+        let path = format!("{}/data.parquet", table.metadata().location());
+        let mut data = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut data, batch.schema(), Some(properties))?;
+        writer.write(batch)?;
+        let metadata = writer.close()?;
+        assert_eq!(metadata.num_row_groups(), 1);
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .partition_spec_id(0)
+            .file_path(path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(data.len() as u64)
+            .record_count(batch.num_rows() as u64)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        table
+            .file_io()
+            .new_output(&path)
+            .map_err(to_datafusion_error)?
+            .write(data.into())
+            .await
+            .map_err(to_datafusion_error)?;
+        let transaction = Transaction::new(&table);
+        let table = transaction
+            .fast_append()
+            .add_data_files([file])
+            .apply(transaction)
+            .map_err(to_datafusion_error)?
+            .commit(catalog.as_ref())
+            .await
+            .map_err(to_datafusion_error)?;
+        let provider: Arc<dyn TableProvider> = if catalog_backed {
+            Arc::new(
+                IcebergCatalogTableProvider::try_new(catalog, namespace, "events")
+                    .await?,
+            )
+        } else {
+            Arc::new(IcebergStaticTableProvider::try_new_from_table(table).await?)
+        };
+        let ctx = SessionContext::new();
+        ctx.register_table("events", provider)?;
+        Ok((
+            Self {
+                ctx,
+                parquet_read_bytes,
+            },
+            directory,
+        ))
     }
 }
