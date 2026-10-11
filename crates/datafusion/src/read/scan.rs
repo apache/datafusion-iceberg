@@ -182,13 +182,19 @@ impl DataSource for IcebergDataSource {
     fn open(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             Some(self.projection.clone()),
             self.predicate.clone(),
+            context
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .enable_page_index,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -274,6 +280,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicate: Option<Predicate>,
+    enable_page_index: bool,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -287,7 +294,10 @@ async fn get_batch_stream(
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
     }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+    let table_scan = scan_builder
+        .with_row_selection_enabled(enable_page_index)
+        .build()
+        .map_err(to_datafusion_error)?;
 
     let stream = table_scan
         .to_arrow()
@@ -295,4 +305,153 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int64Array};
+    use datafusion::arrow::compute::concat_batches;
+    use datafusion::prelude::SessionContext;
+    use iceberg::arrow::schema_to_arrow_schema;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use parquet::basic::Compression;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+    use super::*;
+    use crate::test_utils::IcebergTestHarness;
+
+    const ROWS: usize = 262_144;
+    const QUERY: &str = "SELECT * FROM events WHERE id BETWEEN 8190 AND 8194 ORDER BY id";
+
+    fn page_index_fixture() -> (Schema, RecordBatch) {
+        let mut fields = vec![Arc::new(NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Long),
+        ))];
+        let mut columns: Vec<ArrayRef> =
+            vec![Arc::new(Int64Array::from_iter_values(0..ROWS as i64))];
+        for (index, precision) in [9, 18, 38].into_iter().enumerate() {
+            fields.push(Arc::new(NestedField::optional(
+                index as i32 + 2,
+                format!("amount_{precision}"),
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision,
+                    scale: 2,
+                }),
+            )));
+            let values = Decimal128Array::from_iter((0..ROWS).map(|row| {
+                (!(row / 8192).is_multiple_of(2))
+                    .then_some(row as i128 - ROWS as i128 / 2)
+            }))
+            .with_precision_and_scale(precision as u8, 2)
+            .unwrap();
+            columns.push(Arc::new(values));
+        }
+        let schema = Schema::builder().with_fields(fields).build().unwrap();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let batch = RecordBatch::try_new(arrow_schema, columns).unwrap();
+        (schema, batch)
+    }
+
+    fn page_index_properties(enabled: bool) -> WriterProperties {
+        WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_max_row_group_row_count(Some(ROWS))
+            .set_data_page_row_count_limit(8192)
+            .set_statistics_enabled(if enabled {
+                EnabledStatistics::Page
+            } else {
+                EnabledStatistics::Chunk
+            })
+            .set_offset_index_disabled(!enabled)
+            .build()
+    }
+
+    async fn query(ctx: &SessionContext, sql: &str) -> Result<RecordBatch> {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        Ok(concat_batches(&batches[0].schema(), &batches)?)
+    }
+
+    #[tokio::test]
+    async fn test_page_index_setting_prunes_reads() -> Result<()> {
+        let (schema, batch) = page_index_fixture();
+        let expected = batch.slice(8190, 5);
+        for catalog_backed in [false, true] {
+            let (harness, _directory) = IcebergTestHarness::with_parquet(
+                schema.clone(),
+                &batch,
+                page_index_properties(true),
+                catalog_backed,
+            )
+            .await?;
+            let ctx = harness.context();
+            let mut read_bytes = [0; 3];
+            for (bytes, enabled) in
+                read_bytes.iter_mut().zip([None, Some(false), Some(true)])
+            {
+                if let Some(enabled) = enabled {
+                    ctx.sql(&format!(
+                        "SET datafusion.execution.parquet.enable_page_index = '{enabled}'",
+                    )).await?.collect().await?;
+                }
+                assert_eq!(query(ctx, QUERY).await?, expected);
+                *bytes = harness.take_parquet_read_bytes();
+            }
+            let [default, disabled, enabled] = read_bytes;
+            assert_eq!(default, enabled);
+            assert!(
+                enabled < disabled,
+                "page index on: {enabled}, off: {disabled}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_page_index_setting_without_indexes() -> Result<()> {
+        let (schema, batch) = page_index_fixture();
+        let expected = batch.slice(8190, 5);
+        for catalog_backed in [false, true] {
+            let (harness, _directory) = IcebergTestHarness::with_parquet(
+                schema.clone(),
+                &batch,
+                page_index_properties(false),
+                catalog_backed,
+            )
+            .await?;
+            for enabled in [false, true] {
+                harness.context().sql(&format!(
+                    "SET datafusion.execution.parquet.enable_page_index = '{enabled}'",
+                )).await?.collect().await?;
+                assert_eq!(query(harness.context(), QUERY).await?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_page_index_pruning_with_nullable_decimals_and_projection() -> Result<()>
+    {
+        let (schema, batch) = page_index_fixture();
+        let expected = batch.slice(8190, 2).project(&[0])?;
+        for catalog_backed in [false, true] {
+            let (harness, _directory) = IcebergTestHarness::with_parquet(
+                schema.clone(),
+                &batch,
+                page_index_properties(true),
+                catalog_backed,
+            )
+            .await?;
+            for precision in [9, 18, 38] {
+                let sql = format!(
+                    "SELECT id FROM events WHERE id BETWEEN 8190 AND 8194 \
+                     AND amount_{precision} IS NULL ORDER BY id",
+                );
+                assert_eq!(query(harness.context(), &sql).await?, expected);
+            }
+        }
+        Ok(())
+    }
 }
