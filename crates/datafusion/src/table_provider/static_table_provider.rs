@@ -126,14 +126,13 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
-            self.table.clone(),
-            self.snapshot_id,
-            self.schema.clone(),
-            projection,
-            filters,
-            limit,
-        )?))
+        let source = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
+            .with_snapshot_id(self.snapshot_id)
+            .with_projection(projection)
+            .with_filters(filters)
+            .with_fetch(limit)
+            .build()?;
+        Ok(DataSourceExec::from_data_source(source))
     }
 
     fn supports_filters_pushdown(

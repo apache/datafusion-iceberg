@@ -139,14 +139,12 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        Ok(DataSourceExec::from_data_source(IcebergDataSource::new(
-            table,
-            None, // Always use current snapshot for catalog-backed provider
-            self.schema.clone(),
-            projection,
-            filters,
-            limit,
-        )?))
+        let source = IcebergDataSource::builder(table, self.schema.clone())
+            .with_projection(projection)
+            .with_filters(filters)
+            .with_fetch(limit)
+            .build()?;
+        Ok(DataSourceExec::from_data_source(source))
     }
 
     fn supports_filters_pushdown(
@@ -447,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_rejects_out_of_range_projection() {
+    async fn test_scan_projection() {
         let (catalog, namespace, table_name, _temp_dir) =
             get_test_catalog_and_table().await;
         let table_ident = TableIdent::new(namespace, table_name);
@@ -456,15 +454,22 @@ mod tests {
             Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
         let out_of_range = schema.fields().len();
 
-        let err = IcebergDataSource::new(
-            table,
-            None,
-            schema,
-            Some(&vec![0, out_of_range]),
-            &[],
-            None,
-        )
-        .unwrap_err();
+        // Columns come back in the projection's order, not the table's.
+        let source = IcebergDataSource::builder(table.clone(), schema.clone())
+            .with_projection(Some(&vec![1, 0]))
+            .build()
+            .unwrap();
+        insta::assert_debug_snapshot!(source.projection(), @r#"
+        [
+            "name",
+            "id",
+        ]
+        "#);
+
+        let err = IcebergDataSource::builder(table, schema)
+            .with_projection(Some(&vec![0, out_of_range]))
+            .build()
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(

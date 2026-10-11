@@ -49,59 +49,24 @@ pub struct IcebergDataSource {
     schema: ArrowSchemaRef,
     /// Projection column names in the output schema.
     projection: Vec<String>,
-    /// Filters to apply to the table scan
-    predicates: Option<Predicate>,
+    /// Filter to apply to the table scan
+    predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
 }
 
 impl IcebergDataSource {
-    /// Creates a new [`IcebergDataSource`] object.
-    pub(crate) fn new(
-        table: Table,
-        snapshot_id: Option<i64>,
-        schema: ArrowSchemaRef,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Self> {
-        let output_schema = match projection {
-            None => schema,
-            Some(projection) => Arc::new(schema.project(projection)?),
-        };
-        Ok(Self::new_with_predicate(
+    /// Starts building a source that scans `table` and returns the columns of
+    /// `schema`, all of them unless [`IcebergDataSourceBuilder::with_projection`]
+    /// selects some. Columns are read from Iceberg by name.
+    pub fn builder(table: Table, schema: ArrowSchemaRef) -> IcebergDataSourceBuilder {
+        IcebergDataSourceBuilder {
             table,
-            snapshot_id,
-            output_schema,
-            convert_filters_to_predicate(filters),
-            limit,
-        ))
-    }
-
-    /// Rebuilds a source from the parts needed to scan an Iceberg table.
-    ///
-    /// The supplied schema determines both the source's output schema and the
-    /// columns read from Iceberg. Callers can recreate a source from its
-    /// accessors after transporting those values to another process.
-    pub fn new_with_predicate(
-        table: Table,
-        snapshot_id: Option<i64>,
-        schema: ArrowSchemaRef,
-        predicates: Option<Predicate>,
-        fetch: Option<usize>,
-    ) -> Self {
-        let projection = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        Self {
-            table,
-            snapshot_id,
             schema,
-            projection,
-            predicates,
-            fetch,
+            projection: None,
+            snapshot_id: None,
+            predicate: None,
+            fetch: None,
         }
     }
 
@@ -121,12 +86,88 @@ impl IcebergDataSource {
         &self.projection
     }
 
-    pub fn predicates(&self) -> Option<&Predicate> {
-        self.predicates.as_ref()
+    pub fn predicate(&self) -> Option<&Predicate> {
+        self.predicate.as_ref()
     }
 
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+}
+
+/// Builds an [`IcebergDataSource`]. Created by [`IcebergDataSource::builder`].
+///
+/// A table provider passes the table's schema and selects columns with
+/// [`Self::with_projection`]. To rebuild a source, such as in another process,
+/// pass its [`IcebergDataSource::schema`], which is already projected, and no
+/// projection.
+#[derive(Debug, Clone)]
+pub struct IcebergDataSourceBuilder {
+    table: Table,
+    schema: ArrowSchemaRef,
+    projection: Option<Vec<usize>>,
+    snapshot_id: Option<i64>,
+    predicate: Option<Predicate>,
+    fetch: Option<usize>,
+}
+
+impl IcebergDataSourceBuilder {
+    /// Returns only the columns of the schema at these indices, or all of them
+    /// if `None` (the default). Indices are into the schema passed to
+    /// [`IcebergDataSource::builder`].
+    pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
+        self.projection = projection.cloned();
+        self
+    }
+
+    /// Scans this snapshot, or the table's current one if `None` (the default).
+    pub fn with_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
+        self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Filters the scan with `predicate`, or not at all if `None` (the default).
+    pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
+        self.predicate = predicate;
+        self
+    }
+
+    /// Filters the scan with the parts of `filters` that convert to an Iceberg
+    /// predicate. The rest are dropped, so the scan may return rows that
+    /// `filters` reject.
+    pub fn with_filters(self, filters: &[Expr]) -> Self {
+        self.with_predicate(convert_filters_to_predicate(filters))
+    }
+
+    /// Stops after `fetch` rows, or reads every row if `None` (the default).
+    pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
+        self.fetch = fetch;
+        self
+    }
+
+    /// Builds the source, which reads the columns of its projected schema by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection is out of bounds for the schema.
+    pub fn build(self) -> Result<IcebergDataSource> {
+        let schema = match &self.projection {
+            None => self.schema,
+            Some(projection) => Arc::new(self.schema.project(projection)?),
+        };
+        let projection = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        Ok(IcebergDataSource {
+            table: self.table,
+            snapshot_id: self.snapshot_id,
+            schema,
+            projection,
+            predicate: self.predicate,
+            fetch: self.fetch,
+        })
     }
 }
 
@@ -147,7 +188,7 @@ impl DataSource for IcebergDataSource {
             self.table.clone(),
             self.snapshot_id,
             Some(self.projection.clone()),
-            self.predicates.clone(),
+            self.predicate.clone(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -184,7 +225,7 @@ impl DataSource for IcebergDataSource {
     ) -> std::fmt::Result {
         write!(f, "format=iceberg",)?;
         write!(f, ", projection=[{}]", self.projection.join(", "))?;
-        if let Some(predicate) = &self.predicates {
+        if let Some(predicate) = &self.predicate {
             write!(f, ", predicate={predicate}")?;
         }
         if let Some(fetch) = self.fetch {
@@ -232,7 +273,7 @@ async fn get_batch_stream(
     table: Table,
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
-    predicates: Option<Predicate>,
+    predicate: Option<Predicate>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -243,8 +284,8 @@ async fn get_batch_stream(
         Some(column_names) => scan_builder.select(column_names),
         None => scan_builder.select_all(),
     };
-    if let Some(pred) = predicates {
-        scan_builder = scan_builder.with_filter(pred);
+    if let Some(predicate) = predicate {
+        scan_builder = scan_builder.with_filter(predicate);
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 

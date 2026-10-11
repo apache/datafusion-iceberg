@@ -1019,13 +1019,12 @@ async fn run(
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
 fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
-    IcebergDataSource::new_with_predicate(
-        scan.table().clone(),
-        scan.snapshot_id(),
-        scan.schema(),
-        scan.predicates().cloned(),
-        scan.fetch(),
-    )
+    IcebergDataSource::builder(scan.table().clone(), scan.schema())
+        .with_snapshot_id(scan.snapshot_id())
+        .with_predicate(scan.predicate().cloned())
+        .with_fetch(scan.fetch())
+        .build()
+        .unwrap()
 }
 
 async fn run_source(
@@ -1141,7 +1140,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(
-        scan.predicates().map(ToString::to_string).as_deref(),
+        scan.predicate().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
     let rebuilt = rebuild_scan(scan);
@@ -1183,13 +1182,9 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergDataSource::new_with_predicate(
-        pinned.table().clone(),
-        Some(snapshot_id),
-        foo2_only,
-        None,
-        None,
-    );
+    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+        .with_snapshot_id(Some(snapshot_id))
+        .build()?;
     expect![[r#"
         +--------+
         | foo2   |
