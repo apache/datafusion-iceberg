@@ -258,10 +258,10 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
+    use iceberg::Runtime;
     use iceberg::spec::{
         NestedField, PrimitiveType, Schema, StructType, Transform, Type,
     };
-    use iceberg::test_utils::test_runtime;
 
     use super::*;
 
@@ -675,8 +675,8 @@ mod tests {
         assert_eq!(city_partition.value(1), "Los Angeles");
     }
 
-    #[test]
-    fn test_schema_validation_matching_schemas() {
+    #[tokio::test]
+    async fn test_schema_validation_matching_schemas() {
         use iceberg::TableIdent;
         use iceberg::io::FileIO;
         use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
@@ -732,7 +732,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -740,8 +740,8 @@ mod tests {
         assert!(result.is_ok(), "Schema validation should pass");
     }
 
-    #[test]
-    fn test_schema_validation_mismatched_schemas() {
+    #[tokio::test]
+    async fn test_schema_validation_mismatched_schemas() {
         use iceberg::TableIdent;
         use iceberg::io::FileIO;
         use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
@@ -797,7 +797,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -814,8 +814,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_schema_validation_with_metadata_differences() {
+    #[tokio::test]
+    async fn test_schema_validation_with_metadata_differences() {
         use std::collections::HashMap;
 
         use iceberg::TableIdent;
@@ -876,7 +876,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
