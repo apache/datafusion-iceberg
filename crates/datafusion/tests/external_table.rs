@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use datafusion_iceberg::test_utils::{FIXTURE_URI, IcebergTestHarness};
+    use iceberg_datafusion::test_utils::{FIXTURE_URI, IcebergTestHarness};
 
     #[tokio::test]
     async fn registers_the_fixture_with_the_iceberg_schema() -> Result<()> {

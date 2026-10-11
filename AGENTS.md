@@ -23,7 +23,7 @@ Apache DataFusion integration for Apache Iceberg: catalog/table providers and ph
 
 | Directory | Package | Purpose |
 |---|---|---|
-| `crates/datafusion` | `datafusion-iceberg` | The published library |
+| `crates/datafusion` | `iceberg-datafusion` | The published library |
 | `crates/sqllogictest` | `iceberg-sqllogictest` | SQL-level test harness (unpublished) |
 | `crates/playground` | `iceberg-playground` | REPL CLI built on `datafusion-cli` (unpublished) |
 
@@ -45,10 +45,10 @@ cargo test --workspace --locked
 ## Testing
 
 ```sh
-cargo test -p datafusion-iceberg --lib <name_substring>                          # unit tests
-cargo test -p datafusion-iceberg --test integration_datafusion_test <name>      # integration tests
+cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
+cargo test -p iceberg-datafusion --test integration_datafusion_test <name>      # integration tests
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
-UPDATE_EXPECT=1 cargo test -p datafusion-iceberg --test integration_datafusion_test  # rewrite expect![[...]] snapshots
+UPDATE_EXPECT=1 cargo test -p iceberg-datafusion --test integration_datafusion_test  # rewrite expect![[...]] snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 

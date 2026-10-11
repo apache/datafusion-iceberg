@@ -32,7 +32,7 @@ datafusion-sqllogictest = { workspace = true }
 enum-ordinalize = "4.3.0"
 env_logger = "0.11.8"
 iceberg = { workspace = true }
-datafusion-iceberg = { workspace = true }
+iceberg-datafusion = { workspace = true }
 indicatif = "0.18"
 log = "0.4.28"
 serde = { version = "1.0.219", features = ["rc"] }
