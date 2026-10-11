@@ -375,88 +375,7 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    insta::assert_debug_snapshot!(snapshots[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "committed_at",
-                data_type: Timestamp(
-                    Microsecond,
-                    Some(
-                        "+00:00",
-                    ),
-                ),
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "snapshot_id",
-                data_type: Int64,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-            Field {
-                name: "parent_id",
-                data_type: Int64,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "3",
-                },
-            },
-            Field {
-                name: "operation",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "4",
-                },
-            },
-            Field {
-                name: "manifest_list",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "5",
-                },
-            },
-            Field {
-                name: "summary",
-                data_type: Map(
-                    Field {
-                        name: "key_value",
-                        data_type: Struct(
-                            [
-                                Field {
-                                    name: "key",
-                                    data_type: Utf8,
-                                    metadata: {
-                                        "PARQUET:field_id": "7",
-                                    },
-                                },
-                                Field {
-                                    name: "value",
-                                    data_type: Utf8,
-                                    nullable: true,
-                                    metadata: {
-                                        "PARQUET:field_id": "8",
-                                    },
-                                },
-                            ],
-                        ),
-                    },
-                    false,
-                ),
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "6",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(snapshots[0].schema().to_string(), @r#"Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} }, Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} }, Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} }, Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} }, Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} }, Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#);
     assert!(snapshots.iter().all(|batch| batch.num_rows() == 0));
 
     let manifests = ctx
@@ -466,138 +385,7 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    insta::assert_debug_snapshot!(manifests[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "content",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "14",
-                },
-            },
-            Field {
-                name: "path",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "length",
-                data_type: Int64,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-            Field {
-                name: "partition_spec_id",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "3",
-                },
-            },
-            Field {
-                name: "added_snapshot_id",
-                data_type: Int64,
-                metadata: {
-                    "PARQUET:field_id": "4",
-                },
-            },
-            Field {
-                name: "added_data_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "5",
-                },
-            },
-            Field {
-                name: "existing_data_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "6",
-                },
-            },
-            Field {
-                name: "deleted_data_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "7",
-                },
-            },
-            Field {
-                name: "added_delete_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "15",
-                },
-            },
-            Field {
-                name: "existing_delete_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "16",
-                },
-            },
-            Field {
-                name: "deleted_delete_files_count",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "17",
-                },
-            },
-            Field {
-                name: "partition_summaries",
-                data_type: List(
-                    Field {
-                        data_type: Struct(
-                            [
-                                Field {
-                                    name: "contains_null",
-                                    data_type: Boolean,
-                                    metadata: {
-                                        "PARQUET:field_id": "10",
-                                    },
-                                },
-                                Field {
-                                    name: "contains_nan",
-                                    data_type: Boolean,
-                                    nullable: true,
-                                    metadata: {
-                                        "PARQUET:field_id": "11",
-                                    },
-                                },
-                                Field {
-                                    name: "lower_bound",
-                                    data_type: Utf8,
-                                    nullable: true,
-                                    metadata: {
-                                        "PARQUET:field_id": "12",
-                                    },
-                                },
-                                Field {
-                                    name: "upper_bound",
-                                    data_type: Utf8,
-                                    nullable: true,
-                                    metadata: {
-                                        "PARQUET:field_id": "13",
-                                    },
-                                },
-                            ],
-                        ),
-                        metadata: {
-                            "PARQUET:field_id": "9",
-                        },
-                    },
-                ),
-                metadata: {
-                    "PARQUET:field_id": "8",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(manifests[0].schema().to_string(), @r#"Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} }, Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} }, Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} }, Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} }, Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} }, Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} }, Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} }, Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} }, Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} }, Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} }, Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} }, Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#);
     assert!(manifests.iter().all(|batch| batch.num_rows() == 0));
 
     Ok(())
@@ -662,27 +450,7 @@ async fn test_insert_into() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the data
-    insta::assert_debug_snapshot!(batches[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "foo1",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "foo2",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(batches[0].schema().to_string(), @r#"Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} }, Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#);
     insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
     +------+--------+
     | foo1 | foo2   |
@@ -845,100 +613,7 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the data
-    insta::assert_debug_snapshot!(batches[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "id",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "name",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-            Field {
-                name: "profile",
-                data_type: Struct(
-                    [
-                        Field {
-                            name: "address",
-                            data_type: Struct(
-                                [
-                                    Field {
-                                        name: "street",
-                                        data_type: Utf8,
-                                        nullable: true,
-                                        metadata: {
-                                            "PARQUET:field_id": "6",
-                                        },
-                                    },
-                                    Field {
-                                        name: "city",
-                                        data_type: Utf8,
-                                        nullable: true,
-                                        metadata: {
-                                            "PARQUET:field_id": "7",
-                                        },
-                                    },
-                                    Field {
-                                        name: "zip",
-                                        data_type: Int32,
-                                        nullable: true,
-                                        metadata: {
-                                            "PARQUET:field_id": "8",
-                                        },
-                                    },
-                                ],
-                            ),
-                            nullable: true,
-                            metadata: {
-                                "PARQUET:field_id": "4",
-                            },
-                        },
-                        Field {
-                            name: "contact",
-                            data_type: Struct(
-                                [
-                                    Field {
-                                        name: "email",
-                                        data_type: Utf8,
-                                        nullable: true,
-                                        metadata: {
-                                            "PARQUET:field_id": "9",
-                                        },
-                                    },
-                                    Field {
-                                        name: "phone",
-                                        data_type: Utf8,
-                                        nullable: true,
-                                        metadata: {
-                                            "PARQUET:field_id": "10",
-                                        },
-                                    },
-                                ],
-                            ),
-                            nullable: true,
-                            metadata: {
-                                "PARQUET:field_id": "5",
-                            },
-                        },
-                    ],
-                ),
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "3",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(batches[0].schema().to_string(), @r#"Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }, Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} }, Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#);
     insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
     +----+-------+-------------------------------------------------------------------------------------------------------------------------+
     | id | name  | profile                                                                                                                 |
@@ -970,67 +645,7 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the flattened data
-    insta::assert_debug_snapshot!(batches[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "id",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "name",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-            Field {
-                name: "catalog.test_insert_nested.nested_table.profile[address][street]",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "6",
-                },
-            },
-            Field {
-                name: "catalog.test_insert_nested.nested_table.profile[address][city]",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "7",
-                },
-            },
-            Field {
-                name: "catalog.test_insert_nested.nested_table.profile[address][zip]",
-                data_type: Int32,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "8",
-                },
-            },
-            Field {
-                name: "catalog.test_insert_nested.nested_table.profile[contact][email]",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "9",
-                },
-            },
-            Field {
-                name: "catalog.test_insert_nested.nested_table.profile[contact][phone]",
-                data_type: Utf8,
-                nullable: true,
-                metadata: {
-                    "PARQUET:field_id": "10",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(batches[0].schema().to_string(), @r#"Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }, Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} }, Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} }, Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} }, Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} }, Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} }, Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#);
     insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
     +----+-------+------------------------------------------------------------------+----------------------------------------------------------------+---------------------------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------------------------+
     | id | name  | catalog.test_insert_nested.nested_table.profile[address][street] | catalog.test_insert_nested.nested_table.profile[address][city] | catalog.test_insert_nested.nested_table.profile[address][zip] | catalog.test_insert_nested.nested_table.profile[contact][email] | catalog.test_insert_nested.nested_table.profile[contact][phone] |
@@ -1154,34 +769,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the data - note that _partition column should NOT be present
-    insta::assert_debug_snapshot!(batches[0].schema(), @r#"
-    Schema {
-        fields: [
-            Field {
-                name: "id",
-                data_type: Int32,
-                metadata: {
-                    "PARQUET:field_id": "1",
-                },
-            },
-            Field {
-                name: "category",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "2",
-                },
-            },
-            Field {
-                name: "value",
-                data_type: Utf8,
-                metadata: {
-                    "PARQUET:field_id": "3",
-                },
-            },
-        ],
-        metadata: {},
-    }
-    "#);
+    insta::assert_snapshot!(batches[0].schema().to_string(), @r#"Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }, Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} }, Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#);
     insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
     +----+-------------+----------+
     | id | category    | value    |
@@ -1608,35 +1196,7 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         ident.name(),
     )
     .await?;
-    insta::assert_debug_snapshot!(&evolved.schema(), @r#"
-        Schema {
-            fields: [
-                Field {
-                    name: "foo1",
-                    data_type: Int32,
-                    metadata: {
-                        "PARQUET:field_id": "1",
-                    },
-                },
-                Field {
-                    name: "foo2",
-                    data_type: Utf8,
-                    metadata: {
-                        "PARQUET:field_id": "2",
-                    },
-                },
-                Field {
-                    name: "foo3",
-                    data_type: Int32,
-                    nullable: true,
-                    metadata: {
-                        "PARQUET:field_id": "3",
-                    },
-                },
-            ],
-            metadata: {},
-        }
-    "#);
+    insta::assert_snapshot!(evolved.schema().to_string(), @r#"Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} }, Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }, Field { "foo3": nullable Int32, metadata: {"PARQUET:field_id": "3"} }"#);
     ctx.register_table("evolved", Arc::new(evolved))?;
     ctx.sql("INSERT INTO evolved VALUES (2, 'turing', 3)")
         .await?
