@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "iceberg-datafusion"
-version = "0.10.1"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3261,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "iceberg-playground"
-version = "0.10.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "iceberg-sqllogictest"
-version = "0.10.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -28,7 +28,7 @@ edition = "2024"
 homepage = "https://datafusion.apache.org"
 license = "Apache-2.0"
 repository = "https://github.com/apache/datafusion-iceberg"
-version = "0.10.1"
+version = "0.12.0"
 
 [workspace.dependencies]
 anyhow = "1.0.72"
