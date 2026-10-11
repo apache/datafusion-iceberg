@@ -42,7 +42,6 @@ serde = { version = "1", features = ["derive"] }
 typetag = "0.2"
 
 [dev-dependencies]
-expect-test = "1"
 insta = "1"
 parquet = "59.2"
 tempfile = "3.18"

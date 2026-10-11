@@ -3258,7 +3258,6 @@ dependencies = [
  "bytes",
  "dashmap",
  "datafusion",
- "expect-test",
  "futures",
  "iceberg",
  "insta",

@@ -48,7 +48,7 @@ cargo test --workspace --locked
 cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
 cargo test -p iceberg-datafusion --test integration_datafusion_test <name>      # integration tests
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
-UPDATE_EXPECT=1 cargo test -p iceberg-datafusion --test integration_datafusion_test  # rewrite expect![[...]] snapshots
+cargo insta test -p iceberg-datafusion --test integration_datafusion_test --review  # review inline snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 
