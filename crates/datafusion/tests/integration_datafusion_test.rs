@@ -22,11 +22,15 @@ use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, AsArray, Int32Array, RecordBatch, StringArray, UInt64Array,
+};
 use datafusion::arrow::compute::{
     cast, concat_batches, sort_to_indices, take_record_batch,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Int32Type, Int64Type, Schema as ArrowSchema,
+};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
@@ -554,6 +558,102 @@ async fn test_insert_into() -> Result<(), Box<dyn Error>> {
         Some("foo1"),
     );
 
+    Ok(())
+}
+
+/// Registers the default test table (required `foo1: int`, required `foo2: string`, unpartitioned)
+/// in `namespace`, and a source table `src` whose `foo1` is nullable and holds `foo1_values`.
+async fn insert_from_nullable_source(
+    namespace: &str,
+    foo1_values: Vec<Option<i32>>,
+) -> Result<(SessionContext, datafusion::error::Result<Vec<RecordBatch>>), Box<dyn Error>>
+{
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace_ident = NamespaceIdent::new(namespace.to_string());
+    set_test_namespace(&iceberg_catalog, &namespace_ident).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog
+        .create_table(&namespace_ident, creation)
+        .await?;
+
+    let catalog =
+        Arc::new(IcebergCatalogProvider::try_new(Arc::new(iceberg_catalog)).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("foo1", DataType::Int32, true),
+        Field::new("foo2", DataType::Utf8, false),
+    ]));
+    let names = StringArray::from(vec!["alan"; foo1_values.len()]);
+    let source = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int32Array::from(foo1_values)), Arc::new(names)],
+    )?;
+    ctx.register_batch("src", source)?;
+
+    let insert = ctx
+        .sql(&format!(
+            "INSERT INTO catalog.{namespace}.my_table SELECT foo1, foo2 FROM src"
+        ))
+        .await?
+        .collect()
+        .await;
+    Ok((ctx, insert))
+}
+
+#[tokio::test]
+async fn test_insert_into_rejects_null_in_required_column() -> Result<(), Box<dyn Error>>
+{
+    let (ctx, insert) =
+        insert_from_nullable_source("test_insert_null_required", vec![Some(1), None])
+            .await?;
+
+    let err = insert.expect_err("a null in a required column must fail the insert");
+    assert!(
+        err.to_string()
+            .contains("has null but schema specifies non-nullable"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing was committed.
+    let rows = ctx
+        .sql("SELECT count(*) FROM catalog.test_insert_null_required.my_table")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(rows[0].column(0).as_primitive::<Int64Type>().value(0), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_accepts_nullable_source_without_nulls()
+-> Result<(), Box<dyn Error>> {
+    let (ctx, insert) = insert_from_nullable_source(
+        "test_insert_nullable_source",
+        vec![Some(1), Some(2)],
+    )
+    .await?;
+    insert?;
+
+    let rows = ctx
+        .sql(
+            "SELECT foo1 FROM catalog.test_insert_nullable_source.my_table ORDER BY foo1",
+        )
+        .await?
+        .collect()
+        .await?;
+    let ids: Vec<i32> = rows
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
     Ok(())
 }
 
