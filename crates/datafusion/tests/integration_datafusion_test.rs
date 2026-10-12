@@ -29,18 +29,12 @@ use datafusion::arrow::compute::{
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
-use datafusion_iceberg::physical_plan::{
-    IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
-};
-use datafusion_iceberg::{
-    IcebergCatalogProvider, IcebergMetadataTableProvider, IcebergStaticTableProvider,
-    IcebergTableProvider,
-};
 use expect_test::{Expect, expect};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -52,6 +46,14 @@ use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
+};
+use iceberg_datafusion::metadata::{
+    IcebergMetadataDataSource, IcebergMetadataTableProvider,
+};
+use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
+use iceberg_datafusion::{
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
 use tempfile::TempDir;
 
@@ -313,7 +315,10 @@ async fn test_table_projection() -> Result<(), Box<dyn Error>> {
         .unwrap();
     assert_eq!(2, s.len());
     // the first row is logical_plan, the second row is physical_plan
-    assert!(s.value(1).contains("projection:[foo1,foo2,foo3]"));
+    assert!(
+        s.value(1)
+            .contains("DataSourceExec: format=iceberg, projection=[foo1, foo2, foo3]")
+    );
 
     // datafusion doesn't support query foo3.s_foo1, use foo3 instead
     let records = table_df
@@ -334,7 +339,7 @@ async fn test_table_projection() -> Result<(), Box<dyn Error>> {
     assert_eq!(2, s.len());
     assert!(
         s.value(1)
-            .contains("IcebergTableScan projection:[foo1,foo3]")
+            .contains("DataSourceExec: format=iceberg, projection=[foo1, foo3]")
     );
 
     Ok(())
@@ -381,7 +386,7 @@ async fn test_table_predict_pushdown() -> Result<(), Box<dyn Error>> {
         .unwrap();
     assert_eq!(2, s.len());
     // the first row is logical_plan, the second row is physical_plan
-    let expected = "predicate:[(foo > 1) OR (bar IS NULL)]";
+    let expected = "predicate=(foo > 1) OR (bar IS NULL)";
     assert!(s.value(1).trim().contains(expected));
     Ok(())
 }
@@ -1148,14 +1153,21 @@ async fn run(
 }
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
-fn rebuild_scan(scan: &IcebergTableScan) -> IcebergTableScan {
-    IcebergTableScan::new_with_predicate(
-        scan.table().clone(),
-        scan.snapshot_id(),
-        scan.schema(),
-        scan.predicates().cloned(),
-        scan.limit(),
-    )
+fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
+    IcebergDataSource::builder(scan.table().clone(), scan.schema())
+        .with_snapshot_id(scan.snapshot_id())
+        .with_predicate(scan.predicate().cloned())
+        .with_fetch(scan.fetch())
+        .build()
+        .unwrap()
+}
+
+async fn run_source(
+    source: &IcebergDataSource,
+    ctx: &SessionContext,
+) -> Result<String, Box<dyn Error>> {
+    let exec = DataSourceExec::from_data_source(source.clone());
+    run(exec.as_ref(), ctx).await
 }
 
 /// Returns the first node of type `T` in `plan`, depth first.
@@ -1183,11 +1195,11 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .table_provider("catalog.test_plan_nodes.my_table")
         .await?;
     let provider = provider
-        .downcast_ref::<IcebergTableProvider>()
+        .downcast_ref::<IcebergCatalogTableProvider>()
         .expect("a catalog-backed provider");
     assert_eq!(provider.table_ident(), &ident);
     assert!(Arc::ptr_eq(provider.catalog(), &client));
-    let rebuilt = IcebergTableProvider::try_new(
+    let rebuilt = IcebergCatalogTableProvider::try_new(
         provider.catalog().clone(),
         provider.table_ident().namespace().clone(),
         provider.table_ident().name(),
@@ -1257,15 +1269,19 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .await?
         .create_physical_plan()
         .await?;
-    let scan = find_node::<IcebergTableScan>(&plan).expect("a scan");
+    let scan_exec = find_node::<DataSourceExec>(&plan).expect("a data source");
+    let scan = scan_exec
+        .data_source()
+        .downcast_ref::<IcebergDataSource>()
+        .expect("an Iceberg data source");
     assert_eq!(
-        scan.predicates().map(ToString::to_string).as_deref(),
+        scan.predicate().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
-    let expected = run(scan, &ctx).await?;
+    let expected = run_source(scan, &ctx).await?;
     expect![[r#"
         +------+------+
         | foo1 | foo2 |
@@ -1273,16 +1289,22 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         | 1    | alan |
         +------+------+"#]]
     .assert_eq(&expected);
-    assert_eq!(run(&rebuilt, &ctx).await?, expected);
+    assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
 
     // Without a projection the scan reads every column by name, and its limit
     // is kept.
     let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
-    let scan = plan.downcast_ref::<IcebergTableScan>().expect("a scan");
+    let scan_exec = plan
+        .downcast_ref::<DataSourceExec>()
+        .expect("a data source");
+    let scan = scan_exec
+        .data_source()
+        .downcast_ref::<IcebergDataSource>()
+        .expect("an Iceberg data source");
     assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
     let rebuilt = rebuild_scan(scan);
-    assert_eq!(rebuilt.limit(), Some(1));
-    let expected = run(scan, &ctx).await?;
+    assert_eq!(rebuilt.fetch(), Some(1));
+    let expected = run_source(scan, &ctx).await?;
     expect![[r#"
         +------+------+
         | foo1 | foo2 |
@@ -1290,18 +1312,14 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         | 1    | alan |
         +------+------+"#]]
     .assert_eq(&expected);
-    assert_eq!(run(&rebuilt, &ctx).await?, expected);
+    assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
 
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergTableScan::new_with_predicate(
-        pinned.table().clone(),
-        Some(snapshot_id),
-        foo2_only,
-        None,
-        None,
-    );
+    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+        .with_snapshot_id(Some(snapshot_id))
+        .build()?;
     expect![[r#"
         +--------+
         | foo2   |
@@ -1309,7 +1327,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         | alan   |
         | turing |
         +--------+"#]]
-    .assert_eq(&run(&partial, &ctx).await?);
+    .assert_eq(&run_source(&partial, &ctx).await?);
 
     // Metadata tables: a scan rebuilt from a metadata scan's parts reads the
     // same rows.
@@ -1318,14 +1336,19 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .await?
         .create_physical_plan()
         .await?;
-    let metadata_scan = find_node::<IcebergMetadataScan>(&plan).expect("a metadata scan");
+    let metadata_exec =
+        find_node::<DataSourceExec>(&plan).expect("a metadata data source");
+    let metadata_scan = metadata_exec
+        .data_source()
+        .downcast_ref::<IcebergMetadataDataSource>()
+        .expect("an Iceberg metadata source");
     let provider = metadata_scan.provider();
     assert_eq!(provider.table().identifier(), &ident);
-    let rebuilt = IcebergMetadataScan::new(IcebergMetadataTableProvider::new(
+    let rebuilt = IcebergMetadataDataSource::new(IcebergMetadataTableProvider::new(
         provider.table().clone(),
         provider.metadata_type().clone(),
     ));
-    let batches = run_batches(metadata_scan, &ctx).await?;
+    let batches = run_batches(metadata_exec, &ctx).await?;
     // Snapshots come back in no set order, so put the first, which has no
     // parent, first. Their ids, times and paths differ on every run, so each
     // row is checked against its snapshot's metadata.
@@ -1411,8 +1434,10 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     );
     // The rebuilt scan holds the same table, so lists its snapshots in the
     // same order.
+    let rebuilt_exec = DataSourceExec::from_data_source(rebuilt);
     assert_eq!(
-        pretty_format_batches(&run_batches(&rebuilt, &ctx).await?)?.to_string(),
+        pretty_format_batches(&run_batches(rebuilt_exec.as_ref(), &ctx).await?)?
+            .to_string(),
         pretty_format_batches(&batches)?.to_string()
     );
 
@@ -1435,7 +1460,8 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
     let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
 
     let provider = Arc::new(
-        IcebergTableProvider::try_new(client.clone(), namespace, "my_table").await?,
+        IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
+            .await?,
     );
     let ctx = SessionContext::new();
     ctx.register_table("t", provider.clone())?;
@@ -1457,7 +1483,7 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
 
     // A scan reads the schema of the snapshot it reads, so write a snapshot
     // with the new column, through a provider that sees it.
-    let evolved = IcebergTableProvider::try_new(
+    let evolved = IcebergCatalogTableProvider::try_new(
         client.clone(),
         ident.namespace().clone(),
         ident.name(),

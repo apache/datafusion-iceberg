@@ -1,0 +1,903 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+use datafusion::arrow::array::{
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, UInt64Array,
+};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
+use datafusion::common::{
+    exec_err, internal_datafusion_err, internal_err, tree_node::TreeNodeRecursion,
+};
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
+use futures::StreamExt;
+use iceberg::Catalog;
+use iceberg::spec::{DataFile, read_data_files_from_avro};
+use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+use super::exec::DATA_FILES_COL_NAME;
+use crate::to_datafusion_error;
+
+/// IcebergCommitExec is responsible for collecting the files written and use
+/// [`Transaction::fast_append`] to commit the data files written.
+///
+/// Its input produces the data files to commit, in the form
+/// [`IcebergWriteExec`](super::IcebergWriteExec) outputs them, in a single
+/// partition. Its output is one row holding the number of rows committed.
+#[derive(Debug)]
+pub struct IcebergCommitExec {
+    table: Table,
+    catalog: Arc<dyn Catalog>,
+    input: Arc<dyn ExecutionPlan>,
+    count_schema: ArrowSchemaRef,
+    plan_properties: Arc<PlanProperties>,
+}
+
+impl IcebergCommitExec {
+    /// Commits the data files `input` produces to `table` through `catalog`.
+    ///
+    /// `input` must have a single partition, such as a
+    /// [`CoalescePartitionsExec`](datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec)
+    /// over an [`IcebergWriteExec`](super::IcebergWriteExec); executing the node
+    /// fails otherwise.
+    pub fn new(
+        table: Table,
+        catalog: Arc<dyn Catalog>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let count_schema = Self::make_count_schema();
+
+        let plan_properties = Self::compute_properties(Arc::clone(&count_schema));
+
+        Self {
+            table,
+            catalog,
+            input,
+            count_schema,
+            plan_properties,
+        }
+    }
+
+    /// The catalog this node commits through.
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// The table this node commits to, as loaded when the node was planned.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    // Compute the plan properties for this execution plan
+    fn compute_properties(schema: ArrowSchemaRef) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ))
+    }
+
+    // Create a record batch with just the count of rows written
+    fn make_count_batch(count: u64) -> Result<RecordBatch> {
+        let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
+
+        RecordBatch::try_from_iter_with_nullable(vec![("count", count_array, false)])
+            .map_err(|e| {
+                DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("Failed to make count batch!".to_string()),
+                )
+            })
+    }
+
+    fn make_count_schema() -> ArrowSchemaRef {
+        // Define a schema.
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]))
+    }
+}
+
+impl DisplayAs for IcebergCommitExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default => {
+                write!(f, "IcebergCommitExec: table={}", self.table.identifier())
+            }
+            DisplayFormatType::Verbose => {
+                // The fields on one line, as `Schema`'s own display spans
+                // several.
+                let fields = self
+                    .table
+                    .metadata()
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| field.to_string().trim_end().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "IcebergCommitExec: table={}, schema=[{fields}]",
+                    self.table.identifier()
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "IcebergCommitExec: table={}", self.table.identifier())
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for IcebergCommitExec {
+    fn name(&self) -> &str {
+        "IcebergCommitExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn required_input_distribution(
+        &self,
+    ) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![
+            datafusion::physical_plan::Distribution::SinglePartition;
+            self.children().len()
+        ]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return internal_err!(
+                "IcebergCommitExec expects exactly one child, but provided {}",
+                children.len()
+            );
+        }
+
+        Ok(Arc::new(IcebergCommitExec::new(
+            self.table.clone(),
+            self.catalog.clone(),
+            children[0].clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        // IcebergCommitExec only has one partition (partition 0)
+        if partition != 0 {
+            return internal_err!(
+                "IcebergCommitExec only has one partition, but got partition {partition}"
+            );
+        }
+
+        // Only partition 0 of the input is read below, so the files of any
+        // other partition would silently go uncommitted.
+        let input_partitions = self.input.properties().partitioning.partition_count();
+        if input_partitions != 1 {
+            return exec_err!(
+                "IcebergCommitExec requires an input with one partition, but it has \
+                 {input_partitions}; coalesce the input first"
+            );
+        }
+
+        let table = self.table.clone();
+        let input_plan = self.input.clone();
+
+        // todo revisit this
+        let spec_id = self.table.metadata().default_partition_spec_id();
+        let partition_type = self.table.metadata().default_partition_type().clone();
+        let current_schema = self.table.metadata().current_schema().clone();
+        let format_version = self.table.metadata().format_version();
+
+        let catalog = Arc::clone(&self.catalog);
+
+        // Process the input streams from all partitions and commit the data files
+        let stream = futures::stream::once(async move {
+            let mut data_files: Vec<DataFile> = Vec::new();
+            let mut total_record_count: u64 = 0;
+
+            // Execute and collect results from the input coalesced plan
+            let mut batch_stream = input_plan.execute(0, context)?;
+
+            while let Some(batch_result) = batch_stream.next().await {
+                let batch = batch_result?;
+
+                let files_array = batch
+                    .column_by_name(DATA_FILES_COL_NAME)
+                    .ok_or_else(|| {
+                        internal_datafusion_err!(
+                            "Expected 'data_files' column in input batch"
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        internal_datafusion_err!(
+                            "Expected 'data_files' column to be LargeBinaryArray"
+                        )
+                    })?;
+
+                // Each value is a separate Avro container with one or more data files.
+                files_array.iter().try_for_each(|payload| {
+                    let mut payload = payload.ok_or_else(|| {
+                        internal_datafusion_err!("Null Avro data file payload")
+                    })?;
+                    if payload.is_empty() {
+                        return internal_err!("Empty Avro data file payload");
+                    }
+                    let files = read_data_files_from_avro(
+                        &mut payload,
+                        &current_schema,
+                        spec_id,
+                        &partition_type,
+                        format_version,
+                    )
+                    .map_err(to_datafusion_error)?;
+
+                    total_record_count +=
+                        files.iter().map(|f| f.record_count()).sum::<u64>();
+                    data_files.extend(files);
+                    Ok(())
+                })?;
+            }
+
+            // If no data files were collected, return a single row with count = 0
+            if data_files.is_empty() {
+                return Self::make_count_batch(0);
+            }
+
+            // Create a transaction and commit the data files
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(data_files);
+
+            // Apply the action and commit the transaction
+            let _updated_table = action
+                .apply(tx)
+                .map_err(to_datafusion_error)?
+                .commit(catalog.as_ref())
+                .await
+                .map_err(to_datafusion_error)?;
+
+            Self::make_count_batch(total_record_count)
+        })
+        .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.count_schema),
+            stream,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fmt;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{
+        ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array,
+    };
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::TaskContext;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::physical_plan::common::collect;
+    use datafusion::physical_plan::execution_plan::Boundedness;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    };
+    use datafusion::prelude::*;
+    use futures::StreamExt;
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType,
+        Schema, Struct, Type, write_data_files_to_avro,
+    };
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+
+    use super::*;
+    use crate::table_provider::IcebergCatalogTableProvider;
+
+    // A mock execution plan that returns record batches with serialized data files
+    #[derive(Debug)]
+    struct MockWriteExec {
+        schema: Arc<ArrowSchema>,
+        data_files_avro: Vec<Vec<u8>>,
+        plan_properties: Arc<PlanProperties>,
+    }
+
+    impl MockWriteExec {
+        fn new(data_files_avro: Vec<Vec<u8>>) -> Self {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                DATA_FILES_COL_NAME,
+                DataType::LargeBinary,
+                false,
+            )]));
+
+            let plan_properties = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema.clone()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ));
+
+            Self {
+                schema,
+                data_files_avro,
+                plan_properties,
+            }
+        }
+    }
+
+    impl ExecutionPlan for MockWriteExec {
+        fn name(&self) -> &str {
+            "MockWriteExec"
+        }
+
+        fn schema(&self) -> Arc<ArrowSchema> {
+            self.schema.clone()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.plan_properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            // Create a record batch with the serialized data files
+            let array = Arc::new(LargeBinaryArray::from_iter_values(
+                self.data_files_avro.iter(),
+            )) as ArrayRef;
+            let batch = RecordBatch::try_new(self.schema.clone(), vec![array])?;
+
+            // Create a stream that returns this batch
+            let stream = futures::stream::once(async move { Ok(batch) }).boxed();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                stream,
+            )))
+        }
+    }
+
+    // Implement DisplayAs for MockDataFilesExec
+    impl DisplayAs for MockWriteExec {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+            match t {
+                DisplayFormatType::Default
+                | DisplayFormatType::Verbose
+                | DisplayFormatType::TreeRender => {
+                    write!(f, "MockDataFilesExec: files={}", self.data_files_avro.len())
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_commit_exec() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a memory catalog with in-memory file IO
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        // Create a namespace
+        let namespace = NamespaceIdent::new("test_namespace".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+        // Create a schema for the table
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()?;
+
+        // Create a table
+        let table_creation = TableCreation::builder()
+            .name("test_table".to_string())
+            .schema(schema)
+            .location("memory://root/test_table".to_string())
+            .properties(HashMap::new())
+            .build();
+
+        let table = catalog.create_table(&namespace, table_creation).await?;
+
+        // Create data files
+        let data_file1 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("path/to/file1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(1024)
+            .record_count(100)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::empty())
+            .build()?;
+
+        let data_file2 = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("path/to/file2.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(2048)
+            .record_count(200)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::empty())
+            .build()?;
+
+        // Serialize each task's files into a separate Avro container
+        let partition_type = table.metadata().default_partition_type().clone();
+        let mut data_file1_avro = Vec::new();
+        write_data_files_to_avro(
+            &mut data_file1_avro,
+            [data_file1.clone()],
+            &partition_type,
+            table.metadata().format_version(),
+        )?;
+
+        let mut data_file2_avro = Vec::new();
+        write_data_files_to_avro(
+            &mut data_file2_avro,
+            [data_file2.clone()],
+            &partition_type,
+            table.metadata().format_version(),
+        )?;
+
+        // Create a mock execution plan that returns the serialized data files
+        let input_exec =
+            Arc::new(MockWriteExec::new(vec![data_file1_avro, data_file2_avro]));
+
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec);
+
+        // Verify Execution Plan schema matches the count schema
+        assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
+
+        // Execute the commit exec
+        let task_ctx = Arc::new(TaskContext::default());
+        let stream = commit_exec.execute(0, task_ctx)?;
+        let batches = collect(stream).await?;
+
+        // Verify the results
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 1);
+
+        // The output should be a record batch with a single column "count" and a single row
+        // with the total record count (100 + 200 = 300)
+        let count_array = batch.column(0);
+        assert_eq!(count_array.len(), 1);
+        assert_eq!(count_array.data_type(), &DataType::UInt64);
+
+        // Verify that the count is correct
+        let count = count_array.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(count.value(0), 300);
+
+        // Verify that the table has been updated with the new files
+        let updated_table = catalog
+            .load_table(&TableIdent::from_strs(["test_namespace", "test_table"]).unwrap())
+            .await?;
+        let current_snapshot = updated_table.metadata().current_snapshot().unwrap();
+
+        // Load the manifest list to verify the data files were added
+        let manifest_list = updated_table
+            .manifest_list_reader(current_snapshot)
+            .load()
+            .await?;
+
+        // There should be at least one manifest
+        assert!(!manifest_list.entries().is_empty());
+
+        // Load the first manifest and verify it contains our data files
+        let manifest = updated_table
+            .manifest_reader()
+            .read(&manifest_list.entries()[0])
+            .await?;
+
+        // Verify that the manifest contains our data files
+        let manifest_files: Vec<String> = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().file_path().to_string())
+            .collect();
+
+        assert!(manifest_files.contains(&"path/to/file1.parquet".to_string()));
+        assert!(manifest_files.contains(&"path/to/file2.parquet".to_string()));
+
+        Ok(())
+    }
+
+    /// The commit reads a single input partition, so an input with more is
+    /// refused rather than committing the files of its first partition alone.
+    #[tokio::test]
+    async fn test_iceberg_commit_exec_rejects_multiple_input_partitions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await?,
+        );
+        let namespace = NamespaceIdent::new("test_namespace".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()?;
+        let table_creation = TableCreation::builder()
+            .name("test_table".to_string())
+            .schema(schema)
+            .location("memory://root/test_table".to_string())
+            .build();
+        let table = catalog.create_table(&namespace, table_creation).await?;
+
+        // One data file in each of two input partitions.
+        let partition_type = table.metadata().default_partition_type().clone();
+        let mut partitions: Vec<Arc<dyn ExecutionPlan>> = vec![];
+        for path in ["path/to/file1.parquet", "path/to/file2.parquet"] {
+            let data_file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(1024)
+                .record_count(100)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::empty())
+                .build()?;
+            let mut payload = Vec::new();
+            write_data_files_to_avro(
+                &mut payload,
+                [data_file],
+                &partition_type,
+                table.metadata().format_version(),
+            )?;
+            partitions.push(Arc::new(MockWriteExec::new(vec![payload])));
+        }
+        let input = UnionExec::try_new(partitions)?;
+        assert_eq!(input.properties().partitioning.partition_count(), 2);
+        let commit_exec = IcebergCommitExec::new(table.clone(), catalog.clone(), input);
+        let err = match commit_exec.execute(0, Arc::new(TaskContext::default())) {
+            Ok(_) => panic!("a commit over two input partitions must not execute"),
+            Err(err) => err.to_string(),
+        };
+        assert_eq!(
+            err,
+            "Execution error: IcebergCommitExec requires an input with one \
+             partition, but it has 2; coalesce the input first"
+        );
+
+        let table = catalog.load_table(table.identifier()).await?;
+        assert!(table.metadata().current_snapshot().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_commit_exec_rejects_empty_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await?,
+        );
+        let namespace = NamespaceIdent::new("test_empty_payload".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()?;
+        let creation = TableCreation::builder()
+            .name("test_table".to_string())
+            .schema(schema)
+            .location("memory://root/test_table".to_string())
+            .build();
+        let table = catalog.create_table(&namespace, creation).await?;
+        let input = Arc::new(MockWriteExec::new(vec![vec![]]));
+        let commit_exec = IcebergCommitExec::new(table.clone(), catalog.clone(), input);
+
+        let stream = commit_exec.execute(0, Arc::new(TaskContext::default()))?;
+        let err = collect(stream).await.unwrap_err();
+        assert!(matches!(
+            err,
+            DataFusionError::Internal(message) if message == "Empty Avro data file payload"
+        ));
+        let table = catalog.load_table(table.identifier()).await?;
+        assert!(table.metadata().current_snapshot().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_commit_exec_empty_insert()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace = NamespaceIdent::new("test_empty_insert".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()?;
+
+        let table_creation = TableCreation::builder()
+            .name("empty_insert_table".to_string())
+            .schema(schema)
+            .location("memory://root/empty_insert_table".to_string())
+            .properties(HashMap::new())
+            .build();
+
+        let table = catalog.create_table(&namespace, table_creation).await?;
+        let snapshot_count_before = table.metadata().snapshots().len();
+
+        // Mock write plan produces no data files
+        let input_exec = Arc::new(MockWriteExec::new(vec![]));
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec);
+
+        // The verbose display shows the table's schema on one line.
+        struct Verbose<'a>(&'a IcebergCommitExec);
+        impl fmt::Display for Verbose<'_> {
+            fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+                self.0.fmt_as(DisplayFormatType::Verbose, f)
+            }
+        }
+        assert_eq!(
+            Verbose(&commit_exec).to_string(),
+            "IcebergCommitExec: table=test_empty_insert.empty_insert_table, \
+             schema=[1: id: required int]"
+        );
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let stream = commit_exec.execute(0, task_ctx)?;
+        let batches = collect(stream).await?;
+
+        // Must return exactly one batch with one row and one column
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+
+        // The count column must be UInt64 with value 0
+        let count_array = batch.column(0);
+        assert_eq!(count_array.data_type(), &DataType::UInt64);
+        let count = count_array.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(count.value(0), 0);
+
+        // No new snapshot should be created for an empty insert
+        let updated_table = catalog
+            .load_table(
+                &TableIdent::from_strs(["test_empty_insert", "empty_insert_table"])
+                    .unwrap(),
+            )
+            .await?;
+        let snapshot_count_after = updated_table.metadata().snapshots().len();
+        assert_eq!(
+            snapshot_count_after, snapshot_count_before,
+            "Empty insert must not create a new snapshot"
+        );
+        assert!(updated_table.metadata().current_snapshot().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_datafusion_execution_partitioned_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await?,
+        );
+
+        let namespace = NamespaceIdent::new("test_namespace".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()?;
+
+        let table_name = "test_table";
+        let table_creation = TableCreation::builder()
+            .name(table_name.to_string())
+            .schema(schema)
+            .location("memory://root/test_table".to_string())
+            .properties(HashMap::new())
+            .build();
+        let _ = catalog.create_table(&namespace, table_creation).await?;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let batches: Vec<RecordBatch> = (1..4)
+            .map(|idx| {
+                RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![idx])) as ArrayRef,
+                        Arc::new(StringArray::from(vec![format!("Name{idx}")]))
+                            as ArrayRef,
+                    ],
+                )
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Create DataFusion context with specific partition configuration
+        let mut config = SessionConfig::new();
+        config = config.set_usize("datafusion.execution.target_partitions", 8);
+        let ctx = SessionContext::new_with_config(config);
+
+        // Create multiple partitions - each batch becomes a separate partition
+        let partitions: Vec<Vec<RecordBatch>> =
+            batches.into_iter().map(|batch| vec![batch]).collect();
+        let source_table =
+            Arc::new(MemTable::try_new(Arc::clone(&arrow_schema), partitions)?);
+        ctx.register_table("source_table", source_table)?;
+
+        let iceberg_table_provider = IcebergCatalogTableProvider::try_new(
+            catalog.clone(),
+            namespace.clone(),
+            table_name.to_string(),
+        )
+        .await?;
+        ctx.register_table("iceberg_table", Arc::new(iceberg_table_provider))?;
+
+        let insert_plan = ctx
+            .sql("INSERT INTO iceberg_table SELECT * FROM source_table")
+            .await?;
+
+        let physical_plan = insert_plan.create_physical_plan().await?;
+
+        let actual_plan = format!(
+            "{}",
+            datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(false)
+        );
+
+        println!("Physical plan:\n{actual_plan}");
+
+        let expected_plan = "\
+IcebergCommitExec: table=test_namespace.test_table
+  CoalescePartitionsExec
+    IcebergWriteExec: table=test_namespace.test_table
+      DataSourceExec: partitions=3, partition_sizes=[1, 1, 1]";
+
+        assert_eq!(
+            actual_plan.trim(),
+            expected_plan.trim(),
+            "Physical plan does not match expected\n\nExpected:\n{}\n\nActual:\n{}",
+            expected_plan.trim(),
+            actual_plan.trim()
+        );
+
+        Ok(())
+    }
+}

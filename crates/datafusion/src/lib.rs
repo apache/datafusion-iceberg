@@ -21,10 +21,13 @@ pub use catalog::*;
 mod error;
 pub use error::*;
 
-pub mod physical_plan;
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
+pub mod metadata;
+pub mod read;
+pub mod table_provider;
+pub use table_provider::{
+    IcebergCatalogTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
+};
+pub mod write;
 
-pub(crate) mod task_writer;
+#[doc(hidden)]
+pub mod test_utils;

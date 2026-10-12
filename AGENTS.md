@@ -23,7 +23,7 @@ Apache DataFusion integration for Apache Iceberg: catalog/table providers and ph
 
 | Directory | Package | Purpose |
 |---|---|---|
-| `crates/datafusion` | `datafusion-iceberg` | The published library |
+| `crates/datafusion` | `iceberg-datafusion` | The published library |
 | `crates/sqllogictest` | `iceberg-sqllogictest` | SQL-level test harness (unpublished) |
 | `crates/playground` | `iceberg-playground` | REPL CLI built on `datafusion-cli` (unpublished) |
 
@@ -45,10 +45,10 @@ cargo test --workspace --locked
 ## Testing
 
 ```sh
-cargo test -p datafusion-iceberg --lib <name_substring>                          # unit tests
-cargo test -p datafusion-iceberg --test integration_datafusion_test <name>      # integration tests
+cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
+cargo test -p iceberg-datafusion --test integration_datafusion_test <name>      # integration tests
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
-UPDATE_EXPECT=1 cargo test -p datafusion-iceberg --test integration_datafusion_test  # rewrite expect![[...]] snapshots
+UPDATE_EXPECT=1 cargo test -p iceberg-datafusion --test integration_datafusion_test  # rewrite expect![[...]] snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 
@@ -58,14 +58,14 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 ### Catalog → schema → table
 
-`IcebergCatalogProvider` wraps an `iceberg::Catalog` and builds one `IcebergSchemaProvider` per namespace, each holding an `IcebergTableProvider` per table. Namespaces and tables are listed once, at construction, and are never refreshed. Tables created by other clients after that point are invisible.
+`IcebergCatalogProvider` wraps an `iceberg::Catalog` and builds one `IcebergSchemaProvider` per namespace, each holding an `IcebergCatalogTableProvider` per table. Namespaces and tables are listed once, at construction, and are never refreshed. Tables created by other clients after that point are invisible.
 
 - Names like `<table>$snapshots`, `$manifests`, and `$history` resolve to `IcebergMetadataTableProvider`.
 - SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods, which call the async catalog through `spawn_blocking` + `block_on`. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.
 
 ### Table providers (`table/`)
 
-- **`IcebergTableProvider`**: catalog-backed. It caches the Arrow schema at construction but reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
+- **`IcebergCatalogTableProvider`**: catalog-backed. It caches the Arrow schema at construction but reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
 - **`IcebergStaticTableProvider`**: wraps a fixed `Table`, optionally pinned to a snapshot id for time travel. Read-only.
 - **`IcebergTableProviderFactory`**: handles `CREATE EXTERNAL TABLE t STORED AS ICEBERG LOCATION '<metadata.json>'` and produces a static provider. Bare names get the `default` namespace. Schema, partition, and order clauses are rejected.
 
@@ -114,5 +114,6 @@ Library code returns `datafusion::error::Result`. Convert iceberg errors with `t
 
 ## Conventions
 
+- Reserve `mod.rs` and `lib.rs` for module declarations and public re-exports. Put implementations, constants, and unit tests in the corresponding named source files.
 - New files need the ASF license header; copy it from a neighbouring file.
 - Any GitHub Action added to a workflow must be on the ASF allowlist; the `asf-allowlist-check` workflow enforces this.
