@@ -272,14 +272,10 @@ impl ExecutionPlan for IcebergCommitExec {
                 // Each value is a separate Avro container with one or more data files.
                 files_array.iter().try_for_each(|payload| {
                     let mut payload = payload.ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "Null Avro data file payload".to_string(),
-                        )
+                        internal_datafusion_err!("Null Avro data file payload")
                     })?;
                     if payload.is_empty() {
-                        return Err(DataFusionError::Execution(
-                            "Empty Avro data file payload".to_string(),
-                        ));
+                        return internal_err!("Empty Avro data file payload");
                     }
                     let files = read_data_files_from_avro(
                         &mut payload,
@@ -664,6 +660,49 @@ mod tests {
              partition, but it has 2; coalesce the input first"
         );
 
+        let table = catalog.load_table(table.identifier()).await?;
+        assert!(table.metadata().current_snapshot().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_commit_exec_rejects_empty_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        "memory://root".to_string(),
+                    )]),
+                )
+                .await?,
+        );
+        let namespace = NamespaceIdent::new("test_empty_payload".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()?;
+        let creation = TableCreation::builder()
+            .name("test_table".to_string())
+            .schema(schema)
+            .location("memory://root/test_table".to_string())
+            .build();
+        let table = catalog.create_table(&namespace, creation).await?;
+        let input = Arc::new(MockWriteExec::new(vec![vec![]]));
+        let commit_exec = IcebergCommitExec::new(table.clone(), catalog.clone(), input);
+
+        let stream = commit_exec.execute(0, Arc::new(TaskContext::default()))?;
+        let err = collect(stream).await.unwrap_err();
+        assert!(matches!(
+            err,
+            DataFusionError::Internal(message) if message == "Empty Avro data file payload"
+        ));
         let table = catalog.load_table(table.identifier()).await?;
         assert!(table.metadata().current_snapshot().is_none());
 

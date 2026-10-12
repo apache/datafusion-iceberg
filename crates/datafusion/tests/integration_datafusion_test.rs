@@ -17,7 +17,7 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::vec;
@@ -45,7 +45,7 @@ use expect_test::{Expect, expect};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
     UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -903,7 +903,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
-    // Create a schema with string and nullable float partition columns
+    // Create a schema with string and nullable float/double partition columns
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -918,10 +918,16 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
                 Type::Primitive(PrimitiveType::Float),
             )
             .into(),
+            NestedField::optional(
+                5,
+                "double_partition",
+                Type::Primitive(PrimitiveType::Double),
+            )
+            .into(),
         ])
         .build()?;
 
-    // Identity-partition on both category and the float value
+    // Identity-partition on category and both floating-point values
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
         .add_partition_field(
@@ -935,6 +941,13 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
             UnboundPartitionField::builder()
                 .source_ids(vec![4])
                 .name("float_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![5])
+                .name("double_partition")
                 .transform(Transform::Identity)
                 .build()?,
         )?
@@ -965,12 +978,12 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
             r#"
             INSERT INTO catalog.test_partitioned_write.partitioned_table 
             VALUES 
-                (1, 'electronics', 'laptop', CAST(123.456 AS REAL)),
-                (2, 'electronics', 'phone', CAST(123.456 AS REAL)),
-                (3, 'books', 'novel', CAST('NaN' AS REAL)),
-                (4, 'books', 'textbook', CAST('Infinity' AS REAL)),
-                (5, 'clothing', 'shirt', CAST('-Infinity' AS REAL)),
-                (6, 'clothing', 'coat', CAST(NULL AS REAL))
+                (1, 'electronics', 'laptop', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (2, 'electronics', 'phone', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (3, 'books', 'novel', CAST('NaN' AS REAL), CAST('NaN' AS DOUBLE)),
+                (4, 'books', 'textbook', CAST('Infinity' AS REAL), CAST('Infinity' AS DOUBLE)),
+                (5, 'clothing', 'shirt', CAST('-Infinity' AS REAL), CAST('-Infinity' AS DOUBLE)),
+                (6, 'clothing', 'coat', CAST(NULL AS REAL), CAST(NULL AS DOUBLE))
             "#,
         )
         .await
@@ -1001,7 +1014,8 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
             Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
             Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} },
-            Field { "float_partition": nullable Float32, metadata: {"PARQUET:field_id": "4"} }"#]],
+            Field { "float_partition": nullable Float32, metadata: {"PARQUET:field_id": "4"} },
+            Field { "double_partition": nullable Float64, metadata: {"PARQUET:field_id": "5"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
@@ -1038,12 +1052,21 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               inf,
               -inf,
               null,
+            ],
+            double_partition: PrimitiveArray<Float64>
+            [
+              123.456,
+              123.456,
+              NaN,
+              inf,
+              -inf,
+              null,
             ]"#]],
         &[],
         Some("id"),
     );
 
-    // Verify all five partition files and six rows were committed.
+    // Verify the committed files, rows, and partition values.
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
     let table = client.load_table(&table_ident).await?;
 
@@ -1051,17 +1074,34 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let manifest_list = table.manifest_list_reader(snapshot).load().await?;
     let mut file_count = 0;
     let mut row_count = 0;
+    let mut partitions = HashSet::new();
     for entry in manifest_list.entries() {
         let manifest = table.manifest_reader().read(entry).await?;
-        file_count += manifest.entries().len();
-        row_count += manifest
-            .entries()
-            .iter()
-            .map(|entry| entry.data_file().record_count())
-            .sum::<u64>();
+        for entry in manifest.entries() {
+            file_count += 1;
+            row_count += entry.data_file().record_count();
+            partitions.insert(entry.data_file().partition().clone());
+        }
     }
     assert_eq!(file_count, 5);
     assert_eq!(row_count, 6);
+    let partition = |category: &str, float: Option<f32>, double: Option<f64>| {
+        Struct::from_iter([
+            Some(Literal::string(category)),
+            float.map(Literal::float),
+            double.map(Literal::double),
+        ])
+    };
+    assert_eq!(
+        partitions,
+        HashSet::from([
+            partition("electronics", Some(123.456), Some(123.456)),
+            partition("books", Some(f32::NAN), Some(f64::NAN)),
+            partition("books", Some(f32::INFINITY), Some(f64::INFINITY)),
+            partition("clothing", Some(f32::NEG_INFINITY), Some(f64::NEG_INFINITY)),
+            partition("clothing", None, None),
+        ])
+    );
 
     let table_location = table.metadata().location();
     let file_io = table.file_io();
