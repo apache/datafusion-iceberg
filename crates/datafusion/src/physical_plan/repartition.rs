@@ -177,14 +177,13 @@ mod tests {
     };
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::empty::EmptyExec;
-    use iceberg::TableIdent;
     use iceberg::io::FileIO;
     use iceberg::spec::{
         NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField,
         SortOrder, Transform, Type,
     };
     use iceberg::table::Table;
-    use iceberg::test_utils::test_runtime;
+    use iceberg::{Runtime, TableIdent};
 
     use super::*;
 
@@ -226,7 +225,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap()
     }
@@ -378,7 +377,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "bucketed_table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/bucketed_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -463,7 +462,7 @@ mod tests {
             )
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/partitioned_bucketed_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -544,7 +543,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "none_table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/none_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -614,7 +613,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "range_only_table"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/range_only_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -689,7 +688,7 @@ mod tests {
             )
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/mixed_transforms_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -769,7 +768,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "temporal_partition"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/temporal_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 
@@ -840,7 +839,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "identity_partition"]).unwrap())
             .file_io(FileIO::new_with_fs())
             .metadata_location("/test/identity_metadata.json")
-            .runtime(test_runtime())
+            .runtime(Runtime::current())
             .build()
             .unwrap();
 

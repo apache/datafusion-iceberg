@@ -41,19 +41,62 @@ use datafusion_iceberg::{
     IcebergCatalogProvider, IcebergMetadataTableProvider, IcebergStaticTableProvider,
     IcebergTableProvider,
 };
-use expect_test::expect;
+use expect_test::{Expect, expect};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
-use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
 };
 use tempfile::TempDir;
+
+/// Snapshot assertions over record batches, optionally sorted by one column.
+fn check_record_batches(
+    record_batches: Vec<RecordBatch>,
+    expected_schema: Expect,
+    expected_data: Expect,
+    ignore_check_columns: &[&str],
+    sort_column: Option<&str>,
+) {
+    let first_batch = record_batches.first().expect("Empty record batches");
+    let mut batch = concat_batches(&first_batch.schema(), &record_batches).unwrap();
+    if let Some(sort_column) = sort_column {
+        let column = batch.column_by_name(sort_column).unwrap();
+        let indices = sort_to_indices(column, None, None).unwrap();
+        batch = take_record_batch(&batch, &indices).unwrap();
+    }
+
+    expected_schema.assert_eq(
+        &batch
+            .schema()
+            .fields()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n"),
+    );
+    expected_data.assert_eq(
+        &batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, column)| {
+                if ignore_check_columns.contains(&field.name().as_str()) {
+                    format!("{}: (skipped)", field.name())
+                } else {
+                    format!("{}: {column:?}", field.name())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",\n"),
+    );
+}
 
 fn temp_path() -> String {
     let temp_dir = TempDir::new().unwrap();
@@ -881,8 +924,20 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     // Identity-partition on both category and the float value
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
-        .add_partition_field(2, "category", Transform::Identity)?
-        .add_partition_field(4, "float_partition", Transform::Identity)?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![4])
+                .name("float_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
         .build();
 
     // Create the partitioned table
