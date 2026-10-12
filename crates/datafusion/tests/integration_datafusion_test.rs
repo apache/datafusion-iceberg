@@ -39,7 +39,8 @@ use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    Literal, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -554,6 +555,63 @@ async fn test_insert_into() -> Result<(), Box<dyn Error>> {
         Some("foo1"),
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_fills_write_defaults() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_insert_write_defaults".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    // Defaults set through the Iceberg API, as another engine would, rather than by SQL.
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "quantity", Type::Primitive(PrimitiveType::Int))
+                .with_write_default(Literal::int(42))
+                .into(),
+            NestedField::optional(3, "note", Type::Primitive(PrimitiveType::String))
+                .with_write_default(Literal::string("none"))
+                .into(),
+            NestedField::optional(4, "comment", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let creation = get_table_creation(temp_path(), "my_table", Some(schema))?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let catalog =
+        Arc::new(IcebergCatalogProvider::try_new(Arc::new(iceberg_catalog)).await?);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("catalog", catalog);
+
+    ctx.sql("INSERT INTO catalog.test_insert_write_defaults.my_table (id) VALUES (1)")
+        .await?
+        .collect()
+        .await?;
+    ctx.sql(
+        "INSERT INTO catalog.test_insert_write_defaults.my_table (id, quantity, note) \
+         VALUES (2, 3, 'given')",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    let rows = ctx
+        .sql("SELECT * FROM catalog.test_insert_write_defaults.my_table ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    expect![[r#"
+        +----+----------+-------+---------+
+        | id | quantity | note  | comment |
+        +----+----------+-------+---------+
+        | 1  | 42       | none  |         |
+        | 2  | 3        | given |         |
+        +----+----------+-------+---------+"#]]
+    .assert_eq(&pretty_format_batches(&rows)?.to_string());
     Ok(())
 }
 

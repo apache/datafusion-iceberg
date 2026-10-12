@@ -33,6 +33,7 @@ use iceberg::spec::FormatVersion;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::table_provider::IcebergCatalogTableProvider;
+use crate::table_provider::column_defaults::with_write_defaults;
 use crate::to_datafusion_error;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
@@ -159,6 +160,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let df_schema = table.schema();
         let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(df_schema.as_ref())
             .map_err(to_datafusion_error)?;
+        let iceberg_schema = with_write_defaults(iceberg_schema, table.as_ref())?;
 
         // Use at least V2, and upgrade to V3 if the schema requires it (e.g. timestamp_ns / variant).
         let format_version = iceberg_schema
@@ -276,7 +278,9 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use datafusion::prelude::lit;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::Literal;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use tempfile::TempDir;
 
@@ -366,6 +370,43 @@ mod tests {
 
         // Verify the table was registered
         assert!(schema_provider.table_exist("empty_table"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_stores_column_defaults() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider().await;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("count", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty_batch = RecordBatch::new_empty(arrow_schema.clone());
+        // The Int32 default for the Int64 column is cast to the column's type.
+        let mem_table = MemTable::try_new(arrow_schema, vec![vec![empty_batch]])
+            .unwrap()
+            .with_column_defaults(HashMap::from([
+                ("count".to_string(), lit(7i32)),
+                ("name".to_string(), lit("none")),
+            ]));
+
+        schema_provider
+            .register_table("defaults_table".to_string(), Arc::new(mem_table))
+            .unwrap();
+
+        let table_ident =
+            TableIdent::new(schema_provider.namespace.clone(), "defaults_table".into());
+        let table = schema_provider
+            .catalog
+            .load_table(&table_ident)
+            .await
+            .unwrap();
+        let schema = table.metadata().current_schema();
+        let write_default =
+            |name: &str| schema.field_by_name(name).unwrap().write_default.clone();
+        assert_eq!(write_default("id"), None);
+        assert_eq!(write_default("count"), Some(Literal::long(7)));
+        assert_eq!(write_default("name"), Some(Literal::string("none")));
     }
 
     #[tokio::test]

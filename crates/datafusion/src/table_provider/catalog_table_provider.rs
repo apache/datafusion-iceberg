@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
 use crate::read::IcebergDataSource;
+use crate::table_provider::column_defaults::column_defaults;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -59,6 +61,8 @@ pub struct IcebergCatalogTableProvider {
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
     schema: ArrowSchemaRef,
+    /// The columns' `write-default` values, keyed by column name (cached at construction)
+    column_defaults: HashMap<String, Expr>,
 }
 
 impl IcebergCatalogTableProvider {
@@ -78,15 +82,16 @@ impl IcebergCatalogTableProvider {
             .load_table(&table_ident)
             .await
             .map_err(to_datafusion_error)?;
+        let current_schema = table.metadata().current_schema();
         let schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema())
-                .map_err(to_datafusion_error)?,
+            schema_to_arrow_schema(current_schema).map_err(to_datafusion_error)?,
         );
 
         Ok(IcebergCatalogTableProvider {
             catalog,
             table_ident,
             schema,
+            column_defaults: column_defaults(current_schema),
         })
     }
 
@@ -153,6 +158,10 @@ impl TableProvider for IcebergCatalogTableProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         // Push down all filters, as a single source of truth, the scanner will drop the filters which couldn't be push down
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.column_defaults.get(column)
     }
 
     async fn insert_into(

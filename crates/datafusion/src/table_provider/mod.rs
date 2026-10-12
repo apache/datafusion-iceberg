@@ -21,6 +21,7 @@
 //! The static provider reads a fixed table snapshot.
 
 mod catalog_table_provider;
+pub(crate) mod column_defaults;
 mod factory;
 mod static_table_provider;
 

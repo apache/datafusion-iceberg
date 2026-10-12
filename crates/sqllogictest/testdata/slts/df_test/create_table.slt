@@ -88,3 +88,36 @@ SELECT * FROM default.default.nullable_table
 ----
 1 Value
 2 NULL
+
+# Test CREATE TABLE with column defaults
+statement ok
+CREATE TABLE default.default.defaults_table (id INT NOT NULL, quantity INT NOT NULL DEFAULT 7, active BOOLEAN NOT NULL DEFAULT true, note STRING DEFAULT 'none', comment STRING)
+
+# Omitted columns are filled with their defaults, or NULL if they have none
+query I
+INSERT INTO default.default.defaults_table (id) VALUES (1)
+----
+1
+
+# Explicit values take precedence over defaults
+query I
+INSERT INTO default.default.defaults_table (id, quantity, note, comment) VALUES (2, 3, 'given', 'c')
+----
+1
+
+query IIBTT rowsort
+SELECT * FROM default.default.defaults_table
+----
+1 7 true none NULL
+2 3 true given c
+
+# Defaults are stored as values, so they must be constant
+statement error (?s)DEFAULT for column created must be a constant, got now\(\)
+CREATE TABLE default.default.volatile_default_table (id INT NOT NULL, created TIMESTAMP DEFAULT now())
+
+statement error (?s)DEFAULT for column x must be a constant, got random\(\)
+CREATE TABLE default.default.random_default_table (id INT NOT NULL, x DOUBLE DEFAULT random())
+
+# A default that can't be cast to the column's type is rejected when the table is created
+statement error (?s)Cannot cast string 'abc' to value of Int32 type
+CREATE TABLE default.default.bad_default_table (id INT NOT NULL, x INT DEFAULT 'abc')
