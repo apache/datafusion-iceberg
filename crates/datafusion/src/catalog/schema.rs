@@ -33,6 +33,7 @@ use iceberg::spec::FormatVersion;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::table_provider::IcebergCatalogTableProvider;
+use crate::table_provider::column_defaults::with_write_defaults;
 use crate::to_datafusion_error;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
@@ -159,6 +160,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let df_schema = table.schema();
         let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(df_schema.as_ref())
             .map_err(to_datafusion_error)?;
+        let iceberg_schema = with_write_defaults(iceberg_schema, table.as_ref())?;
 
         // Use at least V2, and upgrade to V3 if the schema requires it (e.g. timestamp_ns / variant).
         let format_version = iceberg_schema
