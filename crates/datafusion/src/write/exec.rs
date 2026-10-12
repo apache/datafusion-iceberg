@@ -22,7 +22,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, LargeBinaryArray, RecordBatch};
 use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
 use datafusion::arrow::datatypes::{
-    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use datafusion::common::{internal_err, not_impl_err, tree_node::TreeNodeRecursion};
 use datafusion::error::DataFusionError;
@@ -132,6 +132,38 @@ impl IcebergWriteExec {
                 Some("Failed to make result batch".to_string()),
             )
         })
+    }
+
+    /// The schema `input` is checked against before it is written: `input`'s own schema,
+    /// with each column made non-nullable where the table's column of the same name is
+    /// required. Columns the table doesn't have, such as the `_partition` column that
+    /// [`project_with_partition`](super::project_with_partition) adds, are unchanged.
+    ///
+    /// Without this, a null in a required column would reach the Parquet writer, which
+    /// writes the column as `REQUIRED` and stores the type's default value (e.g. `0`)
+    /// in place of the null.
+    fn sink_schema(&self) -> ArrowSchemaRef {
+        let input_schema = self.input.schema();
+        let table_schema = self.table.metadata().current_schema();
+        let fields: Fields = input_schema
+            .fields()
+            .iter()
+            .map(|input_field| {
+                let required_in_table_schema = table_schema
+                    .as_struct()
+                    .field_by_name(input_field.name())
+                    .is_some_and(|table_field| table_field.required);
+                if required_in_table_schema && input_field.is_nullable() {
+                    Arc::new(input_field.as_ref().clone().with_nullable(false))
+                } else {
+                    Arc::clone(input_field)
+                }
+            })
+            .collect();
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ))
     }
 
     fn make_result_schema() -> ArrowSchemaRef {
@@ -304,10 +336,11 @@ impl ExecutionPlan for IcebergWriteExec {
             partition_spec,
         )?;
 
-        // Get input data
+        // Get input data. DataFusion fails the write if a column that is non-nullable in
+        // the sink schema but nullable in the input holds a null.
         let data = execute_input_stream(
             Arc::clone(&self.input),
-            self.input.schema(), // input schema may have projected column `_partition`
+            self.sink_schema(),
             partition,
             Arc::clone(&context),
         )?;
