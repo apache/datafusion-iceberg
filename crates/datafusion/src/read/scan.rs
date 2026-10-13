@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{Statistics, internal_err};
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -30,12 +30,26 @@ use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::ArrowReader;
 use iceberg::expr::Predicate;
+use iceberg::scan::TableScan;
 use iceberg::table::Table;
 
+use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
+
+// A reader is created once per eager scan. Its clones share the delete loader's
+// cache while each read() call still owns its own scan metrics.
+#[derive(Clone)]
+struct ScanReader(ArrowReader);
+
+impl std::fmt::Debug for ScanReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScanReader")
+    }
+}
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -53,6 +67,9 @@ pub struct IcebergDataSource {
     predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
+    planned_files: Option<Arc<PlannedFileScan>>,
+    output_partitions: usize,
+    reader: Option<Arc<ScanReader>>,
 }
 
 impl IcebergDataSource {
@@ -68,6 +85,45 @@ impl IcebergDataSource {
             predicate: None,
             fetch: None,
         }
+    }
+
+    /// Plan file tasks during physical planning; read them only at execution.
+    pub(crate) async fn with_planned_files(
+        mut self,
+        context: Arc<TaskContext>,
+        max_files: usize,
+        target_partitions: usize,
+    ) -> Result<Self> {
+        let scan = build_table_scan(
+            &self.table,
+            self.snapshot_id,
+            Some(&self.projection),
+            self.predicate.as_ref(),
+        )?;
+        let planned = PlannedFileScan::collect(scan, &context, max_files).await?;
+        let partitions = planned.tasks().len().max(1).min(target_partitions.max(1));
+
+        // Table::reader_builder retains the table's FileIO and custom runtime.
+        // This scan currently changes only snapshot, projection, and predicate;
+        // those values are already carried by FileScanTask. A future scan-specific
+        // reader setting must be applied here and in TableScan::to_arrow().
+        let builder = self.table.reader_builder();
+        let builder = if partitions > 1 {
+            builder.with_data_file_concurrency_limit(1)
+        } else {
+            builder
+        };
+        self.reader = Some(Arc::new(ScanReader(builder.build())));
+        self.output_partitions = partitions;
+        self.planned_files = Some(Arc::new(planned));
+        Ok(self)
+    }
+
+    /// Planned, ungrouped tasks, if file discovery was enabled for this scan.
+    /// A distributed consumer may assign these tasks to its own workers instead
+    /// of using the local output partitions of this source.
+    pub fn planned_files(&self) -> Option<&Arc<PlannedFileScan>> {
+        self.planned_files.as_ref()
     }
 
     pub fn table(&self) -> &Table {
@@ -100,7 +156,8 @@ impl IcebergDataSource {
 /// A table provider passes the table's schema and selects columns with
 /// [`Self::with_projection`]. To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
-/// projection.
+/// projection. This rebuilds a lazy single-partition source; planned file tasks
+/// must be transferred separately when reconstructing a distributed scan.
 #[derive(Debug, Clone)]
 pub struct IcebergDataSourceBuilder {
     table: Table,
@@ -167,6 +224,9 @@ impl IcebergDataSourceBuilder {
             projection,
             predicate: self.predicate,
             fetch: self.fetch,
+            planned_files: None,
+            output_partitions: 1,
+            reader: None,
         })
     }
 }
@@ -181,16 +241,45 @@ impl DataSource for IcebergDataSource {
 
     fn open(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            Some(self.projection.clone()),
-            self.predicate.clone(),
-        );
-        let stream = futures::stream::once(fut).try_flatten();
+        let stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
+            if let Some(planned) = &self.planned_files {
+                if partition >= self.output_partitions {
+                    return internal_err!(
+                        "Iceberg scan partition {partition} does not exist"
+                    );
+                }
+                let Some(reader) = &self.reader else {
+                    return internal_err!("Planned Iceberg scan has no reader");
+                };
+                let planned = Arc::clone(planned);
+                let partitions = self.output_partitions;
+                let tasks = futures::stream::iter(
+                    (partition..planned.tasks().len()).step_by(partitions),
+                )
+                .map(move |index| {
+                    Ok(Arc::unwrap_or_clone(Arc::clone(&planned.tasks()[index])))
+                });
+                Box::pin(
+                    reader
+                        .0
+                        .clone()
+                        .read(Box::pin(tasks))
+                        .map_err(to_datafusion_error)?
+                        .stream()
+                        .map_err(to_datafusion_error),
+                )
+            } else {
+                let fut = get_batch_stream(
+                    self.table.clone(),
+                    self.snapshot_id,
+                    Some(self.projection.clone()),
+                    self.predicate.clone(),
+                );
+                Box::pin(futures::stream::once(fut).try_flatten())
+            };
 
         // Apply the fetch if specified.
         let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
@@ -231,11 +320,14 @@ impl DataSource for IcebergDataSource {
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
+        if let Some(planned) = &self.planned_files {
+            write!(f, ", planned_files={}", planned.tasks().len())?;
+        }
         Ok(())
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        Partitioning::UnknownPartitioning(self.output_partitions)
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
@@ -275,19 +367,12 @@ async fn get_batch_stream(
     column_names: Option<Vec<String>>,
     predicate: Option<Predicate>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
-        None => scan_builder.select_all(),
-    };
-    if let Some(predicate) = predicate {
-        scan_builder = scan_builder.with_filter(predicate);
-    }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+    let table_scan = build_table_scan(
+        &table,
+        snapshot_id,
+        column_names.as_deref(),
+        predicate.as_ref(),
+    )?;
 
     let stream = table_scan
         .to_arrow()
@@ -295,4 +380,24 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
+}
+
+fn build_table_scan(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    column_names: Option<&[String]>,
+    predicate: Option<&Predicate>,
+) -> Result<TableScan> {
+    let builder = match snapshot_id {
+        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
+        None => table.scan(),
+    };
+    let mut builder = match column_names {
+        Some(columns) => builder.select(columns),
+        None => builder.select_all(),
+    };
+    if let Some(predicate) = predicate {
+        builder = builder.with_filter(predicate.clone());
+    }
+    builder.build().map_err(to_datafusion_error)
 }

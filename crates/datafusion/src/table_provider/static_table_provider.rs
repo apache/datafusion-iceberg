@@ -30,6 +30,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
+use crate::IcebergPlanningConfig;
 use crate::error::to_datafusion_error;
 use crate::read::IcebergDataSource;
 
@@ -120,18 +121,34 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Use cached table (no refresh)
-        let source = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
-            .with_snapshot_id(self.snapshot_id)
-            .with_projection(projection)
-            .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
+        // Use cached table (no refresh).
+        let mut source =
+            IcebergDataSource::builder(self.table.clone(), self.schema.clone())
+                .with_snapshot_id(self.snapshot_id)
+                .with_projection(projection)
+                .with_filters(filters)
+                .with_fetch(limit)
+                .build()?;
+        if let Some(config) = state
+            .config()
+            .options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .filter(|config| config.plan_files)
+        {
+            source = source
+                .with_planned_files(
+                    state.task_ctx(),
+                    config.planning_max_files,
+                    state.config().target_partitions(),
+                )
+                .await?;
+        }
         Ok(DataSourceExec::from_data_source(source))
     }
 

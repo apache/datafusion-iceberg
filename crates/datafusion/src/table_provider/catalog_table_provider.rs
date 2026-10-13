@@ -34,6 +34,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
+use crate::IcebergPlanningConfig;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
 use crate::read::IcebergDataSource;
@@ -126,24 +127,39 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog
+        // Load fresh table metadata from catalog.
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
 
-        // Create scan with fresh metadata (always use current snapshot)
-        let source = IcebergDataSource::builder(table, self.schema.clone())
+        // Create scan with fresh metadata (always use current snapshot).
+        let mut source = IcebergDataSource::builder(table, self.schema.clone())
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
             .build()?;
+        if let Some(config) = state
+            .config()
+            .options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .filter(|config| config.plan_files)
+        {
+            source = source
+                .with_planned_files(
+                    state.task_ctx(),
+                    config.planning_max_files,
+                    state.config().target_partitions(),
+                )
+                .await?;
+        }
         Ok(DataSourceExec::from_data_source(source))
     }
 
