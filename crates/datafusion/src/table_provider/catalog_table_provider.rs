@@ -66,6 +66,11 @@ impl IcebergCatalogTableProvider {
     ///
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot load the table, or its schema has
+    /// no Arrow equivalent.
     pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -83,11 +88,23 @@ impl IcebergCatalogTableProvider {
                 .map_err(to_datafusion_error)?,
         );
 
-        Ok(IcebergCatalogTableProvider {
+        Ok(Self::new_with_schema(catalog, table_ident, schema))
+    }
+
+    /// Creates a provider for `table_ident` that declares `schema`, without loading
+    /// the table. For rebuilding a provider in another process from [`Self::catalog`],
+    /// [`Self::table_ident`] and [`TableProvider::schema`]. `schema` is not checked
+    /// against the table; scans read its columns by name from the snapshot they scan.
+    pub fn new_with_schema(
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        schema: ArrowSchemaRef,
+    ) -> Self {
+        IcebergCatalogTableProvider {
             catalog,
             table_ident,
             schema,
-        })
+        }
     }
 
     pub(crate) async fn metadata_table(

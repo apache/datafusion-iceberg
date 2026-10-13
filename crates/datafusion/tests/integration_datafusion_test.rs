@@ -1199,12 +1199,11 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .expect("a catalog-backed provider");
     assert_eq!(provider.table_ident(), &ident);
     assert!(Arc::ptr_eq(provider.catalog(), &client));
-    let rebuilt = IcebergCatalogTableProvider::try_new(
+    let rebuilt = IcebergCatalogTableProvider::new_with_schema(
         provider.catalog().clone(),
-        provider.table_ident().namespace().clone(),
-        provider.table_ident().name(),
-    )
-    .await?;
+        provider.table_ident().clone(),
+        provider.schema(),
+    );
     assert_eq!(rebuilt.table_ident(), &ident);
     assert_eq!(rebuilt.schema(), provider.schema());
 
@@ -1525,23 +1524,32 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         .collect()
         .await?;
 
-    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
-    assert_eq!(plan.schema(), provider.schema());
-    // The rows come from two data files, which may be read in either order.
-    // They are joined under their own schema, not the plan's, so that a column
-    // the plan does not report would show.
-    let batches = run_batches(plan.as_ref(), &ctx).await?;
-    let batch = concat_batches(&batches[0].schema(), &batches)?;
-    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
-    let sorted = take_record_batch(&batch, &order)?;
-    expect![[r#"
-        +------+--------+
-        | foo1 | foo2   |
-        +------+--------+
-        | 1    | alan   |
-        | 2    | turing |
-        +------+--------+"#]]
-    .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
+    // A provider rebuilt from the original's parts, as a codec does, scans the
+    // same columns as the original, not the table's current ones.
+    let rebuilt = IcebergCatalogTableProvider::new_with_schema(
+        provider.catalog().clone(),
+        provider.table_ident().clone(),
+        provider.schema(),
+    );
+    for provider in [provider.as_ref(), &rebuilt] {
+        let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+        assert_eq!(plan.schema(), provider.schema());
+        // The rows come from two data files, which may be read in either order.
+        // They are joined under their own schema, not the plan's, so that a
+        // column the plan does not report would show.
+        let batches = run_batches(plan.as_ref(), &ctx).await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+        let sorted = take_record_batch(&batch, &order)?;
+        expect![[r#"
+            +------+--------+
+            | foo1 | foo2   |
+            +------+--------+
+            | 1    | alan   |
+            | 2    | turing |
+            +------+--------+"#]]
+        .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
+    }
 
     Ok(())
 }
