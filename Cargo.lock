@@ -1690,9 +1690,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-cli"
-version = "55.0.0"
+version = "55.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8b87ff78e243da48b836ced274799a1799b4a2fd321700e4b8f3426c01aa7e"
+checksum = "ffb9833a102f01a257994de966c73fbf7441d8347207d8676c821b7318c03ee6"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5276,7 +5276,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
