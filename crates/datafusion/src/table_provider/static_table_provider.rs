@@ -120,18 +120,21 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        let source = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
-            .with_snapshot_id(self.snapshot_id)
-            .with_projection(projection)
-            .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
+        let source =
+            IcebergDataSource::builder(self.table.clone(), self.schema.clone(), None)
+                .with_snapshot_id(self.snapshot_id)
+                .with_projection(projection)
+                .with_filters(filters)
+                .with_fetch(limit)
+                .build()?
+                .plan_sort_order(state)
+                .await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 

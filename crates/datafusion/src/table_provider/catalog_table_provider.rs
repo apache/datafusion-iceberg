@@ -126,7 +126,7 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -139,11 +139,13 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        let source = IcebergDataSource::builder(table, self.schema.clone())
+        let source = IcebergDataSource::builder(table, self.schema.clone(), None)
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
-            .build()?;
+            .build()?
+            .plan_sort_order(state)
+            .await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
@@ -455,7 +457,7 @@ mod tests {
         let out_of_range = schema.fields().len();
 
         // Columns come back in the projection's order, not the table's.
-        let source = IcebergDataSource::builder(table.clone(), schema.clone())
+        let source = IcebergDataSource::builder(table.clone(), schema.clone(), None)
             .with_projection(Some(&vec![1, 0]))
             .build()
             .unwrap();
@@ -466,7 +468,7 @@ mod tests {
         ]
         "#);
 
-        let err = IcebergDataSource::builder(table, schema)
+        let err = IcebergDataSource::builder(table, schema, None)
             .with_projection(Some(&vec![0, out_of_range]))
             .build()
             .unwrap_err();
