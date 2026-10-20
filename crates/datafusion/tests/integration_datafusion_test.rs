@@ -920,6 +920,7 @@ fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
+        .with_sorted_tasks(scan.sorted_tasks().map(<[_]>::to_vec))
         .build()
         .unwrap()
 }
