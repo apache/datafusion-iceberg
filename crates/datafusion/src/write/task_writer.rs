@@ -20,10 +20,18 @@
 //! This module provides a high-level writer that handles partitioning and routing
 //! of RecordBatch data to Iceberg tables.
 
+use std::collections::HashMap;
+
 use datafusion::arrow::array::RecordBatch;
+use datafusion::common::internal_datafusion_err;
 use datafusion::error::Result;
-use iceberg::arrow::RecordBatchPartitionSplitter;
-use iceberg::spec::{DataFile, PartitionSpecRef, SchemaRef};
+use iceberg::arrow::{
+    PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter,
+    arrow_struct_to_literal,
+};
+use iceberg::spec::{
+    DataFile, Literal, PartitionKey, PartitionSpecRef, SchemaRef, StructType,
+};
 use iceberg::writer::IcebergWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
@@ -82,7 +90,7 @@ enum SupportedWriter<B: IcebergWriterBuilder> {
     /// Writer for partitioned tables with unsorted data (maintains multiple active writers)
     Fanout(FanoutWriter<B>),
     /// Writer for partitioned tables with sorted data (maintains single active writer)
-    Clustered(ClusteredWriter<B>),
+    Clustered(ClusteredWriter<B>, StructType),
 }
 
 impl<B: IcebergWriterBuilder> TaskWriter<B> {
@@ -131,7 +139,12 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         } else if fanout_enabled {
             SupportedWriter::Fanout(FanoutWriter::new(writer_builder))
         } else {
-            SupportedWriter::Clustered(ClusteredWriter::new(writer_builder))
+            SupportedWriter::Clustered(
+                ClusteredWriter::new(writer_builder),
+                partition_spec
+                    .partition_type(&schema)
+                    .map_err(to_datafusion_error)?,
+            )
         };
 
         // Initialize partition splitter in constructor for partitioned tables
@@ -189,12 +202,22 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
                 writer.write(batch).await.map_err(to_datafusion_error)
             }
             SupportedWriter::Fanout(writer) => {
-                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch)
-                    .await
+                Self::write_partitioned_batches(
+                    writer,
+                    &self.partition_splitter,
+                    &batch,
+                    None,
+                )
+                .await
             }
-            SupportedWriter::Clustered(writer) => {
-                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch)
-                    .await
+            SupportedWriter::Clustered(writer, partition_type) => {
+                Self::write_partitioned_batches(
+                    writer,
+                    &self.partition_splitter,
+                    &batch,
+                    Some(partition_type),
+                )
+                .await
             }
         }
     }
@@ -218,12 +241,17 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         writer: &mut W,
         partition_splitter: &Option<RecordBatchPartitionSplitter>,
         batch: &RecordBatch,
+        first_row_order: Option<&StructType>,
     ) -> Result<()> {
         // Split batch by partition
         let splitter = partition_splitter
             .as_ref()
             .expect("Partition splitter should be initialized");
-        let partitioned_batches = splitter.split(batch).map_err(to_datafusion_error)?;
+        let mut partitioned_batches =
+            splitter.split(batch).map_err(to_datafusion_error)?;
+        if let Some(partition_type) = first_row_order {
+            sort_by_first_row(batch, partition_type, &mut partitioned_batches)?;
+        }
 
         // Write each partition
         for (partition_key, partition_batch) in partitioned_batches {
@@ -266,11 +294,44 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
             SupportedWriter::Fanout(writer) => {
                 writer.close().await.map_err(to_datafusion_error)
             }
-            SupportedWriter::Clustered(writer) => {
+            SupportedWriter::Clustered(writer, _) => {
                 writer.close().await.map_err(to_datafusion_error)
             }
         }
     }
+}
+
+fn sort_by_first_row(
+    batch: &RecordBatch,
+    partition_type: &StructType,
+    partitioned_batches: &mut [(PartitionKey, RecordBatch)],
+) -> Result<()> {
+    if partitioned_batches.len() < 2 {
+        return Ok(());
+    }
+    let partition_column = batch
+        .column_by_name(PROJECTED_PARTITION_VALUE_COLUMN)
+        .ok_or_else(|| {
+            internal_datafusion_err!(
+                "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
+            )
+        })?;
+    let partition_values = arrow_struct_to_literal(partition_column, partition_type)
+        .map_err(to_datafusion_error)?;
+
+    let mut first_rows = HashMap::with_capacity(partitioned_batches.len());
+    for (row, value) in partition_values.into_iter().enumerate() {
+        if let Some(Literal::Struct(value)) = value {
+            first_rows.entry(value).or_insert(row);
+        }
+    }
+    partitioned_batches.sort_by_key(|(partition_key, _)| {
+        first_rows
+            .get(partition_key.data())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -565,6 +626,63 @@ mod tests {
         let partition_counts = verify_partition_files(&data_files, 4);
         assert_eq!(partition_counts.get("ASIA"), Some(&2));
         assert_eq!(partition_counts.get("EU"), Some(&2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_task_writer_clustered_partition_spans_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let schema = create_test_schema()?;
+        let arrow_schema = create_arrow_schema_with_partition();
+
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .add_partition_field(
+                    "region",
+                    "region",
+                    iceberg::spec::Transform::Identity,
+                )?
+                .build()?,
+        );
+
+        let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
+        let mut task_writer =
+            TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
+
+        let partition_field = Field::new("region", DataType::Utf8, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1000".to_string())]),
+        );
+        let regions: Vec<String> = (0..50)
+            .flat_map(|i| std::iter::repeat_n(format!("r{i:02}"), 3))
+            .collect();
+
+        for (chunk_index, chunk) in regions.chunks(8).enumerate() {
+            let ids: Vec<i32> = (0..chunk.len())
+                .map(|i| (chunk_index * 8 + i) as i32)
+                .collect();
+            let partition_struct = StructArray::from(vec![(
+                Arc::new(partition_field.clone()),
+                Arc::new(StringArray::from(chunk.to_vec())) as ArrayRef,
+            )]);
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(vec!["name"; chunk.len()])),
+                    Arc::new(StringArray::from(chunk.to_vec())),
+                    Arc::new(partition_struct),
+                ],
+            )?;
+            task_writer.write(batch).await?;
+        }
+        let data_files = task_writer.close().await?;
+
+        let partition_counts = verify_partition_files(&data_files, 150);
+        assert_eq!(partition_counts.len(), 50);
+        assert!(partition_counts.values().all(|count| *count == 3));
 
         Ok(())
     }
