@@ -86,20 +86,7 @@ impl IcebergDataSource {
     /// Starts building a source that scans `table` and returns the columns of
     /// `schema`, all of them unless [`IcebergDataSourceBuilder::with_projection`]
     /// selects some. Columns are read from Iceberg by name.
-    ///
-    /// `sorted_tasks` are the data files to merge in the sort order they all
-    /// record, which the source then reports to DataFusion. With `None`, the
-    /// source lists its files when it runs and reports no order, as a table
-    /// provider's source does. A source rebuilt from another, such as in
-    /// another process, must be given what that source's
-    /// [`sorted_tasks`](Self::sorted_tasks) returns, because a plan built over a
-    /// sorted source may rely on its order. [`IcebergDataSourceBuilder::build`]
-    /// fails if the tasks don't share a sort order the source can report.
-    pub fn builder(
-        table: Table,
-        schema: ArrowSchemaRef,
-        sorted_tasks: Option<Vec<FileScanTask>>,
-    ) -> IcebergDataSourceBuilder {
+    pub fn builder(table: Table, schema: ArrowSchemaRef) -> IcebergDataSourceBuilder {
         IcebergDataSourceBuilder {
             table,
             schema,
@@ -107,7 +94,7 @@ impl IcebergDataSource {
             snapshot_id: None,
             predicate: None,
             fetch: None,
-            sorted_tasks,
+            sorted_tasks: None,
         }
     }
 
@@ -137,63 +124,11 @@ impl IcebergDataSource {
 
     /// The data files the source merges in the order it reports, listed while
     /// the scan was planned, or `None` if it reports no order and lists its
-    /// files when it runs.
+    /// files when it runs. A source rebuilt from this one must be given them
+    /// with [`IcebergDataSourceBuilder::with_sorted_tasks`], because a plan
+    /// built over a sorted source may rely on its order.
     pub fn sorted_tasks(&self) -> Option<&[FileScanTask]> {
         self.sorted.as_ref().map(|sorted| sorted.tasks.as_slice())
-    }
-
-    /// Lists the source's data files and reports the sort order they all
-    /// record, if the session enables `iceberg.execution.preserve_data_ordering`
-    /// and they are few enough to merge. Otherwise returns the source unchanged.
-    pub(crate) async fn plan_sort_order(self, state: &dyn Session) -> Result<Self> {
-        let config = state
-            .config()
-            .options()
-            .extensions
-            .get::<IcebergDataFusionConfig>()
-            .map(|config| config.execution.clone())
-            .unwrap_or_default();
-        if !config.preserve_data_ordering {
-            return Ok(self);
-        }
-
-        let metadata = self.table.metadata();
-        let snapshot = match self.snapshot_id {
-            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
-            None => metadata.current_snapshot(),
-        };
-        let Some(snapshot) = snapshot else {
-            return Ok(self);
-        };
-        let schema = snapshot.schema(metadata).map_err(to_datafusion_error)?;
-        let output = self.schema();
-        if !metadata
-            .sort_orders_iter()
-            .any(|order| lex_ordering(order, &schema, &output).is_some())
-        {
-            return Ok(self);
-        }
-
-        let tasks: Vec<FileScanTask> = build_table_scan(
-            &self.table,
-            self.snapshot_id,
-            Some(self.projection.clone()),
-            self.predicate.clone(),
-        )?
-        .plan_files()
-        .await
-        .map_err(to_datafusion_error)?
-        .take(config.max_merge_files_per_partition.saturating_add(1))
-        .try_collect()
-        .await
-        .map_err(to_datafusion_error)?;
-        if tasks.len() > config.max_merge_files_per_partition {
-            return Ok(self);
-        }
-        let mut source = self;
-        source.sorted = shared_ordering(&tasks, &output)
-            .map(|ordering| SortedTasks { tasks, ordering });
-        Ok(source)
     }
 
     /// Reads each sorted data file as its own stream and merges the streams in
@@ -250,9 +185,9 @@ impl IcebergDataSource {
 ///
 /// A table provider passes the table's schema and selects columns with
 /// [`Self::with_projection`]. To rebuild a source, such as in another process,
-/// pass its [`IcebergDataSource::schema`], which is already projected, and its
-/// [`IcebergDataSource::sorted_tasks`] to [`IcebergDataSource::builder`], and no
-/// projection.
+/// pass its [`IcebergDataSource::schema`], which is already projected, no
+/// projection, and its [`IcebergDataSource::sorted_tasks`] to
+/// [`Self::with_sorted_tasks`].
 #[derive(Debug, Clone)]
 pub struct IcebergDataSourceBuilder {
     table: Table,
@@ -295,6 +230,16 @@ impl IcebergDataSourceBuilder {
     /// Stops after `fetch` rows, or reads every row if `None` (the default).
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
+        self
+    }
+
+    /// Merges these data files in the sort order they all record, which the
+    /// source then reports to DataFusion, or lists the files when the source
+    /// runs and reports no order if `None` (the default). A plan built over a
+    /// source with [`IcebergDataSource::sorted_tasks`] may rely on their order,
+    /// so a source rebuilt from it must be given them.
+    pub fn with_sorted_tasks(mut self, sorted_tasks: Option<Vec<FileScanTask>>) -> Self {
+        self.sorted_tasks = sorted_tasks;
         self
     }
 
@@ -457,6 +402,64 @@ impl DataSource for IcebergDataSource {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
+}
+
+/// The data files that a source built by `builder` can merge in the sort order
+/// they all record, for [`IcebergDataSourceBuilder::with_sorted_tasks`], or
+/// `None` to have the source list them when it runs and report no order. They
+/// are listed only if the session enables
+/// `iceberg.execution.preserve_data_ordering`, and returned only if they are
+/// few enough to merge and the source can report their order.
+pub(crate) async fn plan_sorted_tasks(
+    builder: &IcebergDataSourceBuilder,
+    state: &dyn Session,
+) -> Result<Option<Vec<FileScanTask>>> {
+    let config = state
+        .config()
+        .options()
+        .extensions
+        .get::<IcebergDataFusionConfig>()
+        .map(|config| config.execution.clone())
+        .unwrap_or_default();
+    if !config.preserve_data_ordering {
+        return Ok(None);
+    }
+
+    let source = builder.clone().build()?;
+    let metadata = source.table.metadata();
+    let snapshot = match source.snapshot_id {
+        Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
+        None => metadata.current_snapshot(),
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let schema = snapshot.schema(metadata).map_err(to_datafusion_error)?;
+    let output = source.schema();
+    if !metadata
+        .sort_orders_iter()
+        .any(|order| lex_ordering(order, &schema, &output).is_some())
+    {
+        return Ok(None);
+    }
+
+    let tasks: Vec<FileScanTask> = build_table_scan(
+        &source.table,
+        source.snapshot_id,
+        Some(source.projection.clone()),
+        source.predicate.clone(),
+    )?
+    .plan_files()
+    .await
+    .map_err(to_datafusion_error)?
+    .take(config.max_merge_files_per_partition.saturating_add(1))
+    .try_collect()
+    .await
+    .map_err(to_datafusion_error)?;
+    if tasks.len() > config.max_merge_files_per_partition {
+        return Ok(None);
+    }
+    Ok(shared_ordering(&tasks, &output).map(|_| tasks))
 }
 
 /// Asynchronously retrieves a stream of [`RecordBatch`] instances

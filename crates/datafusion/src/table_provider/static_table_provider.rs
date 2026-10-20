@@ -32,6 +32,7 @@ use iceberg::table::Table;
 
 use crate::error::to_datafusion_error;
 use crate::read::IcebergDataSource;
+use crate::read::scan::plan_sorted_tasks;
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -126,15 +127,13 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        let source =
-            IcebergDataSource::builder(self.table.clone(), self.schema.clone(), None)
-                .with_snapshot_id(self.snapshot_id)
-                .with_projection(projection)
-                .with_filters(filters)
-                .with_fetch(limit)
-                .build()?
-                .plan_sort_order(state)
-                .await?;
+        let builder = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
+            .with_snapshot_id(self.snapshot_id)
+            .with_projection(projection)
+            .with_filters(filters)
+            .with_fetch(limit);
+        let sorted_tasks = plan_sorted_tasks(&builder, state).await?;
+        let source = builder.with_sorted_tasks(sorted_tasks).build()?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
