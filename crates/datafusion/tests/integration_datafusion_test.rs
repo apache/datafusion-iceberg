@@ -163,7 +163,7 @@ async fn test_provider_plan_stream_schema() -> Result<(), Box<dyn Error>> {
 
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await.unwrap();
-    let stream = plan.execute(1, task_ctx).unwrap();
+    let stream = plan.execute(0, task_ctx).unwrap();
 
     // Ensure both the plan and the stream conform to the same schema
     assert_eq!(plan.schema(), stream.schema());
@@ -915,12 +915,16 @@ async fn run(
 }
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
-fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
+async fn rebuild_scan(
+    scan: &IcebergDataSource,
+    ctx: &SessionContext,
+) -> IcebergDataSource {
     IcebergDataSource::builder(scan.table().clone(), scan.schema())
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
-        .build()
+        .build(ctx.task_ctx())
+        .await
         .unwrap()
 }
 
@@ -1039,7 +1043,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         scan.predicate().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan, &ctx).await;
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
@@ -1062,7 +1066,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan, &ctx).await;
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
@@ -1078,7 +1082,8 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
     let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
         .with_snapshot_id(Some(snapshot_id))
-        .build()?;
+        .build(ctx.task_ctx())
+        .await?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
         +--------+
         | foo2   |

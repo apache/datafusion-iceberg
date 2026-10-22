@@ -1,0 +1,16 @@
+---
+source: crates/datafusion/tests/eager_file_planning.rs
+expression: "format!(\"{plan}\\n{eager_batches}\")"
+---
+ProjectionExec: expr=[vendor_id@0 as vendor_id, pickup_at@1 as pickup_at]
+  SortPreservingMergeExec: [pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], fetch=3
+    SortExec: TopK(fetch=3), expr=[pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], preserve_partitioning=[true]
+      DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id], planned_files=7
+
++-----------+---------------------+
+| vendor_id | pickup_at           |
++-----------+---------------------+
+| 2         | 2024-01-08T00:00:03 |
+| 2         | 2024-01-08T00:00:07 |
+| 2         | 2024-01-08T00:00:08 |
++-----------+---------------------+

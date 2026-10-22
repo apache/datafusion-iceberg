@@ -1,0 +1,15 @@
+---
+source: crates/datafusion/tests/eager_file_planning.rs
+expression: "format!(\"{plan}\\n{batches}\")"
+---
+ProjectionExec: expr=[1 as n]
+  CoalescePartitionsExec: fetch=3
+    DataSourceExec: format=iceberg, projection=[], fetch=3, planned_files=7
+
++---+
+| n |
++---+
+| 1 |
+| 1 |
+| 1 |
++---+

@@ -34,6 +34,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
+use crate::IcebergPlanningConfig;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
 use crate::read::IcebergDataSource;
@@ -126,24 +127,32 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog
+        // Load fresh table metadata from catalog.
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
 
-        // Create scan with fresh metadata (always use current snapshot)
+        // Create scan with fresh metadata (always use current snapshot).
         let source = IcebergDataSource::builder(table, self.schema.clone())
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
-            .build()?;
+            .with_eager_planning(
+                state
+                    .config_options()
+                    .extensions
+                    .get::<IcebergPlanningConfig>()
+                    .is_some_and(|config| config.eager_file_planning),
+            )
+            .build(state.task_ctx())
+            .await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
@@ -457,7 +466,8 @@ mod tests {
         // Columns come back in the projection's order, not the table's.
         let source = IcebergDataSource::builder(table.clone(), schema.clone())
             .with_projection(Some(&vec![1, 0]))
-            .build()
+            .build(SessionContext::new().task_ctx())
+            .await
             .unwrap();
         insta::assert_debug_snapshot!(source.projection(), @r#"
         [
@@ -468,7 +478,8 @@ mod tests {
 
         let err = IcebergDataSource::builder(table, schema)
             .with_projection(Some(&vec![0, out_of_range]))
-            .build()
+            .build(SessionContext::new().task_ctx())
+            .await
             .unwrap_err();
         assert_eq!(
             err.to_string(),
