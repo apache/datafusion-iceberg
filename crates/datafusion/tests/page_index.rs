@@ -24,7 +24,8 @@ use datafusion::error::Result;
 async fn page_index_setting_without_indexes() -> Result<()> {
     let harness = IcebergTestHarness::new().await?;
 
-    // The checked-in taxi files have no column or offset indexes.
+    // create_taxi_table writes no page indexes, so this covers reading files
+    // without them.
     for enabled in [false, true] {
         harness
             .query(&format!(
