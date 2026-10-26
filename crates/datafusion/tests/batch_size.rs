@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
+use common::IcebergTestHarness;
 use datafusion::error::Result;
-use iceberg_datafusion::test_utils::IcebergTestHarness;
 
 #[tokio::test]
 async fn scan_honors_session_batch_size() -> Result<()> {

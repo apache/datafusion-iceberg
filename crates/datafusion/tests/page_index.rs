@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
+use common::IcebergTestHarness;
 use datafusion::error::Result;
-use iceberg_datafusion::test_utils::IcebergTestHarness;
 
 #[tokio::test]
 async fn page_index_setting_without_indexes() -> Result<()> {
@@ -41,7 +43,7 @@ async fn page_index_setting_without_indexes() -> Result<()> {
             +-------+
             | trips |
             +-------+
-            | 9891  |
+            | 10659 |
             +-------+
             ");
         }

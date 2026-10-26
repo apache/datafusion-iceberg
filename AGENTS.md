@@ -26,6 +26,7 @@ Apache DataFusion integration for Apache Iceberg: catalog/table providers and ph
 | `crates/datafusion` | `iceberg-datafusion` | The published library |
 | `crates/sqllogictest` | `iceberg-sqllogictest` | SQL-level test harness (unpublished) |
 | `crates/playground` | `iceberg-playground` | REPL CLI built on `datafusion-cli` (unpublished) |
+| `crates/test-tools` | `iceberg-datafusion-test-tools` | Builders for the Iceberg tables tests read (unpublished) |
 
 ## Before Committing
 
@@ -52,7 +53,11 @@ cargo insta test -p iceberg-datafusion --test integration_datafusion_test --revi
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 
-Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSON); no Docker or external services are needed. The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
+Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSON); no Docker or external services are needed.
+
+Build test tables with `iceberg-datafusion-test-tools` rather than by hand or by committing data files. A `FixtureCatalog` is an in-memory catalog over a temp dir, not tied to any dataset. `fixtures.table(ident, schema).partition_by(..).create()` creates a table, and each `table.append().file(batch)...commit()` adds one snapshot in which every batch becomes exactly one data file. Snapshot ids count up from 1, so snapshots can show them. Data files are written with iceberg-rust's writers, not this crate's insert path, so they carry real column statistics and a writer bug can't hide a reader bug. `create_taxi_table` generates a deterministic, synthetic stand-in for NYC taxi trips: 7 days × 25,000 rows, identity-partitioned on `pickup_date`, one file per day.
+
+The integration tests share `IcebergTestHarness` from `crates/datafusion/tests/common/`. It's a session with `datafusion.public.taxi` registered, so `FROM taxi` resolves unqualified. The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
 
 ## Architecture (`crates/datafusion`)
 

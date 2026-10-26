@@ -30,6 +30,8 @@ through an Iceberg catalog.
 - [`crates/sqllogictest`](crates/sqllogictest): SQL logic tests for the integration.
 - [`crates/playground`](crates/playground): a command-line SQL playground backed
   by DataFusion and Iceberg catalogs.
+- [`crates/test-tools`](crates/test-tools): builders for the Iceberg tables the
+  tests read.
 
 ## Query an existing table
 

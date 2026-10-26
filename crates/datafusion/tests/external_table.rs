@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
 #[cfg(test)]
 mod tests {
+    use crate::common::IcebergTestHarness;
     use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::{FIXTURE_URI, IcebergTestHarness};
 
     #[tokio::test]
     async fn registers_the_fixture_with_the_iceberg_schema() -> Result<()> {
@@ -54,7 +56,8 @@ mod tests {
         let error = harness
             .query(&format!(
                 "CREATE EXTERNAL TABLE invalid (id INT) STORED AS ICEBERG \
-                 LOCATION '{FIXTURE_URI}/metadata/v1.metadata.json'"
+                 LOCATION '{}'",
+                harness.taxi_metadata_location()?
             ))
             .await
             .unwrap_err();

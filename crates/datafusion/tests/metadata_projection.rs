@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod common;
+
 #[cfg(test)]
 mod tests {
+    use crate::common::IcebergTestHarness;
     use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::IcebergTestHarness;
 
     #[tokio::test]
     async fn applies_metadata_table_projections() -> Result<()> {
@@ -48,12 +50,12 @@ mod tests {
           CooperativeExec
             DataSourceExec: format=iceberg_metadata
         ");
-        insta::assert_snapshot!(multiple_projected_columns_result.1, @"
-        +-----------+---------------------+
-        | operation | snapshot_id         |
-        +-----------+---------------------+
-        | append    | 3167948105555765929 |
-        +-----------+---------------------+
+        insta::assert_snapshot!(multiple_projected_columns_result.1, @r"
+        +-----------+-------------+
+        | operation | snapshot_id |
+        +-----------+-------------+
+        | append    | 1           |
+        +-----------+-------------+
         ");
 
         let aggregated_columns_result = harness
