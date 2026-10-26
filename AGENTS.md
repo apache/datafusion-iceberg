@@ -47,9 +47,9 @@ cargo test --workspace --locked
 
 ```sh
 cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
-cargo test -p iceberg-datafusion --test integration_datafusion_test <name>      # integration tests
+cargo test -p iceberg-datafusion --test <file> <name>                           # integration tests, e.g. --test filter_pushdown
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
-cargo insta test -p iceberg-datafusion --test integration_datafusion_test --review  # review inline snapshots
+cargo insta test -p iceberg-datafusion --review                                  # review inline snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 
@@ -68,6 +68,8 @@ let (plan, batches) = IcebergTestHarness::builder()
 ```
 
 The harness doesn't depend on `iceberg-datafusion`, so each test hands it the `ICEBERG` table factory with `with_iceberg_table_factory(..)`. `with_table` registers a table under its name with `CREATE EXTERNAL TABLE`, so it's read through `IcebergStaticTableProvider`. For metadata tables or the catalog-backed provider, also register `IcebergCatalogProvider::try_new(table.catalog())` with `with_catalog(..)`. Other builder methods: `with_session_extension`, `with_config_option`, `with_table_option`, `with_metadata` and `configure_session`.
+
+Integration tests live in `crates/datafusion/tests/`, one file per area (`filter_pushdown.rs`, `insert_into.rs`, `metadata_tables.rs`, `schema_evolution.rs`, ...); add a test to the file for what it tests rather than starting a catch-all. There's no shared test module: put setup in the harness or the test tools if many tests need it, and otherwise inline it. Tests of the catalog provider itself build their `SessionContext` directly and register `IcebergCatalogProvider::try_new(fixtures.catalog())` in it.
 
 The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
 

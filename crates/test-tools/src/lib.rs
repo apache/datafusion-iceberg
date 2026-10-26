@@ -51,7 +51,8 @@ mod taxi;
 pub use append::Append;
 pub use catalog::FixtureCatalog;
 pub use harness::{
-    IcebergTestHarness, IcebergTestHarnessBuilder, data_file_name, without_snapshots,
+    IcebergTestHarness, IcebergTestHarnessBuilder, data_file_name, display_schema,
+    without_snapshots,
 };
 pub use storage::ReadCountingStorageFactory;
 pub use table::{FixtureTable, TableBuilder};
