@@ -79,6 +79,11 @@ impl IcebergTestHarness {
         })
     }
 
+    /// Table `taxi`, e.g. to inspect its files.
+    pub fn taxi(&self) -> &FixtureTable {
+        &self.taxi
+    }
+
     /// The current metadata file of table `taxi`.
     pub fn taxi_metadata_location(&self) -> Result<&str> {
         self.taxi.metadata_location().map_err(to_datafusion_error)

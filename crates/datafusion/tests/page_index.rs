@@ -17,14 +17,39 @@
 
 mod common;
 
+use std::error::Error;
+use std::fs::File;
+
 use common::IcebergTestHarness;
-use datafusion::error::Result;
+use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+use futures::TryStreamExt;
 
 #[tokio::test]
-async fn page_index_setting_without_indexes() -> Result<()> {
+async fn page_index_setting_without_indexes() -> Result<(), Box<dyn Error>> {
     let harness = IcebergTestHarness::new().await?;
 
-    // The checked-in taxi files have no column or offset indexes.
+    // The query returns the same rows with or without page indexes, so check
+    // that the taxi files have no column or offset indexes.
+    let tasks: Vec<_> = harness
+        .taxi()
+        .table()
+        .scan()
+        .build()?
+        .plan_files()
+        .await?
+        .try_collect()
+        .await?;
+    assert!(!tasks.is_empty());
+    for task in &tasks {
+        let reader = SerializedFileReader::new(File::open(task.data_file_path())?)?;
+        for row_group in reader.metadata().row_groups() {
+            for column in row_group.columns() {
+                assert_eq!(column.column_index_offset(), None);
+                assert_eq!(column.offset_index_offset(), None);
+            }
+        }
+    }
+
     for enabled in [false, true] {
         harness
             .query(&format!(
