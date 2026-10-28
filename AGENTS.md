@@ -57,7 +57,19 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 Build test tables with `iceberg-datafusion-test-tools` rather than by hand or by committing data files. A `FixtureCatalog` is an in-memory catalog over a temp dir, not tied to any dataset. `fixtures.table(ident, schema).partition_by(..).create()` creates a table, and each `table.append().file(batch)...commit()` adds one snapshot in which every batch becomes exactly one data file. Snapshot ids count up from 1, so snapshots can show them. Data files are written with iceberg-rust's writers, not this crate's insert path, so they carry real column statistics and a writer bug can't hide a reader bug. `create_taxi_table` generates a deterministic, synthetic stand-in for NYC taxi trips: 7 days × 25,000 rows, identity-partitioned on `pickup_date`, one file per day.
 
-The integration tests share `IcebergTestHarness` from `crates/datafusion/tests/common/`. It's a session with `datafusion.public.taxi` registered, so `FROM taxi` resolves unqualified. The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
+Write integration tests with `IcebergTestHarness` from the test tools, configured in one builder chain:
+
+```rust
+let (plan, batches) = IcebergTestHarness::builder()
+    .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+    .with_table(create_taxi_table().await?)
+    .query("SELECT COUNT(*) FROM taxi")
+    .await?;
+```
+
+The harness doesn't depend on `iceberg-datafusion`, so each test hands it the `ICEBERG` table factory with `with_iceberg_table_factory(..)`. `with_table` registers a table under its name with `CREATE EXTERNAL TABLE`, so it's read through `IcebergStaticTableProvider`. For metadata tables or the catalog-backed provider, also register `IcebergCatalogProvider::try_new(table.catalog())` with `with_catalog(..)`. Other builder methods: `with_session_extension`, `with_config_option`, `with_table_option`, `with_metadata` and `configure_session`.
+
+The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
 
 ## Architecture (`crates/datafusion`)
 

@@ -23,14 +23,15 @@
 //! the batches it was given.
 //!
 //! ```no_run
-//! # async fn example() -> iceberg::Result<()> {
+//! # async fn example() -> datafusion::error::Result<()> {
 //! use iceberg::TableIdent;
 //! use iceberg::spec::Transform;
 //! use iceberg_datafusion_test_tools::{FixtureCatalog, taxi_schema, taxi_trips};
 //!
-//! let fixtures = FixtureCatalog::new().await?;
+//! let fixtures = FixtureCatalog::try_new().await?;
+//! let ident = TableIdent::from_strs(["public", "trips"]).expect("valid identifier");
 //! let mut table = fixtures
-//!     .table(TableIdent::from_strs(["public", "trips"])?, taxi_schema())
+//!     .table(ident, taxi_schema())
 //!     .partition_by("pickup_date", Transform::Identity)
 //!     .create()
 //!     .await?;
@@ -41,10 +42,15 @@
 
 mod append;
 mod catalog;
+mod error;
+mod harness;
 mod table;
 mod taxi;
 
 pub use append::Append;
 pub use catalog::FixtureCatalog;
+pub use harness::{
+    IcebergTestHarness, IcebergTestHarnessBuilder, data_file_name, without_snapshots,
+};
 pub use table::{FixtureTable, TableBuilder};
 pub use taxi::*;

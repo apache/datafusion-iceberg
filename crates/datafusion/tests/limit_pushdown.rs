@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 #[cfg(test)]
 mod tests {
-    use crate::common::IcebergTestHarness;
     use datafusion::error::Result;
+    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
     async fn applies_sql_limit_to_the_iceberg_scan_output() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT vendor_id, pickup_at, passenger_count, trip_distance, pickup_date
                FROM taxi
@@ -57,8 +57,9 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_unordered_limits_above_the_iceberg_source() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10' LIMIT 3")
             .await?;
 
@@ -83,8 +84,9 @@ mod tests {
 
     #[tokio::test]
     async fn passes_the_scan_limit_to_the_iceberg_source() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
@@ -150,8 +152,9 @@ mod tests {
 
     #[tokio::test]
     async fn avoids_scanning_for_limit_zero() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT vendor_id FROM taxi WHERE pickup_date = DATE '2024-01-10' LIMIT 0")
             .await?;
 
@@ -168,8 +171,9 @@ mod tests {
 
     #[tokio::test]
     async fn applies_offset_before_limit() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT vendor_id, pickup_at
                    FROM taxi

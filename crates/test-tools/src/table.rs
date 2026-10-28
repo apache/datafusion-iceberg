@@ -19,16 +19,20 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::exec_datafusion_err;
+use datafusion::error::Result;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::memory::MemoryCatalog;
 use iceberg::spec::{
     Schema, TableMetadata, Transform, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg::{
-    Catalog, Error, ErrorKind, MetadataLocation, Result, TableCreation, TableIdent,
-};
+use iceberg::{Catalog, MetadataLocation, TableCreation, TableIdent};
+use tempfile::TempDir;
 
 use crate::Append;
+use crate::error::df_err;
 
 /// Describes a new table, which [`TableBuilder::create`] then creates.
 ///
@@ -37,6 +41,7 @@ use crate::Append;
 /// [`FixtureTable::append`].
 pub struct TableBuilder {
     catalog: Arc<MemoryCatalog>,
+    directory: Arc<TempDir>,
     ident: TableIdent,
     schema: Schema,
     partition_fields: Vec<(String, Transform)>,
@@ -46,11 +51,13 @@ pub struct TableBuilder {
 impl TableBuilder {
     pub(crate) fn new(
         catalog: Arc<MemoryCatalog>,
+        directory: Arc<TempDir>,
         ident: TableIdent,
         schema: Schema,
     ) -> Self {
         Self {
             catalog,
+            directory,
             ident,
             schema,
             partition_fields: Vec::new(),
@@ -82,25 +89,31 @@ impl TableBuilder {
         let mut partition_spec = UnboundPartitionSpec::builder();
         for (column, transform) in self.partition_fields {
             let source = self.schema.field_by_name(&column).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("cannot partition by {column}: no such column"),
-                )
+                exec_datafusion_err!("cannot partition by {column}: no such column")
             })?;
-            partition_spec = partition_spec.add_partition_field(
-                UnboundPartitionField::builder()
-                    .source_ids(vec![source.id])
-                    .name(partition_field_name(&column, transform))
-                    .transform(transform)
-                    .build()?,
-            )?;
+            partition_spec = partition_spec
+                .add_partition_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![source.id])
+                        .name(partition_field_name(&column, transform))
+                        .transform(transform)
+                        .build()
+                        .map_err(df_err)?,
+                )
+                .map_err(df_err)?;
         }
 
         let namespace = self.ident.namespace();
-        if !self.catalog.namespace_exists(namespace).await? {
+        if !self
+            .catalog
+            .namespace_exists(namespace)
+            .await
+            .map_err(df_err)?
+        {
             self.catalog
                 .create_namespace(namespace, HashMap::new())
-                .await?;
+                .await
+                .map_err(df_err)?;
         }
         let table = self
             .catalog
@@ -113,10 +126,12 @@ impl TableBuilder {
                     .properties(self.properties)
                     .build(),
             )
-            .await?;
+            .await
+            .map_err(df_err)?;
         Ok(FixtureTable {
             catalog: self.catalog,
             table,
+            _directory: self.directory,
         })
     }
 }
@@ -141,9 +156,11 @@ fn partition_field_name(column: &str, transform: Transform) -> String {
 /// It tracks the table as of its latest commit, so [`FixtureTable::table`]
 /// reflects every change made through it. Changes made in other ways, such as
 /// SQL `INSERT`s, aren't seen until the table is loaded from the catalog again.
+/// It keeps its files, which live in its catalog's directory, until dropped.
 pub struct FixtureTable {
     catalog: Arc<MemoryCatalog>,
     table: Table,
+    _directory: Arc<TempDir>,
 }
 
 impl FixtureTable {
@@ -157,9 +174,22 @@ impl FixtureTable {
         self.table.identifier()
     }
 
+    /// The catalog holding the table, e.g. to register it with an Iceberg catalog
+    /// provider.
+    pub fn catalog(&self) -> Arc<dyn Catalog> {
+        self.catalog.clone()
+    }
+
+    /// The table's current schema, as a DataFusion schema.
+    pub fn schema(&self) -> Result<SchemaRef> {
+        let schema = schema_to_arrow_schema(self.table.metadata().current_schema())
+            .map_err(df_err)?;
+        Ok(Arc::new(schema))
+    }
+
     /// The table's current metadata file.
     pub fn metadata_location(&self) -> Result<&str> {
-        self.table.metadata_location_result()
+        self.table.metadata_location_result().map_err(df_err)
     }
 
     /// Starts a commit that appends data files.
@@ -175,15 +205,20 @@ impl FixtureTable {
     /// re-registers the table under it, which the in-memory catalog does
     /// without touching the table's files.
     pub(crate) async fn commit(&mut self, metadata: TableMetadata) -> Result<()> {
-        let location =
-            MetadataLocation::from_str(self.metadata_location()?)?.with_next_version();
-        metadata.write_to(self.table.file_io(), &location).await?;
+        let location = MetadataLocation::from_str(self.metadata_location()?)
+            .map_err(df_err)?
+            .with_next_version();
+        metadata
+            .write_to(self.table.file_io(), &location)
+            .await
+            .map_err(df_err)?;
         let ident = self.ident().clone();
-        self.catalog.drop_table(&ident).await?;
+        self.catalog.drop_table(&ident).await.map_err(df_err)?;
         self.table = self
             .catalog
             .register_table(&ident, location.to_string())
-            .await?;
+            .await
+            .map_err(df_err)?;
         Ok(())
     }
 }

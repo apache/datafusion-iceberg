@@ -15,19 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 #[cfg(test)]
 mod tests {
-    use crate::common::IcebergTestHarness;
+    use std::sync::Arc;
+
     use datafusion::error::Result;
+    use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProviderFactory};
+    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
     async fn applies_metadata_table_projections() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
+        // Metadata tables resolve through the catalog, not the external table.
+        let table = create_taxi_table().await?;
+        let catalog = IcebergCatalogProvider::try_new(table.catalog()).await?;
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_catalog("iceberg", Arc::new(catalog))
+            .with_table(table)
+            .build()
+            .await?;
 
         let single_projected_column_result = harness
-            .query("SELECT operation FROM datafusion.public.taxi$snapshots")
+            .query("SELECT operation FROM iceberg.default.taxi$snapshots")
             .await?;
         insta::assert_snapshot!(single_projected_column_result.0, @"
            CooperativeExec
@@ -42,7 +51,7 @@ mod tests {
            ");
 
         let multiple_projected_columns_result = harness
-            .query("SELECT operation, snapshot_id FROM datafusion.public.taxi$snapshots")
+            .query("SELECT operation, snapshot_id FROM iceberg.default.taxi$snapshots")
             .await?;
 
         insta::assert_snapshot!(multiple_projected_columns_result.0, @"
@@ -59,7 +68,7 @@ mod tests {
         ");
 
         let aggregated_columns_result = harness
-            .query("SELECT COUNT(*) FROM datafusion.public.taxi$snapshots")
+            .query("SELECT COUNT(*) FROM iceberg.default.taxi$snapshots")
             .await?;
 
         insta::assert_snapshot!(aggregated_columns_result.0, @"

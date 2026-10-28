@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 #[cfg(test)]
 mod tests {
-    use crate::common::IcebergTestHarness;
     use datafusion::error::Result;
+    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
     async fn projects_only_columns_required_by_the_query() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT pickup_date, COUNT(*) AS trips
                FROM taxi
@@ -63,8 +63,9 @@ mod tests {
 
     #[tokio::test]
     async fn includes_filter_columns_that_are_not_in_the_output() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT vendor_id, pickup_location_id
                    FROM taxi
@@ -97,8 +98,9 @@ mod tests {
 
     #[tokio::test]
     async fn projects_source_columns_for_computed_expressions() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT MAX(trip_distance * fare_amount) AS max_weighted_fare
                    FROM taxi
@@ -128,8 +130,9 @@ mod tests {
 
     #[tokio::test]
     async fn reads_all_columns_when_selecting_star() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT *
                    FROM taxi
