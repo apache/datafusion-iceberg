@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod eager;
 mod file_planning;
 pub(crate) mod predicate;
+mod reader;
 pub(crate) mod scan;
 
+pub use eager::EagerIcebergDataSource;
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};

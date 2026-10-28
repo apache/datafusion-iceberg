@@ -143,17 +143,19 @@ impl TableProvider for IcebergCatalogTableProvider {
         let source = IcebergDataSource::builder(table, self.schema.clone())
             .with_projection(projection)
             .with_filters(filters)
-            .with_fetch(limit)
-            .with_eager_planning(
-                state
-                    .config_options()
-                    .extensions
-                    .get::<IcebergPlanningConfig>()
-                    .is_some_and(|config| config.eager_file_planning),
-            )
-            .build(state.task_ctx())
-            .await?;
-        Ok(DataSourceExec::from_data_source(source))
+            .with_fetch(limit);
+        if state
+            .config_options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .is_some_and(|config| config.eager_file_planning)
+        {
+            Ok(DataSourceExec::from_data_source(
+                source.build_eager(state.task_ctx()).await?,
+            ))
+        } else {
+            Ok(DataSourceExec::from_data_source(source.build()?))
+        }
     }
 
     fn supports_filters_pushdown(
@@ -466,8 +468,7 @@ mod tests {
         // Columns come back in the projection's order, not the table's.
         let source = IcebergDataSource::builder(table.clone(), schema.clone())
             .with_projection(Some(&vec![1, 0]))
-            .build(SessionContext::new().task_ctx())
-            .await
+            .build()
             .unwrap();
         insta::assert_debug_snapshot!(source.projection(), @r#"
         [
@@ -478,8 +479,7 @@ mod tests {
 
         let err = IcebergDataSource::builder(table, schema)
             .with_projection(Some(&vec![0, out_of_range]))
-            .build(SessionContext::new().task_ctx())
-            .await
+            .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),

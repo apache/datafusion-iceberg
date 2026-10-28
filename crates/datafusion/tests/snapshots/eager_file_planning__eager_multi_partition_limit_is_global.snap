@@ -4,7 +4,7 @@ expression: "format!(\"{plan}\\n{batches}\")"
 ---
 ProjectionExec: expr=[1 as n]
   CoalescePartitionsExec: fetch=3
-    DataSourceExec: format=iceberg, projection=[], fetch=3, planned_files=7
+    DataSourceExec: format=iceberg, projection=[], planned_files=7, fetch=3
 
 +---+
 | n |

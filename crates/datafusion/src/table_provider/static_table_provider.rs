@@ -131,17 +131,19 @@ impl TableProvider for IcebergStaticTableProvider {
             .with_snapshot_id(self.snapshot_id)
             .with_projection(projection)
             .with_filters(filters)
-            .with_fetch(limit)
-            .with_eager_planning(
-                state
-                    .config_options()
-                    .extensions
-                    .get::<IcebergPlanningConfig>()
-                    .is_some_and(|config| config.eager_file_planning),
-            )
-            .build(state.task_ctx())
-            .await?;
-        Ok(DataSourceExec::from_data_source(source))
+            .with_fetch(limit);
+        if state
+            .config_options()
+            .extensions
+            .get::<IcebergPlanningConfig>()
+            .is_some_and(|config| config.eager_file_planning)
+        {
+            Ok(DataSourceExec::from_data_source(
+                source.build_eager(state.task_ctx()).await?,
+            ))
+        } else {
+            Ok(DataSourceExec::from_data_source(source.build()?))
+        }
     }
 
     fn supports_filters_pushdown(

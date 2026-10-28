@@ -29,7 +29,7 @@ use datafusion::physical_plan::common::collect;
 use datafusion::physical_plan::{ExecutionPlanProperties, collect as collect_plan};
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
-use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::read::{EagerIcebergDataSource, IcebergDataSource};
 use iceberg_datafusion::test_utils::IcebergTestHarness;
 use iceberg_datafusion::{
     IcebergCatalogTableProvider, IcebergPlanningConfig, IcebergStaticTableProvider,
@@ -48,11 +48,11 @@ fn eager_config() -> SessionConfig {
 
 fn iceberg_source(
     plan: &dyn datafusion::physical_plan::ExecutionPlan,
-) -> &IcebergDataSource {
+) -> &EagerIcebergDataSource {
     plan.downcast_ref::<DataSourceExec>()
         .expect("the Iceberg provider creates a DataSourceExec")
         .data_source()
-        .downcast_ref::<IcebergDataSource>()
+        .downcast_ref::<EagerIcebergDataSource>()
         .expect("the plan contains the Iceberg data source")
 }
 
@@ -69,31 +69,32 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
         .scan(&lazy.context().state(), None, &[], None)
         .await?;
     let eager_source = iceberg_source(eager_plan.as_ref());
-    let lazy_source = iceberg_source(lazy_plan.as_ref());
+    let lazy_source = lazy_plan
+        .downcast_ref::<DataSourceExec>()
+        .unwrap()
+        .data_source()
+        .downcast_ref::<IcebergDataSource>()
+        .unwrap();
 
-    assert!(lazy_source.planned_files().is_none());
-    assert!(lazy_source.planned_partition_tasks(0)?.is_none());
-    assert!(lazy_source.planned_partition_tasks(1).is_err());
     assert!(eager_source.planned_partition_tasks(4).is_err());
-    let tasks = eager_source.planned_files().unwrap();
+    let tasks: Vec<_> = eager_source.planned_files().collect();
     for (partition, indices) in [vec![0, 4], vec![1, 5], vec![2, 6], vec![3]]
         .into_iter()
         .enumerate()
     {
         let assigned: Vec<_> = eager_source
             .planned_partition_tasks(partition)?
-            .unwrap()
             .map(std::ptr::from_ref)
             .collect();
         let expected: Vec<_> = indices
             .into_iter()
-            .map(|index| std::ptr::from_ref(&tasks[index]))
+            .map(|index| std::ptr::from_ref(tasks[index]))
             .collect();
         assert_eq!(assigned, expected);
     }
 
     assert_eq!(lazy_plan.output_partitioning().partition_count(), 1);
-    assert_eq!(eager_source.planned_files().unwrap().len(), 7);
+    assert_eq!(eager_source.planned_files().len(), 7);
     assert_eq!(eager_plan.output_partitioning().partition_count(), 4);
     assert!(eager_source.open(4, eager.context().task_ctx()).is_err());
     assert!(lazy_source.open(1, lazy.context().task_ctx()).is_err());
@@ -114,12 +115,7 @@ async fn plans_file_tasks_before_execution_without_changing_statistics() -> Resu
             None,
         )
         .await?;
-    assert!(
-        iceberg_source(empty.as_ref())
-            .planned_files()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(iceberg_source(empty.as_ref()).planned_files().len(), 0);
     assert_eq!(empty.output_partitioning().partition_count(), 1);
 
     Ok(())
@@ -203,19 +199,11 @@ async fn eager_and_lazy_scans_apply_position_deletes() -> StdResult<(), Box<dyn 
     assert_eq!(
         iceberg_source(eager_plan.as_ref())
             .planned_files()
-            .expect("eager plan has files")
-            .iter()
             .filter(|task| !task.deletes().is_empty())
             .count(),
         2
     );
-    assert_eq!(
-        iceberg_source(eager_plan.as_ref())
-            .planned_files()
-            .expect("eager plan has files")
-            .len(),
-        2
-    );
+    assert_eq!(iceberg_source(eager_plan.as_ref()).planned_files().len(), 2);
     let lazy_plan = provider.scan(&lazy.state(), None, &[], None).await?;
     let eager_batches = collect_plan(eager_plan, state.task_ctx()).await?;
     let lazy_batches = collect_plan(lazy_plan, lazy.task_ctx()).await?;
@@ -267,10 +255,7 @@ fn eager_scan_uses_the_tables_custom_runtime() -> Result<()> {
     planning_runtime.block_on(async {
         let state = harness.context().state();
         let plan = provider.scan(&state, None, &[], None).await?;
-        assert_eq!(
-            iceberg_source(plan.as_ref()).planned_files().unwrap().len(),
-            7
-        );
+        assert_eq!(iceberg_source(plan.as_ref()).planned_files().len(), 7);
         let mut rows = 0;
         for partition in 0..plan.output_partitioning().partition_count() {
             let batches = collect(plan.execute(partition, state.task_ctx())?).await?;
@@ -326,8 +311,11 @@ async fn retained_tasks_follow_plan_and_stream_lifetimes() -> Result<()> {
     let source = iceberg_source(plan.as_ref()).clone();
     drop(plan);
     assert_eq!(runtime.memory_pool.reserved(), reserved);
-    let stream = source.open(0, harness.context().task_ctx())?;
+    let subset = source.with_file_groups(vec![vec![0]])?;
     drop(source);
+    assert_eq!(runtime.memory_pool.reserved(), reserved);
+    let stream = subset.open(0, harness.context().task_ctx())?;
+    drop(subset);
     assert_eq!(runtime.memory_pool.reserved(), reserved);
     drop(stream);
     assert_eq!(runtime.memory_pool.reserved(), 0);
@@ -352,18 +340,108 @@ async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
     let source = IcebergDataSource::builder(table, schema)
         .with_projection(Some(&projection))
         .with_filters(&[col("pickup_date").eq(lit(pickup_date))])
-        .with_eager_planning(true)
-        .build(harness.context().task_ctx())
+        .build_eager(harness.context().task_ctx())
         .await?;
-    assert_eq!(source.projection(), &["pickup_date"]);
-    assert_eq!(source.planned_files().unwrap().len(), 1);
+    assert_eq!(source.schema().field(0).name(), "pickup_date");
+    assert_eq!(source.planned_files().len(), 1);
     assert_eq!(source.output_partitioning().partition_count(), 1);
     let batches = collect(source.open(0, harness.context().task_ctx())?).await?;
     assert!(!batches.is_empty());
     assert!(
         batches
             .iter()
-            .all(|batch| batch.schema() == source.schema())
+            .all(|batch| batch.schema().as_ref() == source.schema().as_ref())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn assigned_file_groups_can_be_regrouped_and_reconstructed() -> Result<()> {
+    let harness = IcebergTestHarness::with_config(eager_config()).await?;
+    let provider = harness.context().table_provider("taxi").await?;
+    let catalog = provider
+        .downcast_ref::<IcebergCatalogTableProvider>()
+        .unwrap();
+    let table = catalog
+        .catalog()
+        .load_table(catalog.table_ident())
+        .await
+        .map_err(iceberg_datafusion::to_datafusion_error)?;
+    let projection = vec![provider.schema().index_of("pickup_date")?];
+    let plan = provider
+        .scan(
+            &harness.context().state(),
+            Some(&projection),
+            &[col("trip_distance").gt(lit(20.0))],
+            None,
+        )
+        .await?;
+    let source = iceberg_source(plan.as_ref());
+    let files: Vec<_> = source.planned_files().collect();
+    let assigned = source.with_file_groups(vec![vec![6, 1], vec![]])?;
+    let paths = |source: &EagerIcebergDataSource, partition| -> Result<Vec<String>> {
+        Ok(source
+            .planned_partition_tasks(partition)?
+            .map(|task| task.data_file_path().to_owned())
+            .collect())
+    };
+    assert_eq!(
+        paths(&assigned, 0)?,
+        vec![files[6].data_file_path(), files[1].data_file_path()]
+    );
+    // Subset positions refer to the visible files in retained-file order: [1, 6].
+    let nested = assigned.with_file_groups(vec![vec![], vec![1]])?;
+    assert_eq!(paths(&nested, 1)?, vec![files[6].data_file_path()]);
+    assert_eq!(nested.planned_files().len(), 1);
+    assert!(source.with_file_groups(vec![]).is_err());
+    assert!(source.with_file_groups(vec![vec![7]]).is_err());
+    assert!(source.with_file_groups(vec![vec![0], vec![0]]).is_err());
+    assert!(assigned.with_file_groups(vec![vec![2]]).is_err());
+
+    let groups: Vec<_> = (0..2)
+        .map(|partition| {
+            Ok(assigned
+                .planned_partition_tasks(partition)?
+                .cloned()
+                .collect::<Vec<_>>())
+        })
+        .collect::<Result<_>>()?;
+    let encoded = serde_json::to_vec(&groups).unwrap();
+    let groups = serde_json::from_slice(&encoded).unwrap();
+    // Reconstruction needs only assigned descriptors, the projected schema and a
+    // locally configured reader. It never consults a catalog or plans manifests.
+    let reader = table
+        .reader_builder()
+        .with_data_file_concurrency_limit(1)
+        .build();
+    assert!(
+        EagerIcebergDataSource::from_file_groups(
+            assigned.schema().clone(),
+            vec![],
+            reader.clone(),
+            None,
+            &harness.context().task_ctx()
+        )
+        .is_err()
+    );
+    let rebuilt = EagerIcebergDataSource::from_file_groups(
+        assigned.schema().clone(),
+        groups,
+        reader,
+        None,
+        &harness.context().task_ctx(),
+    )?;
+    assert_eq!(rebuilt.output_partitioning().partition_count(), 2);
+    assert_eq!(paths(&rebuilt, 0)?, paths(&assigned, 0)?);
+    for partition in 0..2 {
+        let expected =
+            collect(assigned.open(partition, harness.context().task_ctx())?).await?;
+        for _ in 0..2 {
+            let actual =
+                collect(rebuilt.open(partition, harness.context().task_ctx())?).await?;
+            assert_eq!(actual, expected);
+        }
+    }
+    assert!(rebuilt.open(2, harness.context().task_ctx()).is_err());
     Ok(())
 }

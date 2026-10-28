@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query-local file work selected before execution, independently of task assignment.
-
 use std::mem::{size_of, size_of_val};
 
 use datafusion::common::Result;
@@ -27,11 +25,8 @@ use iceberg::scan::{FileScanTask, TableScan};
 
 use crate::to_datafusion_error;
 
-/// File work selected by one Iceberg scan before assignment to output partitions.
-///
-/// The tasks retain their bound predicates, projection, and delete references. Keeping
-/// this value alive also keeps the query memory reservation for the retained tasks.
-/// This is not a reader and contains no coordinator-local reader state.
+/// File work retained by a query after manifest planning and before execution.
+/// Shared by task-local sources so their descriptors and reservation have one owner.
 #[derive(Debug)]
 pub(crate) struct PlannedFileScan {
     tasks: Vec<FileScanTask>,
@@ -39,26 +34,42 @@ pub(crate) struct PlannedFileScan {
 }
 
 impl PlannedFileScan {
-    /// Tasks in Iceberg's planning order. Assign each once per execution.
     pub(crate) fn tasks(&self) -> &[FileScanTask] {
         &self.tasks
     }
 
-    pub(crate) async fn collect(scan: TableScan, context: &TaskContext) -> Result<Self> {
-        let reservation =
-            MemoryConsumer::new("Iceberg file planning").register(context.memory_pool());
-        let mut planned = Self {
+    fn new(context: &TaskContext) -> Self {
+        Self {
             tasks: Vec::new(),
-            _reservation: reservation,
-        };
+            _reservation: MemoryConsumer::new("Iceberg file planning")
+                .register(context.memory_pool()),
+        }
+    }
+
+    fn push(&mut self, task: FileScanTask) -> Result<()> {
+        // Include owned paths/delete references and allow room for Vec capacity.
+        self._reservation
+            .try_grow(retained_size(&task).saturating_mul(2))?;
+        self.tasks.push(task);
+        Ok(())
+    }
+
+    pub(crate) fn from_tasks(
+        tasks: Vec<FileScanTask>,
+        context: &TaskContext,
+    ) -> Result<Self> {
+        let mut planned = Self::new(context);
+        for task in tasks {
+            planned.push(task)?;
+        }
+        Ok(planned)
+    }
+
+    pub(crate) async fn collect(scan: TableScan, context: &TaskContext) -> Result<Self> {
+        let mut planned = Self::new(context);
         let mut stream = scan.plan_files().await.map_err(to_datafusion_error)?;
         while let Some(task) = stream.try_next().await.map_err(to_datafusion_error)? {
-            // Allow for spare Vec capacity and allocator overhead; schemas and specs
-            // are shared Arcs, but paths and delete references are owned by each task.
-            planned
-                ._reservation
-                .try_grow(retained_size(&task).saturating_mul(2))?;
-            planned.tasks.push(task);
+            planned.push(task)?;
         }
         Ok(planned)
     }

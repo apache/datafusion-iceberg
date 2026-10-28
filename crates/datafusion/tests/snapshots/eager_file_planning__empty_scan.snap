@@ -8,7 +8,7 @@ ProjectionExec: expr=[count(Int64(1))@0 as trips]
       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
         FilterExec: pickup_date@0 = 2025-01-01, projection=[]
           RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-            DataSourceExec: format=iceberg, projection=[pickup_date], predicate=pickup_date = 2025-01-01, planned_files=0
+            DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=0
 
 +-------+
 | trips |

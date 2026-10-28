@@ -52,7 +52,8 @@ use iceberg_datafusion::metadata::{
 use iceberg_datafusion::read::IcebergDataSource;
 use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
-    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergPlanningConfig,
+    IcebergStaticTableProvider,
 };
 use tempfile::TempDir;
 
@@ -915,16 +916,12 @@ async fn run(
 }
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
-async fn rebuild_scan(
-    scan: &IcebergDataSource,
-    ctx: &SessionContext,
-) -> IcebergDataSource {
+fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
     IcebergDataSource::builder(scan.table().clone(), scan.schema())
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
-        .build(ctx.task_ctx())
-        .await
+        .build()
         .unwrap()
 }
 
@@ -1043,7 +1040,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         scan.predicate().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = rebuild_scan(scan, &ctx).await;
+    let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
@@ -1066,7 +1063,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
-    let rebuilt = rebuild_scan(scan, &ctx).await;
+    let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
@@ -1082,8 +1079,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
     let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
         .with_snapshot_id(Some(snapshot_id))
-        .build(ctx.task_ctx())
-        .await?;
+        .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
         +--------+
         | foo2   |
@@ -1266,22 +1262,33 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         .collect()
         .await?;
 
-    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
-    assert_eq!(plan.schema(), provider.schema());
-    // The rows come from two data files, which may be read in either order.
-    // They are joined under their own schema, not the plan's, so that a column
-    // the plan does not report would show.
-    let batches = run_batches(plan.as_ref(), &ctx).await?;
-    let batch = concat_batches(&batches[0].schema(), &batches)?;
-    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
-    let sorted = take_record_batch(&batch, &order)?;
-    insta::assert_snapshot!(&pretty_format_batches(&[sorted])?.to_string(), @r#"
+    for eager in [false, true] {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_option_extension(IcebergPlanningConfig::default())
+                .set_bool("iceberg.eager_file_planning", eager),
+        );
+        let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+        assert_eq!(plan.schema(), provider.schema());
+        // The rows come from two data files, which may be read in either order.
+        // They are joined under their own schema, not the plan's, so that a column
+        // the plan does not report would show.
+        let batches = run_batches(plan.as_ref(), &ctx).await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+        let sorted = take_record_batch(&batch, &order)?;
+        let rendered = pretty_format_batches(&[sorted])?.to_string();
+        insta::allow_duplicates! {
+        insta::assert_snapshot!(&rendered, @r#"
         +------+--------+
         | foo1 | foo2   |
         +------+--------+
         | 1    | alan   |
         | 2    | turing |
         +------+--------+"#);
+        }
+    }
 
     Ok(())
 }
