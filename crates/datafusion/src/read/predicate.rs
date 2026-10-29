@@ -145,16 +145,6 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
                 _ => TransformedResult::NotTransformed,
             }
         }
-        Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32
-                || *c.field.data_type() == DataType::Date64
-            {
-                // Casts to date truncate the expression, we cannot simply extract it as it
-                // can create erroneous predicates.
-                return TransformedResult::NotTransformed;
-            }
-            to_iceberg_predicate(&c.expr)
-        }
         Expr::Like(Like {
             negated,
             expr,
@@ -273,7 +263,6 @@ fn scalar_function_to_iceberg_predicate(
 ///
 /// * negation: `-x` is NaN iff `x` is NaN
 /// * `abs(x)`: `abs(x)` is NaN iff `x` is NaN
-/// * casts between numeric types preserve NaN
 /// * `x + c`, `c + x`, `x - c`, `c - x` for a finite literal `c`
 /// * `x * c`, `c * x`, `x / c` for a finite, non-zero literal `c`
 ///
@@ -285,16 +274,6 @@ fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),
         Expr::Negative(inner) => resolve_nan_preserving_reference(inner),
-        Expr::Cast(cast) => {
-            // Casts to date truncate the value and are not numeric, so they
-            // cannot be treated as NaN-preserving.
-            if *cast.field.data_type() == DataType::Date32
-                || *cast.field.data_type() == DataType::Date64
-            {
-                return None;
-            }
-            resolve_nan_preserving_reference(&cast.expr)
-        }
         Expr::ScalarFunction(ScalarFunction { func, args })
             if func.name() == "abs" && args.len() == 1 =>
         {
@@ -673,18 +652,14 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_cast() {
-        let sql = "ts >= timestamp '2023-01-05T00:00:00'";
-        let predicate = convert_to_iceberg_predicate(sql).unwrap();
-        let expected_predicate = Reference::new("ts")
-            .greater_than_or_equal_to(Datum::string("2023-01-05T00:00:00"));
-        assert_eq!(predicate, expected_predicate);
-    }
-
-    #[test]
-    fn test_predicate_conversion_with_date_cast() {
-        let sql = "ts >= date '2023-01-05T11:00:00'";
-        let predicate = convert_to_iceberg_predicate(sql);
-        assert_eq!(predicate, None);
+        for sql in [
+            "ts >= timestamp '2023-01-05T00:00:00'",
+            "ts >= date '2023-01-05T11:00:00'",
+            "cast(foo as varchar) < '5'",
+            "not isnan(cast(bar as double))",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "sql: {sql}");
+        }
     }
 
     #[test]
