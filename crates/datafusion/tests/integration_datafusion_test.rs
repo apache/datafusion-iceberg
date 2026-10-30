@@ -22,19 +22,21 @@ use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, AsArray, Int32Array, RecordBatch, StringArray, UInt64Array,
+};
 use datafusion::arrow::compute::{
     cast, concat_batches, sort_to_indices, take_record_batch,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
@@ -1277,6 +1279,126 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         | 1    | alan   |
         | 2    | turing |
         +------+--------+"#);
+
+    Ok(())
+}
+
+/// An INSERT whose input ends in a projection that renames and reorders columns gets
+/// the partition projection merged into it by the optimizer. The partition values
+/// must still come from the columns being written (apache/datafusion-iceberg#35).
+#[tokio::test]
+async fn test_insert_into_partitioned_through_reordering_projection()
+-> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_reordered_insert".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+
+    let schema = Schema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "val", Type::Primitive(PrimitiveType::Int)).into(),
+        ])
+        .build()?;
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![1])
+                .name("id")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .build();
+    let creation = TableCreation::builder()
+        .name("partitioned_by_id".to_string())
+        .location(temp_path())
+        .schema(schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let client = Arc::new(iceberg_catalog);
+    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
+    // One partition keeps repartitioning out of the plan.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_catalog("catalog", catalog);
+
+    let source_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )?;
+    ctx.register_table(
+        "source",
+        Arc::new(MemTable::try_new(source_schema, vec![vec![source]])?),
+    )?;
+
+    // `id` is written from `b`, the second source column, so the partition values
+    // must read `b@1` and not the first column of the merged projection's input.
+    let plan = ctx
+        .sql(
+            "INSERT INTO catalog.test_reordered_insert.partitioned_by_id
+             SELECT b AS id, a AS val FROM source",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+    insta::assert_snapshot!(displayable(plan.as_ref()).indent(false), @r"
+    IcebergCommitExec: table=test_reordered_insert.partitioned_by_id
+      IcebergWriteExec: table=test_reordered_insert.partitioned_by_id
+        ProjectionExec: expr=[b@1 as id, a@0 as val, iceberg_partition_values(id: identity(b@1)) as _partition]
+          DataSourceExec: partitions=1, partition_sizes=[1]
+    ");
+    insta::assert_snapshot!(run(plan.as_ref(), &ctx).await?, @r"
+    +-------+
+    | count |
+    +-------+
+    | 2     |
+    +-------+
+    ");
+
+    let table_ident = TableIdent::new(namespace, "partitioned_by_id".to_string());
+    let table = client.load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut partitions = HashSet::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            partitions.insert(entry.data_file().partition().clone());
+        }
+    }
+    assert_eq!(
+        partitions,
+        HashSet::from([
+            Struct::from_iter([Some(Literal::int(100))]),
+            Struct::from_iter([Some(Literal::int(200))]),
+        ])
+    );
+
+    // A filter on the partition column prunes by these values, so it only finds
+    // the row if the values are right.
+    let batches = ctx
+        .sql("SELECT * FROM catalog.test_reordered_insert.partitioned_by_id WHERE id = 100")
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +-----+-----+
+    | id  | val |
+    +-----+-----+
+    | 100 | 1   |
+    +-----+-----+
+    ");
 
     Ok(())
 }
