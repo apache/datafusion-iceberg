@@ -73,7 +73,7 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 `IcebergTableScan` converts the projection to column names and the filters to a single Iceberg `Predicate` (`physical_plan/expr_to_predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
 
-Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `expr_to_predicate.rs`; for example, it is why date casts and some NaN arithmetic are deliberately not pushed down.
+Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `expr_to_predicate.rs`; for example, it is why casts and some NaN arithmetic are deliberately not pushed down. Removing a cast is left to DataFusion's simplifier (`unwrap_cast_in_comparison`), which rewrites a comparison only when the result doesn't change.
 
 ### Write path (`IcebergTableProvider::insert_into`)
 
