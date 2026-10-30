@@ -17,10 +17,18 @@
 
 #[cfg(test)]
 mod tests {
-    use datafusion::error::Result;
-    use iceberg_datafusion::IcebergTableProviderFactory;
-    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
+    use std::error::Error;
+    use std::sync::Arc;
 
+    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::error::Result;
+    use datafusion::prelude::SessionContext;
+    use iceberg::TableIdent;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProviderFactory};
+    use iceberg_datafusion_test_tools::{
+        FixtureCatalog, IcebergTestHarness, create_taxi_table,
+    };
     #[tokio::test]
     async fn pushes_down_compound_predicates() -> Result<()> {
         let (plan, batches) = IcebergTestHarness::builder()
@@ -179,6 +187,50 @@ mod tests {
         +-------+
         ");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_predict_pushdown() -> Result<(), Box<dyn Error>> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()?;
+        fixtures
+            .table(TableIdent::from_strs(["ns", "t1"])?, schema)
+            .create()
+            .await?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "catalog",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        );
+        let records = ctx
+            .sql("select * from catalog.ns.t1 where (foo > 1 and length(bar) = 1 ) or bar is null")
+            .await
+            .unwrap()
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(1, records.len());
+        let record = &records[0];
+        // the first column is plan_type, the second column plan string.
+        let s = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(2, s.len());
+        // the first row is logical_plan, the second row is physical_plan
+        let expected = "predicate=(foo > 1) OR (bar IS NULL)";
+        assert!(s.value(1).trim().contains(expected));
         Ok(())
     }
 }
