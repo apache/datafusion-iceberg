@@ -60,11 +60,17 @@ impl IcebergStaticTableProvider {
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(to_datafusion_error)?,
         );
-        Ok(IcebergStaticTableProvider {
+        Ok(Self::from_table_with_schema(table, schema))
+    }
+
+    // Catalog scans must use the catalog provider's cached schema even when the
+    // loaded table has newer metadata.
+    pub(crate) fn from_table_with_schema(table: Table, schema: ArrowSchemaRef) -> Self {
+        Self {
             table,
             snapshot_id: None,
             schema,
-        })
+        }
     }
 
     /// Creates a static provider for a specific table snapshot.
