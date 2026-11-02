@@ -1,0 +1,160 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# This is a regression test for:
+# https://github.com/apache/datafusion-iceberg/issues/36.
+
+statement ok
+CREATE TABLE default.default.test_cast_table (id INT NOT NULL, d DATE, n INT)
+
+query I
+INSERT INTO default.default.test_cast_table VALUES
+  (1, DATE '2023-01-04', 3),
+  (2, DATE '2023-01-05', 10),
+  (3, DATE '2023-01-06', 3),
+  (4, DATE '1969-12-30', 10),
+  (5, DATE '1969-12-31', 3)
+----
+5
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_cast_table WHERE d < TIMESTAMP '2023-01-05 12:00:00'
+----
+logical_plan
+01)Projection: default.default.test_cast_table.id
+02)--Filter: CAST(default.default.test_cast_table.d AS Timestamp(ns)) < TimestampNanosecond(1672920000000000000, None)
+03)----TableScan: default.default.test_cast_table projection=[id, d], partial_filters=[CAST(default.default.test_cast_table.d AS Timestamp(ns)) < TimestampNanosecond(1672920000000000000, None)]
+physical_plan
+01)FilterExec: CAST(d@1 AS Timestamp(ns)) < 1672920000000000000, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, d]
+
+query I rowsort
+SELECT id FROM default.default.test_cast_table WHERE d < TIMESTAMP '2023-01-05 12:00:00'
+----
+1
+2
+4
+5
+
+query I rowsort
+SELECT id FROM default.default.test_cast_table WHERE d > DATE_TRUNC('day', TIMESTAMP '2023-01-05 12:00:00')
+----
+3
+
+query I rowsort
+SELECT id FROM default.default.test_cast_table WHERE d > TIMESTAMP '1969-12-30 12:00:00'
+----
+1
+2
+3
+5
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_cast_table WHERE arrow_cast(n, 'Utf8') < arrow_cast('5', 'Utf8')
+----
+logical_plan
+01)Projection: default.default.test_cast_table.id
+02)--Filter: CAST(default.default.test_cast_table.n AS Utf8) < Utf8("5")
+03)----TableScan: default.default.test_cast_table projection=[id, n], partial_filters=[CAST(default.default.test_cast_table.n AS Utf8) < Utf8("5")]
+physical_plan
+01)FilterExec: CAST(n@1 AS Utf8) < 5, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, n]
+
+query I rowsort
+SELECT id FROM default.default.test_cast_table WHERE arrow_cast(n, 'Utf8') < arrow_cast('5', 'Utf8')
+----
+1
+2
+3
+4
+5
+
+statement ok
+DROP TABLE default.default.test_cast_table
+
+statement ok
+CREATE TABLE default.default.test_float_cast_table (id INT NOT NULL, x REAL)
+
+query I
+INSERT INTO default.default.test_float_cast_table VALUES
+  (1, CAST(0.1 AS REAL)),
+  (2, CAST(0.2 AS REAL)),
+  (3, CAST(0.05 AS REAL))
+----
+3
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_float_cast_table WHERE x > 0.1
+----
+logical_plan
+01)Projection: default.default.test_float_cast_table.id
+02)--Filter: CAST(default.default.test_float_cast_table.x AS Float64) > Float64(0.1)
+03)----TableScan: default.default.test_float_cast_table projection=[id, x], partial_filters=[CAST(default.default.test_float_cast_table.x AS Float64) > Float64(0.1)]
+physical_plan
+01)FilterExec: CAST(x@1 AS Float64) > 0.1, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, x]
+
+query I rowsort
+SELECT id FROM default.default.test_float_cast_table WHERE x > 0.1
+----
+1
+2
+
+statement ok
+DROP TABLE default.default.test_float_cast_table
+
+statement ok
+CREATE TABLE default.default.test_isnan_cast_table (id INT NOT NULL, s VARCHAR, n INT)
+
+query I
+INSERT INTO default.default.test_isnan_cast_table VALUES (1, 'NaN', 1), (2, '1.5', 2)
+----
+2
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_isnan_cast_table WHERE NOT isnan(CAST(s AS DOUBLE))
+----
+logical_plan
+01)Projection: default.default.test_isnan_cast_table.id
+02)--Filter: NOT isnan(CAST(default.default.test_isnan_cast_table.s AS Float64))
+03)----TableScan: default.default.test_isnan_cast_table projection=[id, s], partial_filters=[NOT isnan(CAST(default.default.test_isnan_cast_table.s AS Float64))]
+physical_plan
+01)FilterExec: NOT isnan(CAST(s@1 AS Float64)), projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, s]
+
+query I rowsort
+SELECT id FROM default.default.test_isnan_cast_table WHERE NOT isnan(CAST(s AS DOUBLE))
+----
+2
+
+query I rowsort
+SELECT id FROM default.default.test_isnan_cast_table WHERE isnan(CAST(s AS DOUBLE))
+----
+1
+
+query I rowsort
+SELECT id FROM default.default.test_isnan_cast_table WHERE NOT isnan(CAST(n AS DOUBLE))
+----
+1
+2
+
+statement ok
+DROP TABLE default.default.test_isnan_cast_table
