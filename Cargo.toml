@@ -20,6 +20,7 @@ members = [
     "crates/datafusion",
     "crates/sqllogictest",
     "crates/playground",
+    "crates/test-tools",
 ]
 resolver = "2"
 
@@ -36,6 +37,7 @@ async-trait = "0.1.89"
 datafusion = "55.0.0"
 datafusion-cli = "55.0.0"
 iceberg-datafusion = { path = "crates/datafusion" }
+iceberg-datafusion-test-tools = { path = "crates/test-tools" }
 datafusion-sqllogictest = "55.0.0"
 iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }

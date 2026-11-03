@@ -204,7 +204,7 @@ Download and unpack the official release tarball, check that its `Cargo.toml` ha
 cargo publish -p iceberg-datafusion
 ```
 
-`iceberg-datafusion` is the only published crate. `iceberg-sqllogictest` and `iceberg-playground` set `publish = false`.
+`iceberg-datafusion` is the only published crate. `iceberg-sqllogictest`, `iceberg-playground`, and `iceberg-datafusion-test-tools` set `publish = false`.
 
 ### 9. Add the release to Apache Reporter
 

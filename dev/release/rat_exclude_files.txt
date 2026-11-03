@@ -3,4 +3,3 @@
 CLAUDE.md
 dev/release/rat_exclude_files.txt
 target/*
-*.parquet

@@ -15,4 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-*.parquet filter=lfs diff=lfs merge=lfs -text
+[package]
+description = "Builders for the Iceberg tables used in tests"
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+name = "iceberg-datafusion-test-tools"
+publish = false
+repository = { workspace = true }
+version = { workspace = true }
+
+[dependencies]
+# Only for its Arrow and Parquet re-exports, which keep this crate on the
+# versions the rest of the workspace resolves to.
+datafusion = { workspace = true }
+iceberg = { workspace = true }
+rand = { version = "0.10", default-features = false, features = ["alloc"] }
+rand_pcg = "0.10"
+tempfile = "3.18"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

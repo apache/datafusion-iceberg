@@ -3246,13 +3246,25 @@ dependencies = [
  "datafusion",
  "futures",
  "iceberg",
+ "iceberg-datafusion-test-tools",
  "insta",
  "parquet",
- "serde",
  "tempfile",
  "tokio",
- "typetag",
  "uuid",
+]
+
+[[package]]
+name = "iceberg-datafusion-test-tools"
+version = "0.12.0"
+dependencies = [
+ "datafusion",
+ "futures",
+ "iceberg",
+ "rand 0.10.2",
+ "rand_pcg",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

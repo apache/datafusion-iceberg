@@ -18,12 +18,16 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::{FIXTURE_URI, IcebergTestHarness};
+    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
     async fn registers_the_fixture_with_the_iceberg_schema() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (_, batches) = harness.query("DESCRIBE taxi").await?;
+        let (_, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            .query("DESCRIBE taxi")
+            .await?;
 
         insta::assert_snapshot!(batches, @r"
     +---------------------+---------------+-------------+
@@ -50,11 +54,16 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_schema_definitions_for_existing_iceberg_tables() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            .build()
+            .await?;
         let error = harness
             .query(&format!(
                 "CREATE EXTERNAL TABLE invalid (id INT) STORED AS ICEBERG \
-                 LOCATION '{FIXTURE_URI}/metadata/v1.metadata.json'"
+                 LOCATION '{}'",
+                harness.table().metadata_location()?
             ))
             .await
             .unwrap_err();
