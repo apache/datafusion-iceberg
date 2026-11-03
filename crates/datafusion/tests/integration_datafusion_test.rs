@@ -1278,5 +1278,25 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         | 2    | turing |
         +------+--------+"#);
 
+    // Projection indices still refer to the cached provider schema, not the
+    // newly loaded table schema.
+    let projection = vec![1];
+    let plan = provider
+        .scan(&ctx.state(), Some(&projection), &[], None)
+        .await?;
+    assert_eq!(plan.schema().field(0).name(), "foo2");
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column(0), None, None)?;
+    let sorted = take_record_batch(&batch, &order)?;
+    expect![[r#"
+        +--------+
+        | foo2   |
+        +--------+
+        | alan   |
+        | turing |
+        +--------+"#]]
+    .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
+
     Ok(())
 }

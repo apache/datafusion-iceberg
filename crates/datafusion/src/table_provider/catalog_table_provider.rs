@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::{config_datafusion_err, not_impl_err};
-use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
@@ -36,12 +35,13 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
-use crate::read::IcebergDataSource;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
 use crate::write::repartition::repartition;
 use crate::write::sort::sort_by_partition;
+
+use super::IcebergStaticTableProvider;
 
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
@@ -126,7 +126,7 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -138,13 +138,9 @@ impl TableProvider for IcebergCatalogTableProvider {
             .await
             .map_err(to_datafusion_error)?;
 
-        // Create scan with fresh metadata (always use current snapshot)
-        let source = IcebergDataSource::builder(table, self.schema.clone())
-            .with_projection(projection)
-            .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
-        Ok(DataSourceExec::from_data_source(source))
+        IcebergStaticTableProvider::from_table_with_schema(table, self.schema.clone())
+            .scan(state, projection, filters, limit)
+            .await
     }
 
     fn supports_filters_pushdown(
@@ -233,6 +229,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::datasource::TableProvider;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::DataFusionError;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
@@ -242,6 +239,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::read::IcebergDataSource;
 
     #[tokio::test]
     async fn test_catalog_backed_provider_creation() {
