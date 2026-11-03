@@ -75,8 +75,8 @@ Replace the metadata path with one from an existing table whose data files are
 accessible to the process. External-table registration reads an existing table;
 it does not create one. For catalog-backed access and inserts, register an
 `IcebergCatalogProvider` with a configured Iceberg `Catalog`. See the
-[integration tests](crates/datafusion/tests/integration_datafusion_test.rs) for
-examples.
+[catalog provider](crates/datafusion/tests/catalog_provider.rs) and
+[insert](crates/datafusion/tests/insert_into.rs) tests for examples.
 
 The workspace uses a pinned `iceberg-rust` Git revision. Applications that
 also depend on Iceberg crates should use the same revision shown in

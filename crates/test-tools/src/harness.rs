@@ -20,6 +20,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::{CatalogProvider, TableProviderFactory};
 use datafusion::common::exec_err;
@@ -278,6 +279,17 @@ impl IcebergTestHarnessBuilder {
             table: Some(table),
         })
     }
+}
+
+/// Renders `schema` one field per line, with types, nullability and metadata, ready to
+/// snapshot.
+pub fn display_schema(schema: &ArrowSchema) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Returns a data file's path relative to its table's `data/` directory, which, unlike
