@@ -127,7 +127,7 @@ impl TableProvider for IcebergCatalogTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -456,7 +456,7 @@ mod tests {
 
         // Columns come back in the projection's order, not the table's.
         let source = IcebergDataSource::builder(table.clone(), schema.clone())
-            .with_projection(Some(&vec![1, 0]))
+            .with_projection(Some(&[1, 0]))
             .build()
             .unwrap();
         insta::assert_debug_snapshot!(source.projection(), @r#"
@@ -467,7 +467,7 @@ mod tests {
         "#);
 
         let err = IcebergDataSource::builder(table, schema)
-            .with_projection(Some(&vec![0, out_of_range]))
+            .with_projection(Some(&[0, out_of_range]))
             .build()
             .unwrap_err();
         assert_eq!(
@@ -605,7 +605,7 @@ mod tests {
     async fn get_partitioned_test_catalog_and_table(
         fanout_enabled: Option<bool>,
     ) -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
-        use iceberg::spec::{Transform, UnboundPartitionField, UnboundPartitionSpec};
+        use iceberg::spec::{Transform, UnboundPartitionSpec};
 
         let temp_dir = TempDir::new().unwrap();
         let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
@@ -644,14 +644,7 @@ mod tests {
 
         let partition_spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
-            .add_partition_field(
-                UnboundPartitionField::builder()
-                    .source_ids(vec![2])
-                    .name("category")
-                    .transform(Transform::Identity)
-                    .build()
-                    .unwrap(),
-            )
+            .add_partition_field(2, "category", Transform::Identity)
             .unwrap()
             .build();
 

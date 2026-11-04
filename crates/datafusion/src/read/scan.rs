@@ -115,8 +115,8 @@ impl IcebergDataSourceBuilder {
     /// Returns only the columns of the schema at these indices, or all of them
     /// if `None` (the default). Indices are into the schema passed to
     /// [`IcebergDataSource::builder`].
-    pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
-        self.projection = projection.cloned();
+    pub fn with_projection(mut self, projection: Option<&[usize]>) -> Self {
+        self.projection = projection.map(<[usize]>::to_vec);
         self
     }
 

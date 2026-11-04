@@ -35,7 +35,7 @@ dashmap = "6"
 datafusion = { workspace = true }
 futures = "0.3"
 iceberg = { workspace = true }
-parquet = "59.2"
+parquet = "60"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,7 +43,7 @@ typetag = "0.2"
 
 [dev-dependencies]
 insta = "1"
-parquet = "59.2"
+parquet = "60"
 tempfile = "3.18"
 
 [lints]
