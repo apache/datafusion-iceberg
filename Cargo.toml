@@ -33,12 +33,12 @@ version = "0.12.0"
 [workspace.dependencies]
 anyhow = "1.0.72"
 async-trait = "0.1.89"
-datafusion = "55.0.0"
-datafusion-cli = "55.0.0"
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
+datafusion-cli = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
 iceberg-datafusion = { path = "crates/datafusion" }
-datafusion-sqllogictest = "55.0.0"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+datafusion-sqllogictest = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "0d5eb123495f765ea151e78c8964919d554d4b98" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "0d5eb123495f765ea151e78c8964919d554d4b98" }
 tokio = { version = "1.47", default-features = false, features = ["sync", "rt-multi-thread"] }
 toml = "1.1"
 tracing = "0.1.41"
