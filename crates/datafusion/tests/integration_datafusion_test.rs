@@ -39,7 +39,7 @@ use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
-    UnboundPartitionSpec,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
@@ -735,9 +735,23 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     // Identity-partition on category and both floating-point values
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
-        .add_partition_field(2, "category", Transform::Identity)?
-        .add_partition_field(4, "float_partition", Transform::Identity)?
-        .add_partition_field(5, "double_partition", Transform::Identity)?
+        .add_partition_fields([
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+            UnboundPartitionField::builder()
+                .source_ids(vec![4])
+                .name("float_partition")
+                .transform(Transform::Identity)
+                .build()?,
+            UnboundPartitionField::builder()
+                .source_ids(vec![5])
+                .name("double_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        ])?
         .build();
 
     // Create the partitioned table
