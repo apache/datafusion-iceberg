@@ -26,7 +26,7 @@ use iceberg::encryption::kms::MemoryKmsClientFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     NestedField, PrimitiveType, Schema, TableProperties, Transform, Type,
-    UnboundPartitionSpec,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use iceberg_datafusion::IcebergCatalogProvider;
@@ -137,7 +137,13 @@ impl DataFusionEngine {
 
         let partition_spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
-            .add_partition_field(2, "category", Transform::Identity)?
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("category")
+                    .transform(Transform::Identity)
+                    .build()?,
+            )?
             .build();
 
         catalog

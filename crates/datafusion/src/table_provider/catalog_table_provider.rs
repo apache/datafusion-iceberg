@@ -605,7 +605,7 @@ mod tests {
     async fn get_partitioned_test_catalog_and_table(
         fanout_enabled: Option<bool>,
     ) -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
-        use iceberg::spec::{Transform, UnboundPartitionSpec};
+        use iceberg::spec::{Transform, UnboundPartitionField, UnboundPartitionSpec};
 
         let temp_dir = TempDir::new().unwrap();
         let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
@@ -644,7 +644,14 @@ mod tests {
 
         let partition_spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
-            .add_partition_field(2, "category", Transform::Identity)
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("category")
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build();
 
