@@ -195,6 +195,7 @@ impl DataSource for IcebergDataSource {
                 .execution
                 .parquet
                 .enable_page_index,
+            context.session_config().batch_size(),
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -281,6 +282,7 @@ async fn get_batch_stream(
     column_names: Option<Vec<String>>,
     predicate: Option<Predicate>,
     enable_page_index: bool,
+    batch_size: usize,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -296,6 +298,7 @@ async fn get_batch_stream(
     }
     let table_scan = scan_builder
         .with_row_selection_enabled(enable_page_index)
+        .with_batch_size(Some(batch_size))
         .build()
         .map_err(to_datafusion_error)?;
 

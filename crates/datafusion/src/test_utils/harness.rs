@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
@@ -100,14 +101,18 @@ impl IcebergTestHarness {
     }
 
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
+        let (plan, batches) = self.query_batches(sql).await?;
+        Ok((plan, pretty_format_batches(&batches)?.to_string()))
+    }
+
+    /// Like [`Self::query`], but returns the batches unformatted, for tests
+    /// that inspect batch boundaries.
+    pub async fn query_batches(&self, sql: &str) -> Result<(String, Vec<RecordBatch>)> {
         let dataframe: DataFrame = self.ctx.sql(sql).await?;
         let plan = dataframe.create_physical_plan().await?;
         let batches = dataframe.collect().await?;
 
-        Ok((
-            displayable(plan.as_ref()).indent(true).to_string(),
-            pretty_format_batches(&batches)?.to_string(),
-        ))
+        Ok((displayable(plan.as_ref()).indent(true).to_string(), batches))
     }
 }
 
