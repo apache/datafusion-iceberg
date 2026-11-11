@@ -31,10 +31,13 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::logical_expr::Operator;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::physical_expr::expressions::{binary, col, lit};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::filter_pushdown::PushedDown;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
@@ -1201,6 +1204,55 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
             .to_string(),
         pretty_format_batches(&batches)?.to_string()
     );
+
+    Ok(())
+}
+
+/// A scan keeps the filters DataFusion pushes into it and reads only the rows that
+/// match them. It reports each filter as not pushed down, so DataFusion still
+/// applies it.
+#[tokio::test]
+async fn test_scan_applies_pushed_filters() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_pushed_filters".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+
+    let ctx = SessionContext::new();
+    let catalog = IcebergCatalogProvider::try_new(Arc::new(iceberg_catalog)).await?;
+    ctx.register_catalog("catalog", Arc::new(catalog));
+    ctx.sql("INSERT INTO catalog.test_pushed_filters.my_table VALUES (1, 'alan'), (2, 'turing')")
+        .await?
+        .collect()
+        .await?;
+
+    let provider = ctx
+        .table_provider("catalog.test_pushed_filters.my_table")
+        .await?;
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    let scan = plan
+        .downcast_ref::<DataSourceExec>()
+        .expect("a data source")
+        .data_source();
+    let schema = provider.schema();
+    let filter = binary(col("foo1", &schema)?, Operator::Eq, lit(1), &schema)?;
+    let pushed = scan.try_pushdown_filters(vec![filter], ctx.state().config_options())?;
+    assert!(matches!(pushed.filters[..], [PushedDown::No]));
+
+    let source = pushed.updated_node.expect("a scan holding the filter");
+    let filters = source
+        .downcast_ref::<IcebergDataSource>()
+        .expect("an Iceberg data source")
+        .filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].to_string(), "foo1@0 = 1");
+    insta::assert_snapshot!(&run(&DataSourceExec::new(source), &ctx).await?, @r#"
+        +------+------+
+        | foo1 | foo2 |
+        +------+------+
+        | 1    | alan |
+        +------+------+"#);
 
     Ok(())
 }
