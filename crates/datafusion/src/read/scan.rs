@@ -22,11 +22,13 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
@@ -34,6 +36,7 @@ use futures::{Stream, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
+use super::physical_predicate::convert_physical_filter_to_predicate;
 use super::predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
@@ -51,6 +54,9 @@ pub struct IcebergDataSource {
     projection: Vec<String>,
     /// Filter to apply to the table scan
     predicate: Option<Predicate>,
+    /// Physical filters pushed down by DataFusion. The scan ANDs the parts that convert
+    /// to an Iceberg predicate onto `predicate`.
+    filters: Vec<Arc<dyn PhysicalExpr>>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
 }
@@ -88,6 +94,11 @@ impl IcebergDataSource {
 
     pub fn predicate(&self) -> Option<&Predicate> {
         self.predicate.as_ref()
+    }
+
+    /// The physical filters DataFusion pushed down into this source.
+    pub fn filters(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.filters
     }
 
     pub fn fetch(&self) -> Option<usize> {
@@ -166,6 +177,7 @@ impl IcebergDataSourceBuilder {
             schema,
             projection,
             predicate: self.predicate,
+            filters: Vec::new(),
             fetch: self.fetch,
         })
     }
@@ -184,11 +196,21 @@ impl DataSource for IcebergDataSource {
         _partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let predicate = self
+            .predicate
+            .clone()
+            .into_iter()
+            .chain(
+                self.filters
+                    .iter()
+                    .filter_map(convert_physical_filter_to_predicate),
+            )
+            .reduce(Predicate::and);
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             Some(self.projection.clone()),
-            self.predicate.clone(),
+            predicate,
             context
                 .session_config()
                 .options()
@@ -268,6 +290,24 @@ impl DataSource for IcebergDataSource {
         _projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
+        // The scan can match extra rows, so DataFusion still applies every filter.
+        let result = FilterPushdownPropagation::with_parent_pushdown_result(vec![
+            PushedDown::No;
+            filters.len()
+        ]);
+        if filters.is_empty() {
+            return Ok(result);
+        }
+        let mut source = self.clone();
+        source.filters.extend(filters);
+        Ok(result.with_updated_node(Arc::new(source)))
     }
 }
 
