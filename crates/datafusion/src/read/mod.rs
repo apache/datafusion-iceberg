@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod physical_predicate;
 pub(crate) mod predicate;
 pub(crate) mod scan;
 
+pub use physical_predicate::convert_physical_filter_to_predicate;
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};
