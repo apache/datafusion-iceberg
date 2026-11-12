@@ -15,44 +15,57 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::pin::Pin;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{Statistics, internal_err};
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
+use iceberg::arrow::ArrowReader;
 use iceberg::expr::Predicate;
+use iceberg::io::FileIO;
 use iceberg::table::Table;
 
 use super::predicate::convert_filters_to_predicate;
+use super::reader::ScanReader;
+use super::task_source::{FileScanTaskSource, TableScanTaskSource};
 use crate::to_datafusion_error;
 
-/// Manages the scanning process of an Iceberg [`Table`], encapsulating the
-/// necessary details and computed properties required for execution planning.
-#[derive(Debug, Clone)]
-pub struct IcebergDataSource {
-    /// A table in the catalog.
-    table: Table,
-    /// Snapshot of the table to scan.
-    snapshot_id: Option<i64>,
-    /// Schema returned by this data source after projection.
+/// Reads Iceberg files supplied by a [`FileScanTaskSource`].
+///
+/// The default [`TableScanTaskSource`] discovers files from a table when executed.
+/// Custom task sources can deliver the same native tasks without a table or
+/// catalog; file reading, deletes and per-partition fetch remain here.
+#[derive(Debug)]
+pub struct IcebergDataSource<T: FileScanTaskSource = TableScanTaskSource> {
+    task_source: T,
     schema: ArrowSchemaRef,
-    /// Projection column names in the output schema.
-    projection: Vec<String>,
-    /// Filter to apply to the table scan
-    predicate: Option<Predicate>,
-    /// Optional limit on the number of rows to return
+    reader: ScanReader,
     fetch: Option<usize>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl<T: FileScanTaskSource> Clone for IcebergDataSource<T> {
+    fn clone(&self) -> Self {
+        Self {
+            task_source: self.task_source.clone(),
+            schema: self.schema.clone(),
+            reader: self.reader.clone(),
+            fetch: self.fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl IcebergDataSource {
@@ -67,29 +80,97 @@ impl IcebergDataSource {
             snapshot_id: None,
             predicate: None,
             fetch: None,
+            reader: None,
         }
     }
 
     pub fn table(&self) -> &Table {
-        &self.table
+        self.task_source.table()
     }
 
     pub fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
+        self.task_source.snapshot_id()
+    }
+
+    pub fn projection(&self) -> &[String] {
+        self.task_source.projection()
+    }
+
+    pub fn predicate(&self) -> Option<&Predicate> {
+        self.task_source.predicate()
+    }
+}
+
+impl<T: FileScanTaskSource> IcebergDataSource<T> {
+    /// Creates a reader over tasks supplied without a table or catalog.
+    ///
+    /// `schema` must match the tasks' projected columns. `file_io` must describe
+    /// the same storage configuration used by `reader`; it is retained for
+    /// consumers that reconstruct this source in another process. Reader options
+    /// are used as supplied, rather than replaced by session defaults. Clones of
+    /// this source share the reader's cached delete-file loader.
+    ///
+    /// `fetch` limits rows per local partition, not across the whole source.
+    /// Construction performs no discovery or file I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task source has no partitions.
+    pub fn from_task_source(
+        schema: ArrowSchemaRef,
+        task_source: T,
+        file_io: FileIO,
+        reader: ArrowReader,
+        fetch: Option<usize>,
+    ) -> Result<Self> {
+        validate_partition_count(&task_source)?;
+        Ok(Self {
+            task_source,
+            schema,
+            reader: ScanReader::Provided { file_io, reader },
+            fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    /// Replaces task delivery while preserving schema, reader options and fetch.
+    ///
+    /// The replacement must supply tasks with the same projection and storage
+    /// access requirements. It may change the number of local partitions. This
+    /// operation does not discover files or open task streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the replacement has no partitions.
+    pub fn with_task_source<U: FileScanTaskSource>(
+        self,
+        task_source: U,
+    ) -> Result<IcebergDataSource<U>> {
+        validate_partition_count(&task_source)?;
+        Ok(IcebergDataSource {
+            task_source,
+            schema: self.schema,
+            reader: self.reader,
+            fetch: self.fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    /// Task delivery or discovery used by this source.
+    pub fn task_source(&self) -> &T {
+        &self.task_source
     }
 
     pub fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
 
-    pub fn projection(&self) -> &[String] {
-        &self.projection
+    /// Storage configuration matching this source's reader.
+    pub fn file_io(&self) -> &FileIO {
+        self.reader.file_io()
     }
 
-    pub fn predicate(&self) -> Option<&Predicate> {
-        self.predicate.as_ref()
-    }
-
+    /// Per-partition row limit, if any.
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
     }
@@ -100,8 +181,9 @@ impl IcebergDataSource {
 /// A table provider passes the table's schema and selects columns with
 /// [`Self::with_projection`]. To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
-/// projection.
-#[derive(Debug, Clone)]
+/// projection. To rebuild without a table, use
+/// [`IcebergDataSource::from_task_source`] with native file tasks.
+#[derive(Clone)]
 pub struct IcebergDataSourceBuilder {
     table: Table,
     schema: ArrowSchemaRef,
@@ -109,6 +191,21 @@ pub struct IcebergDataSourceBuilder {
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
     fetch: Option<usize>,
+    reader: Option<ArrowReader>,
+}
+
+impl Debug for IcebergDataSourceBuilder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergDataSourceBuilder")
+            .field("table", &self.table)
+            .field("schema", &self.schema)
+            .field("projection", &self.projection)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("predicate", &self.predicate)
+            .field("fetch", &self.fetch)
+            .field("has_reader", &self.reader.is_some())
+            .finish()
+    }
 }
 
 impl IcebergDataSourceBuilder {
@@ -139,13 +236,23 @@ impl IcebergDataSourceBuilder {
         self.with_predicate(convert_filters_to_predicate(filters))
     }
 
-    /// Stops after `fetch` rows, or reads every row if `None` (the default).
+    /// Stops each partition after `fetch` rows, or reads every row if `None`.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
     }
 
-    /// Builds the source, which reads the columns of its projected schema by name.
+    /// Uses this reader without changing its settings to session defaults.
+    ///
+    /// The reader must use FileIO matching the table. Its clones share the cached
+    /// delete-file loader. Without this override, a reader is built at execution
+    /// with the table's runtime and the session's batch size and page-index flag.
+    pub fn with_reader(mut self, reader: ArrowReader) -> Self {
+        self.reader = Some(reader);
+        self
+    }
+
+    /// Builds the source without discovering files or performing I/O.
     ///
     /// # Errors
     ///
@@ -160,18 +267,29 @@ impl IcebergDataSourceBuilder {
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        let reader = match self.reader {
+            Some(reader) => ScanReader::Provided {
+                file_io: self.table.file_io().clone(),
+                reader,
+            },
+            None => ScanReader::Table(self.table.clone()),
+        };
         Ok(IcebergDataSource {
-            table: self.table,
-            snapshot_id: self.snapshot_id,
+            task_source: TableScanTaskSource {
+                table: self.table,
+                snapshot_id: self.snapshot_id,
+                projection,
+                predicate: self.predicate,
+            },
             schema,
-            projection,
-            predicate: self.predicate,
+            reader,
             fetch: self.fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
 
-impl DataSource for IcebergDataSource {
+impl<T: FileScanTaskSource> DataSource for IcebergDataSource<T> {
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -181,60 +299,40 @@ impl DataSource for IcebergDataSource {
 
     fn open(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            Some(self.projection.clone()),
-            self.predicate.clone(),
-            context
-                .session_config()
-                .options()
-                .execution
-                .parquet
-                .enable_page_index,
-            context.session_config().batch_size(),
-        );
-        let stream = futures::stream::once(fut).try_flatten();
-
-        // Apply the fetch if specified.
-        let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(limit) = self.fetch {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            limited_stream,
+        if partition >= self.task_source.partition_count() {
+            return internal_err!("Iceberg scan partition {partition} does not exist");
+        }
+        if self.fetch == Some(0) {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                futures::stream::empty(),
+            )));
+        }
+        let tasks = self.task_source.tasks(partition, context.clone())?;
+        let stream = self
+            .reader
+            .reader(&context)
+            .read(tasks)
+            .map_err(to_datafusion_error)?
+            .stream()
+            .map_err(to_datafusion_error);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream));
+        // Unlike filtering out batches after the limit, LimitStream drops its
+        // input as soon as the limit is reached, releasing task delivery too.
+        Ok(Box::pin(LimitStream::new(
+            stream,
+            0,
+            self.fetch,
+            BaselineMetrics::new(&self.metrics, partition),
         )))
     }
 
-    fn fmt_as(
-        &self,
-        _t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "format=iceberg",)?;
-        write!(f, ", projection=[{}]", self.projection.join(", "))?;
-        if let Some(predicate) = &self.predicate {
-            write!(f, ", predicate={predicate}")?;
-        }
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "format=iceberg")?;
+        self.task_source.fmt_as(f)?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
@@ -242,15 +340,24 @@ impl DataSource for IcebergDataSource {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        Partitioning::UnknownPartitioning(self.task_source.partition_count())
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
         EquivalenceProperties::new(self.schema.clone())
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        if let Some(partition) = partition
+            && partition >= self.task_source.partition_count()
+        {
+            return internal_err!("Iceberg scan partition {partition} does not exist");
+        }
         Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.metrics.clone()
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -271,41 +378,9 @@ impl DataSource for IcebergDataSource {
     }
 }
 
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
-    table: Table,
-    snapshot_id: Option<i64>,
-    column_names: Option<Vec<String>>,
-    predicate: Option<Predicate>,
-    enable_page_index: bool,
-    batch_size: usize,
-) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
-        None => scan_builder.select_all(),
-    };
-    if let Some(predicate) = predicate {
-        scan_builder = scan_builder.with_filter(predicate);
+fn validate_partition_count(task_source: &impl FileScanTaskSource) -> Result<()> {
+    if task_source.partition_count() == 0 {
+        return internal_err!("Iceberg task source requires at least one partition");
     }
-    let table_scan = scan_builder
-        .with_row_selection_enabled(enable_page_index)
-        .with_batch_size(Some(batch_size))
-        .build()
-        .map_err(to_datafusion_error)?;
-
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
+    Ok(())
 }
