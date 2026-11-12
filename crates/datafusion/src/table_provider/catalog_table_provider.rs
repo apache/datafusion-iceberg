@@ -479,6 +479,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_scan_drops_conjuncts_that_do_not_bind() {
+        use iceberg::expr::{Predicate, Reference};
+        use iceberg::spec::Datum;
+
+        let (catalog, namespace, table_name, _temp_dir) =
+            get_test_catalog_and_table().await;
+        let table_ident = TableIdent::new(namespace, table_name);
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let schema =
+            Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
+        let id = Reference::new("id").equal_to(Datum::int(1));
+        let name = Reference::new("name").equal_to(Datum::string("a"));
+        // Stands for any predicate Iceberg cannot bind, such as a null test on a
+        // struct column.
+        let unbound = Reference::new("missing").is_null();
+        let source = |predicate: Predicate| {
+            IcebergDataSource::builder(table.clone(), schema.clone())
+                .with_predicate(Some(predicate))
+                .build()
+                .unwrap()
+        };
+
+        let both = id.clone().and(unbound.clone()).and(name.clone());
+        assert_eq!(
+            source(both).predicate(),
+            Some(&id.clone().and(name.clone()))
+        );
+        assert_eq!(source(unbound.clone()).predicate(), None);
+        // Only the top level is split: an `OR` with a side that does not bind is
+        // dropped whole.
+        assert_eq!(source(id.clone().or(unbound)).predicate(), None);
+        assert_eq!(source(id.clone()).predicate(), Some(&id));
+    }
+
     async fn get_test_catalog_and_table()
     -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
         let temp_dir = TempDir::new().unwrap();

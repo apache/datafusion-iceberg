@@ -31,7 +31,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
 use futures::{Stream, TryStreamExt};
-use iceberg::expr::Predicate;
+use iceberg::expr::{Bind, Predicate};
+use iceberg::spec::SchemaRef;
 use iceberg::table::Table;
 
 use super::predicate::convert_filters_to_predicate;
@@ -127,6 +128,11 @@ impl IcebergDataSourceBuilder {
     }
 
     /// Filters the scan with `predicate`, or not at all if `None` (the default).
+    ///
+    /// The top-level conjuncts of `predicate` that do not bind to the schema of the
+    /// snapshot being scanned are dropped in [`Self::build`], as Iceberg would fail
+    /// the scan on them. A null test on a struct, list or map column is one:
+    /// Iceberg binds references to primitive fields only.
     pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
         self.predicate = predicate;
         self
@@ -149,8 +155,16 @@ impl IcebergDataSourceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the projection is out of bounds for the schema.
+    /// Returns an error if the projection is out of bounds for the schema, or if
+    /// the scanned snapshot's schema cannot be read.
     pub fn build(self) -> Result<IcebergDataSource> {
+        let predicate = match self.predicate {
+            Some(predicate) => bindable_conjuncts(
+                predicate,
+                &scan_schema(&self.table, self.snapshot_id)?,
+            ),
+            None => None,
+        };
         let schema = match &self.projection {
             None => self.schema,
             Some(projection) => Arc::new(self.schema.project(projection)?),
@@ -165,9 +179,49 @@ impl IcebergDataSourceBuilder {
             snapshot_id: self.snapshot_id,
             schema,
             projection,
-            predicate: self.predicate,
+            predicate,
             fetch: self.fetch,
         })
+    }
+}
+
+/// The schema the scan binds its predicate to: that of the snapshot it reads, or
+/// the table's current schema if the snapshot is missing (the scan reports that).
+fn scan_schema(table: &Table, snapshot_id: Option<i64>) -> Result<SchemaRef> {
+    let metadata = table.metadata();
+    let snapshot = match snapshot_id {
+        Some(id) => metadata.snapshot_by_id(id),
+        None => metadata.current_snapshot(),
+    };
+    match snapshot {
+        Some(snapshot) => snapshot.schema(metadata).map_err(to_datafusion_error),
+        None => Ok(metadata.current_schema().clone()),
+    }
+}
+
+/// The top-level conjuncts of `predicate` that bind to `schema`, combined with
+/// `AND`, or `None` if none do.
+///
+/// Dropping a conjunct only lets the scan return more rows, and every filter is
+/// pushed down as `Inexact`, so DataFusion still applies it above the scan.
+fn bindable_conjuncts(predicate: Predicate, schema: &SchemaRef) -> Option<Predicate> {
+    let mut conjuncts = Vec::new();
+    split_conjunction(&predicate, &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .filter(|conjunct| conjunct.bind(schema.clone(), true).is_ok())
+        .cloned()
+        .reduce(Predicate::and)
+}
+
+fn split_conjunction<'a>(predicate: &'a Predicate, conjuncts: &mut Vec<&'a Predicate>) {
+    match predicate {
+        Predicate::And(and) => {
+            for input in and.inputs() {
+                split_conjunction(input, conjuncts);
+            }
+        }
+        _ => conjuncts.push(predicate),
     }
 }
 
