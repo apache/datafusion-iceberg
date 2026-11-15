@@ -29,6 +29,7 @@ use datafusion::physical_plan::DisplayFormatType;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::StreamExt;
 use iceberg::arrow::ArrowReader;
+use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 
 use super::file_planning::PlannedFileScan;
@@ -43,6 +44,7 @@ pub struct EagerIcebergDataSource {
     schema: SchemaRef,
     fetch: Option<usize>,
     reader: ScanReader,
+    file_io: FileIO,
     files: Arc<PlannedFileScan>,
     partitions: Arc<[Vec<usize>]>,
 }
@@ -60,35 +62,42 @@ impl EagerIcebergDataSource {
         schema: SchemaRef,
         files: PlannedFileScan,
         groups: Vec<Vec<usize>>,
+        file_io: FileIO,
         reader: ArrowReader,
         fetch: Option<usize>,
     ) -> Self {
         Self {
             schema,
             fetch,
+            file_io,
             files: Arc::new(files),
             partitions: groups.into(),
             reader: ScanReader::new(reader),
         }
     }
 
-    /// Construct a scan from already selected files grouped by local output partition.
-    /// Preserves group order without discovering, pruning, or assigning files.
-    /// The caller supplies a process-local reader configured for these files. Reader
-    /// clones share its delete cache across partitions; regrouping preserves its
-    /// settings, including file concurrency. The schema must match the tasks' projection.
-    /// Descriptors are charged to `context`'s memory pool; statistics are unknown.
-    ///
-    /// # Errors
-    /// Returns an error if there are no partition groups or memory reservation fails.
-    /// Empty groups are valid, including for an empty scan.
-    pub fn from_file_groups(
+    pub(crate) fn from_file_groups(
         schema: SchemaRef,
         groups: Vec<Vec<FileScanTask>>,
+        file_io: FileIO,
         reader: ArrowReader,
         fetch: Option<usize>,
         context: &TaskContext,
     ) -> Result<Self> {
+        let (tasks, partitions) = Self::flatten_groups(groups)?;
+        Ok(Self::from_planned_files(
+            schema,
+            PlannedFileScan::from_tasks(tasks, context)?,
+            partitions,
+            file_io,
+            reader,
+            fetch,
+        ))
+    }
+
+    fn flatten_groups(
+        groups: Vec<Vec<FileScanTask>>,
+    ) -> Result<(Vec<FileScanTask>, Vec<Vec<usize>>)> {
         if groups.is_empty() {
             return exec_err!("Iceberg scan requires at least one file group");
         }
@@ -99,13 +108,7 @@ impl EagerIcebergDataSource {
             tasks.extend(group);
             partitions.push((start..tasks.len()).collect());
         }
-        Ok(Self {
-            schema,
-            fetch,
-            reader: ScanReader::new(reader),
-            files: Arc::new(PlannedFileScan::from_tasks(tasks, context)?),
-            partitions: partitions.into(),
-        })
+        Ok((tasks, partitions))
     }
 
     /// Output schema, including the scan's projection.
@@ -113,27 +116,22 @@ impl EagerIcebergDataSource {
         &self.schema
     }
 
-    /// Borrow this scan's files in retained-file order, independent of partition groups.
-    /// Positions in this iterator are the inputs to [`Self::with_file_groups`].
-    /// This sorts file indices, without cloning descriptors or performing I/O.
-    /// File iteration order does not promise row ordering.
-    pub fn planned_files(&self) -> impl ExactSizeIterator<Item = &FileScanTask> {
-        self.file_indices()
-            .into_iter()
-            .map(|index| &self.files.tasks()[index])
+    /// File access associated with this source's reader, for reconstruction.
+    pub fn file_io(&self) -> &FileIO {
+        &self.file_io
     }
 
-    fn file_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<_> = self.partitions.iter().flatten().copied().collect();
-        indices.sort_unstable();
-        indices
+    /// Borrow all retained file tasks. Iteration does not promise row ordering.
+    /// Use [`Self::planned_partition_files`] to inspect partition membership.
+    pub fn planned_files(&self) -> impl ExactSizeIterator<Item = &FileScanTask> {
+        self.files.tasks().iter()
     }
 
     /// Borrow the files that execution will read for one local partition.
     ///
     /// # Errors
     /// Returns an error for an out-of-bounds partition.
-    pub fn planned_partition_tasks(
+    pub fn planned_partition_files(
         &self,
         partition: usize,
     ) -> Result<impl ExactSizeIterator<Item = &FileScanTask>> {
@@ -143,33 +141,24 @@ impl EagerIcebergDataSource {
         Ok(indices.iter().map(|&index| &self.files.tasks()[index]))
     }
 
-    /// Derive a scan using positions in this source's [`Self::planned_files`] iterator.
-    /// Each group is one local output partition; supplied order is preserved.
-    /// Files may be omitted, but each position may appear at most once.
+    /// Replace the planned files, preserving the supplied local partitions and order.
+    /// Empty partitions are valid. Repeated tasks are not deduplicated;
+    /// the caller is responsible for avoiding unwanted duplicate work and ensuring
+    /// tasks match this source's projected schema and file access.
     ///
-    /// The result shares descriptors and their memory reservation with this source.
-    /// It has fresh metrics and unknown statistics because its file set may differ.
-    /// No file discovery, assignment policy, or file I/O is performed.
+    /// Preserves fetch and reader settings, including the shared delete loader.
+    /// Returns fresh metrics and unknown statistics without discovery or file I/O.
+    /// The owned descriptors have an independent reservation in the same query pool;
+    /// cloning tasks from this source therefore requires additional query memory.
     ///
     /// # Errors
-    /// Returns an error for zero groups, out-of-bounds positions, or repeated positions.
-    pub fn with_file_groups(&self, mut groups: Vec<Vec<usize>>) -> Result<Self> {
-        if groups.is_empty() {
-            return exec_err!("Iceberg scan requires at least one file group");
-        }
-        let indices = self.file_indices();
-        let mut used = vec![false; indices.len()];
-        for position in groups.iter_mut().flatten() {
-            let Some(&index) = indices.get(*position) else {
-                return exec_err!("Invalid Iceberg file position {}", *position);
-            };
-            if std::mem::replace(&mut used[*position], true) {
-                return exec_err!("Repeated Iceberg file position {}", *position);
-            }
-            *position = index;
-        }
+    /// Returns an error for zero groups or insufficient query memory.
+    pub fn with_planned_files(&self, groups: Vec<Vec<FileScanTask>>) -> Result<Self> {
+        let (tasks, partitions) = Self::flatten_groups(groups)?;
+        let files = self.files.with_tasks(tasks)?;
         let mut source = self.clone();
-        source.partitions = groups.into();
+        source.files = Arc::new(files);
+        source.partitions = partitions.into();
         source.reader.metrics = Default::default();
         Ok(source)
     }
@@ -186,7 +175,7 @@ impl DataSource for EagerIcebergDataSource {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let count = self.planned_partition_tasks(partition)?.len();
+        let count = self.planned_partition_files(partition)?.len();
         let source = self.clone();
         let tasks = futures::stream::iter(0..count)
             .map(move |offset| {

@@ -65,6 +65,18 @@ impl PlannedFileScan {
         Ok(planned)
     }
 
+    /// Own a replacement assignment, charging it independently to the same pool.
+    pub(crate) fn with_tasks(&self, tasks: Vec<FileScanTask>) -> Result<Self> {
+        let mut planned = Self {
+            tasks: Vec::new(),
+            _reservation: self._reservation.new_empty(),
+        };
+        for task in tasks {
+            planned.push(task)?;
+        }
+        Ok(planned)
+    }
+
     pub(crate) async fn collect(scan: TableScan, context: &TaskContext) -> Result<Self> {
         let mut planned = Self::new(context);
         let mut stream = scan.plan_files().await.map_err(to_datafusion_error)?;

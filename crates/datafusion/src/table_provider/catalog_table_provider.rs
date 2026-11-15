@@ -34,7 +34,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use crate::IcebergPlanningConfig;
+use crate::IcebergDataFusionConfig;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
 use crate::read::IcebergDataSource;
@@ -147,8 +147,8 @@ impl TableProvider for IcebergCatalogTableProvider {
         if state
             .config_options()
             .extensions
-            .get::<IcebergPlanningConfig>()
-            .is_some_and(|config| config.eager_file_planning)
+            .get::<IcebergDataFusionConfig>()
+            .is_some_and(|config| config.execution.eager_file_planning)
         {
             Ok(DataSourceExec::from_data_source(
                 source.build_eager(state.task_ctx()).await?,

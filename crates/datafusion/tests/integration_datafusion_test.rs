@@ -52,7 +52,7 @@ use iceberg_datafusion::metadata::{
 use iceberg_datafusion::read::IcebergDataSource;
 use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
-    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergPlanningConfig,
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergDataFusionConfig,
     IcebergStaticTableProvider,
 };
 use tempfile::TempDir;
@@ -1266,8 +1266,8 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(1)
-                .with_option_extension(IcebergPlanningConfig::default())
-                .set_bool("iceberg.eager_file_planning", eager),
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", eager),
         );
         let plan = provider.scan(&ctx.state(), None, &[], None).await?;
         assert_eq!(plan.schema(), provider.schema());

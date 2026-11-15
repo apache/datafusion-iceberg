@@ -54,24 +54,51 @@ pub struct IcebergTestHarness {
 
 impl IcebergTestHarness {
     pub async fn new() -> Result<Self> {
-        Self::with_config(SessionConfig::new().with_target_partitions(16)).await
+        Self::builder().build().await
     }
 
-    pub async fn with_config(config: SessionConfig) -> Result<Self> {
-        Self::build(config, None).await
+    pub fn builder() -> IcebergTestHarnessBuilder {
+        IcebergTestHarnessBuilder {
+            config: SessionConfig::new().with_target_partitions(16),
+            runtime_env: None,
+        }
     }
 
-    pub async fn with_config_and_runtime(
-        config: SessionConfig,
-        runtime_env: Arc<RuntimeEnv>,
-    ) -> Result<Self> {
-        Self::build(config, Some(runtime_env)).await
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
     }
 
-    async fn build(
-        config: SessionConfig,
-        runtime_env: Option<Arc<RuntimeEnv>>,
-    ) -> Result<Self> {
+    pub async fn query(&self, sql: &str) -> Result<(String, String)> {
+        let dataframe: DataFrame = self.ctx.sql(sql).await?;
+        let plan = dataframe.create_physical_plan().await?;
+        let plan_display = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = collect(plan, Arc::new(dataframe.task_ctx())).await?;
+
+        Ok((plan_display, pretty_format_batches(&batches)?.to_string()))
+    }
+}
+
+pub struct IcebergTestHarnessBuilder {
+    config: SessionConfig,
+    runtime_env: Option<Arc<RuntimeEnv>>,
+}
+
+impl IcebergTestHarnessBuilder {
+    pub fn with_config(mut self, config: SessionConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
+        self.runtime_env = Some(runtime_env);
+        self
+    }
+
+    pub async fn build(self) -> Result<IcebergTestHarness> {
+        let Self {
+            config,
+            runtime_env,
+        } = self;
         let storage_factory: Arc<dyn StorageFactory> =
             Arc::new(FixtureStorageFactory::default());
         let builder = SessionStateBuilder::new()
@@ -121,20 +148,7 @@ impl IcebergTestHarness {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
 
-        Ok(Self { ctx })
-    }
-
-    pub fn context(&self) -> &SessionContext {
-        &self.ctx
-    }
-
-    pub async fn query(&self, sql: &str) -> Result<(String, String)> {
-        let dataframe: DataFrame = self.ctx.sql(sql).await?;
-        let plan = dataframe.create_physical_plan().await?;
-        let plan_display = displayable(plan.as_ref()).indent(true).to_string();
-        let batches = collect(plan, Arc::new(dataframe.task_ctx())).await?;
-
-        Ok((plan_display, pretty_format_batches(&batches)?.to_string()))
+        Ok(IcebergTestHarness { ctx })
     }
 }
 
