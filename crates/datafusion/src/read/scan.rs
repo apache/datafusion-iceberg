@@ -36,7 +36,7 @@ use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
 use iceberg::table::Table;
 
 use super::eager::EagerIcebergDataSource;
-use super::file_planning::PlannedFileScan;
+use super::file_planning::{PlannedFileScan, flatten_groups};
 use super::predicate::convert_filters_to_predicate;
 use super::reader::ScanReader;
 use crate::to_datafusion_error;
@@ -225,14 +225,16 @@ impl IcebergDataSourceBuilder {
                 "Planned Iceberg files cannot use discovery projection, snapshot or predicate settings"
             );
         }
-        EagerIcebergDataSource::from_file_groups(
+        let (tasks, partitions) = flatten_groups(groups)?;
+        let files = PlannedFileScan::from_tasks(tasks, context)?;
+        Ok(EagerIcebergDataSource::from_planned_files(
             self.schema,
-            groups,
+            files,
+            partitions,
             file_io,
             self.reader.expect("planned input always supplies a reader"),
             self.fetch,
-            context,
-        )
+        ))
     }
 
     /// Use an explicitly configured reader, preserving its settings in both modes.

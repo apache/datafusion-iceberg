@@ -32,7 +32,7 @@ use iceberg::arrow::ArrowReader;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 
-use super::file_planning::PlannedFileScan;
+use super::file_planning::{PlannedFileScan, flatten_groups};
 use super::reader::ScanReader;
 
 /// An Iceberg scan whose complete file assignment is available before execution.
@@ -74,41 +74,6 @@ impl EagerIcebergDataSource {
             partitions: groups.into(),
             reader: ScanReader::new(reader),
         }
-    }
-
-    pub(crate) fn from_file_groups(
-        schema: SchemaRef,
-        groups: Vec<Vec<FileScanTask>>,
-        file_io: FileIO,
-        reader: ArrowReader,
-        fetch: Option<usize>,
-        context: &TaskContext,
-    ) -> Result<Self> {
-        let (tasks, partitions) = Self::flatten_groups(groups)?;
-        Ok(Self::from_planned_files(
-            schema,
-            PlannedFileScan::from_tasks(tasks, context)?,
-            partitions,
-            file_io,
-            reader,
-            fetch,
-        ))
-    }
-
-    fn flatten_groups(
-        groups: Vec<Vec<FileScanTask>>,
-    ) -> Result<(Vec<FileScanTask>, Vec<Vec<usize>>)> {
-        if groups.is_empty() {
-            return exec_err!("Iceberg scan requires at least one file group");
-        }
-        let mut tasks = Vec::new();
-        let mut partitions = Vec::with_capacity(groups.len());
-        for group in groups {
-            let start = tasks.len();
-            tasks.extend(group);
-            partitions.push((start..tasks.len()).collect());
-        }
-        Ok((tasks, partitions))
     }
 
     /// Output schema, including the scan's projection.
@@ -154,7 +119,7 @@ impl EagerIcebergDataSource {
     /// # Errors
     /// Returns an error for zero groups or insufficient query memory.
     pub fn with_planned_files(&self, groups: Vec<Vec<FileScanTask>>) -> Result<Self> {
-        let (tasks, partitions) = Self::flatten_groups(groups)?;
+        let (tasks, partitions) = flatten_groups(groups)?;
         let files = self.files.with_tasks(tasks)?;
         let mut source = self.clone();
         source.files = Arc::new(files);

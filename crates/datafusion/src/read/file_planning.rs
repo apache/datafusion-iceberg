@@ -17,7 +17,7 @@
 
 use std::mem::{size_of, size_of_val};
 
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use futures::TryStreamExt;
@@ -85,6 +85,23 @@ impl PlannedFileScan {
         }
         Ok(planned)
     }
+}
+
+/// Retain supplied file and partition order, including empty partitions.
+pub(super) fn flatten_groups(
+    groups: Vec<Vec<FileScanTask>>,
+) -> Result<(Vec<FileScanTask>, Vec<Vec<usize>>)> {
+    if groups.is_empty() {
+        return exec_err!("Iceberg scan requires at least one file group");
+    }
+    let mut tasks = Vec::new();
+    let mut partitions = Vec::with_capacity(groups.len());
+    for group in groups {
+        let start = tasks.len();
+        tasks.extend(group);
+        partitions.push((start..tasks.len()).collect());
+    }
+    Ok((tasks, partitions))
 }
 
 fn retained_size(task: &FileScanTask) -> usize {
