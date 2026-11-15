@@ -56,7 +56,8 @@ pub struct IcebergDataSource {
     predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
-    reader: ScanReader,
+    reader: Option<ArrowReader>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for IcebergDataSource {
@@ -317,7 +318,17 @@ impl IcebergDataSourceBuilder {
             .max(1)
             .min(context.session_config().target_partitions().max(1));
         let reader = self.reader.unwrap_or_else(|| {
-            let reader = table.reader_builder();
+            let reader = table
+                .reader_builder()
+                .with_batch_size(context.session_config().batch_size())
+                .with_row_selection_enabled(
+                    context
+                        .session_config()
+                        .options()
+                        .execution
+                        .parquet
+                        .enable_page_index,
+                );
             let reader = if partitions > 1 {
                 reader.with_data_file_concurrency_limit(1)
             } else {
@@ -355,10 +366,6 @@ impl IcebergDataSourceBuilder {
                 "Planned Iceberg files require build_planned or build_eager"
             );
         };
-        let reader = ScanReader::new(
-            self.reader
-                .unwrap_or_else(|| table.reader_builder().build()),
-        );
         Ok(IcebergDataSource {
             table,
             snapshot_id: self.snapshot_id,
@@ -366,7 +373,8 @@ impl IcebergDataSourceBuilder {
             projection,
             predicate: self.predicate,
             fetch: self.fetch,
-            reader,
+            reader: self.reader,
+            metrics: Default::default(),
         })
     }
 
@@ -389,7 +397,7 @@ impl DataSource for IcebergDataSource {
     fn open(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return internal_err!("Iceberg scan partition {partition} does not exist");
@@ -403,8 +411,25 @@ impl DataSource for IcebergDataSource {
         let tasks: FileScanTaskStream = Box::pin(
             futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
         );
-        self.reader
-            .open(tasks, self.schema.clone(), self.fetch, partition)
+        // Construct the default reader here to use this execution's session
+        // options. Explicit readers keep their own settings.
+        let arrow_reader = self.reader.clone().unwrap_or_else(|| {
+            self.table
+                .reader_builder()
+                .with_batch_size(context.session_config().batch_size())
+                .with_row_selection_enabled(
+                    context
+                        .session_config()
+                        .options()
+                        .execution
+                        .parquet
+                        .enable_page_index,
+                )
+                .build()
+        });
+        let mut reader = ScanReader::new(arrow_reader);
+        reader.metrics = self.metrics.clone();
+        reader.open(tasks, self.schema.clone(), self.fetch, partition)
     }
 
     fn fmt_as(
@@ -429,7 +454,7 @@ impl DataSource for IcebergDataSource {
     }
 
     fn metrics(&self) -> ExecutionPlanMetricsSet {
-        self.reader.metrics.clone()
+        self.metrics.clone()
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {

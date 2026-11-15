@@ -145,16 +145,6 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
                 _ => TransformedResult::NotTransformed,
             }
         }
-        Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32
-                || *c.field.data_type() == DataType::Date64
-            {
-                // Casts to date truncate the expression, we cannot simply extract it as it
-                // can create erroneous predicates.
-                return TransformedResult::NotTransformed;
-            }
-            to_iceberg_predicate(&c.expr)
-        }
         Expr::Like(Like {
             negated,
             expr,
@@ -165,7 +155,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             // Only support simple prefix patterns (e.g., 'prefix%')
             // Note: Iceberg's StartsWith operator is case-sensitive, so we cannot
             // push down case-insensitive LIKE (ILIKE) patterns
-            // Escape characters are also not supported for pushdown
+            // An explicit ESCAPE clause is also not supported for pushdown
             if escape_char.is_some() || *case_insensitive {
                 return TransformedResult::NotTransformed;
             }
@@ -180,12 +170,7 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             };
 
             // Check if it's a simple prefix pattern (ends with % and no other wildcards)
-            if pattern_str.ends_with('%')
-                && !pattern_str[..pattern_str.len() - 1].contains(['%', '_'])
-            {
-                // Extract the prefix (remove trailing %)
-                let prefix = pattern_str[..pattern_str.len() - 1].to_string();
-
+            if let Some(prefix) = like_prefix(&pattern_str) {
                 // Get the column reference
                 let column = match to_iceberg_predicate(expr) {
                     TransformedResult::Column(r) => r,
@@ -210,6 +195,24 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
         }
         _ => TransformedResult::NotTransformed,
     }
+}
+
+/// Returns the literal prefix of a `prefix%` LIKE pattern, or `None` for any other
+/// pattern. Without an `ESCAPE` clause, DataFusion and Arrow treat `\` as an escape
+/// character: `\c` matches a literal `c`, and a trailing `\` matches itself. The prefix
+/// is unescaped the same way, and an escaped trailing `%` is not a wildcard.
+fn like_prefix(pattern: &str) -> Option<String> {
+    let mut prefix = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => prefix.push(chars.next().unwrap_or('\\')),
+            '%' => return chars.as_str().is_empty().then_some(prefix),
+            '_' => return None,
+            c => prefix.push(c),
+        }
+    }
+    None
 }
 
 fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
@@ -260,7 +263,6 @@ fn scalar_function_to_iceberg_predicate(
 ///
 /// * negation: `-x` is NaN iff `x` is NaN
 /// * `abs(x)`: `abs(x)` is NaN iff `x` is NaN
-/// * casts between numeric types preserve NaN
 /// * `x + c`, `c + x`, `x - c`, `c - x` for a finite literal `c`
 /// * `x * c`, `c * x`, `x / c` for a finite, non-zero literal `c`
 ///
@@ -272,16 +274,6 @@ fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),
         Expr::Negative(inner) => resolve_nan_preserving_reference(inner),
-        Expr::Cast(cast) => {
-            // Casts to date truncate the value and are not numeric, so they
-            // cannot be treated as NaN-preserving.
-            if *cast.field.data_type() == DataType::Date32
-                || *cast.field.data_type() == DataType::Date64
-            {
-                return None;
-            }
-            resolve_nan_preserving_reference(&cast.expr)
-        }
         Expr::ScalarFunction(ScalarFunction { func, args })
             if func.name() == "abs" && args.len() == 1 =>
         {
@@ -449,10 +441,21 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         // DataFusion's type coercion always converts them to match the column type
         // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
         // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => {
+        ScalarValue::TimestampMicrosecond(Some(v), None) => {
             Some(Datum::timestamp_micros(*v))
         }
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), None) => {
+            Some(Datum::timestamp_nanos(*v))
+        }
+        // Note: Arrow stores tz-aware timestamps as UTC epoch values; the tz
+        // only affects display. The same is true for iceberg's tz-aware datum
+        // types.
+        ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => {
+            Some(Datum::timestamptz_micros(*v))
+        }
+        ScalarValue::TimestampNanosecond(Some(v), Some(_)) => {
+            Some(Datum::timestamptz_nanos(*v))
+        }
         _ => None,
     }
 }
@@ -660,18 +663,14 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_cast() {
-        let sql = "ts >= timestamp '2023-01-05T00:00:00'";
-        let predicate = convert_to_iceberg_predicate(sql).unwrap();
-        let expected_predicate = Reference::new("ts")
-            .greater_than_or_equal_to(Datum::string("2023-01-05T00:00:00"));
-        assert_eq!(predicate, expected_predicate);
-    }
-
-    #[test]
-    fn test_predicate_conversion_with_date_cast() {
-        let sql = "ts >= date '2023-01-05T11:00:00'";
-        let predicate = convert_to_iceberg_predicate(sql);
-        assert_eq!(predicate, None);
+        for sql in [
+            "ts >= timestamp '2023-01-05T00:00:00'",
+            "ts >= date '2023-01-05T11:00:00'",
+            "cast(foo as varchar) < '5'",
+            "not isnan(cast(bar as double))",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "sql: {sql}");
+        }
     }
 
     #[test]
@@ -693,6 +692,18 @@ mod tests {
             None,
         ));
         assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
+
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(
+            Some(ts_micros),
+            Some("+01:00".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_micros(ts_micros)));
+
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(
+            Some(ts_nanos),
+            Some("UTC".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_nanos(ts_nanos)));
 
         // Test None timestamp
         let datum =
@@ -855,6 +866,55 @@ mod tests {
         assert_eq!(
             predicate,
             Reference::new("bar").starts_with(Datum::string("测试"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_trailing_percent() {
+        // 'a\%' matches only the literal string "a%", so it is not a prefix pattern
+        let sql = r"bar LIKE 'a\%'";
+        let predicate = convert_to_iceberg_predicate(sql);
+        assert_eq!(predicate, None);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_wildcards_in_prefix() {
+        let sql = r"bar LIKE 'a\%b\_c%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string("a%b_c"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_backslash() {
+        let sql = r"bar LIKE 'a\\%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string(r"a\"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escaped_regular_character() {
+        // An escaped character that isn't a wildcard matches itself
+        let sql = r"bar LIKE 'a\b%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").starts_with(Datum::string("ab"))
+        );
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_not_like_escaped_prefix() {
+        let sql = r"bar NOT LIKE 'a\%%'";
+        let predicate = convert_to_iceberg_predicate(sql).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("bar").not_starts_with(Datum::string("a%"))
         );
     }
 

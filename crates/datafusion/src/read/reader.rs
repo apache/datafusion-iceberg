@@ -27,7 +27,8 @@ use iceberg::scan::FileScanTaskStream;
 
 use crate::to_datafusion_error;
 
-/// One reader per source; clones share the Iceberg delete loader across partitions.
+/// Executes file tasks with the source's metrics. Clones share the Iceberg
+/// reader's delete loader across partitions.
 #[derive(Clone)]
 pub(crate) struct ScanReader {
     reader: ArrowReader,

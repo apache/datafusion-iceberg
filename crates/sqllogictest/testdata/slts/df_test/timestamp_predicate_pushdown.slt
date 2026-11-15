@@ -181,3 +181,92 @@ CREATE TABLE default.default.test_timestamp_millis (id INT NOT NULL, ts TIMESTAM
 # This should fail because Iceberg doesn't support second precision
 statement error (?s)DataFusion error: IcebergError\(DataInvalid\).*Unsupported Arrow data type: Timestamp\(s\)
 CREATE TABLE default.default.test_timestamp_seconds (id INT NOT NULL, ts TIMESTAMP(0))
+
+# Without this, `TIMESTAMP WITH TIME ZONE` in `CREATE TABLE` ends up as a normal
+# timestamp column.
+statement ok
+SET datafusion.execution.time_zone = 'UTC'
+
+statement ok
+CREATE TABLE default.default.test_timestamptz (id INT NOT NULL, ts_us TIMESTAMP(6) WITH TIME ZONE, ts_ns TIMESTAMP WITH TIME ZONE, ts_naive TIMESTAMP)
+
+query I
+INSERT INTO default.default.test_timestamptz VALUES
+  (1, '2023-01-04T12:00:00+00:00'::TIMESTAMPTZ, '2023-01-04T12:00:00+00:00'::TIMESTAMPTZ, CAST('2023-01-04 12:00:00' AS TIMESTAMP)),
+  (2, '2023-01-06T12:00:00+00:00'::TIMESTAMPTZ, '2023-01-06T12:00:00+00:00'::TIMESTAMPTZ, CAST('2023-01-06 12:00:00' AS TIMESTAMP))
+----
+2
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_timestamptz WHERE ts_us > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+logical_plan
+01)Projection: default.default.test_timestamptz.id
+02)--Filter: default.default.test_timestamptz.ts_us > TimestampMicrosecond(1672876800000000, Some("+00:00"))
+03)----TableScan: default.default.test_timestamptz projection=[id, ts_us], partial_filters=[default.default.test_timestamptz.ts_us > TimestampMicrosecond(1672876800000000, Some("+00:00"))]
+physical_plan
+01)FilterExec: ts_us@1 > 1672876800000000, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, ts_us], predicate=ts_us > 2023-01-05 00:00:00 UTC
+
+query I
+SELECT id FROM default.default.test_timestamptz WHERE ts_us > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+2
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_timestamptz WHERE ts_ns > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+logical_plan
+01)Projection: default.default.test_timestamptz.id
+02)--Filter: default.default.test_timestamptz.ts_ns > TimestampNanosecond(1672876800000000000, Some("+00:00"))
+03)----TableScan: default.default.test_timestamptz projection=[id, ts_ns], partial_filters=[default.default.test_timestamptz.ts_ns > TimestampNanosecond(1672876800000000000, Some("+00:00"))]
+physical_plan
+01)FilterExec: ts_ns@1 > 1672876800000000000, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, ts_ns], predicate=ts_ns > 2023-01-05 00:00:00 UTC
+
+query I
+SELECT id FROM default.default.test_timestamptz WHERE ts_ns > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+2
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_timestamptz WHERE ts_us > CAST('2023-01-05 00:00:00' AS TIMESTAMP)
+----
+logical_plan
+01)Projection: default.default.test_timestamptz.id
+02)--Filter: default.default.test_timestamptz.ts_us > TimestampMicrosecond(1672876800000000, Some("+00:00"))
+03)----TableScan: default.default.test_timestamptz projection=[id, ts_us], partial_filters=[default.default.test_timestamptz.ts_us > TimestampMicrosecond(1672876800000000, Some("+00:00"))]
+physical_plan
+01)FilterExec: ts_us@1 > 1672876800000000, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, ts_us], predicate=ts_us > 2023-01-05 00:00:00 UTC
+
+query I
+SELECT id FROM default.default.test_timestamptz WHERE ts_us > CAST('2023-01-05 00:00:00' AS TIMESTAMP)
+----
+2
+
+query TT
+EXPLAIN SELECT id FROM default.default.test_timestamptz WHERE ts_naive > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+logical_plan
+01)Projection: default.default.test_timestamptz.id
+02)--Filter: default.default.test_timestamptz.ts_naive > TimestampNanosecond(1672876800000000000, None)
+03)----TableScan: default.default.test_timestamptz projection=[id, ts_naive], partial_filters=[default.default.test_timestamptz.ts_naive > TimestampNanosecond(1672876800000000000, None)]
+physical_plan
+01)FilterExec: ts_naive@1 > 1672876800000000000, projection=[id@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+03)----DataSourceExec: format=iceberg, projection=[id, ts_naive], predicate=ts_naive > 2023-01-05 00:00:00
+
+query I
+SELECT id FROM default.default.test_timestamptz WHERE ts_naive > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ
+----
+2
+
+statement ok
+DROP TABLE default.default.test_timestamptz
+
+statement ok
+RESET datafusion.execution.time_zone
