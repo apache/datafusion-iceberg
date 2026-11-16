@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::iter::Flatten;
 use std::mem::{size_of, size_of_val};
+use std::slice::Iter;
 
 use datafusion::common::{Result, exec_err};
 use datafusion::execution::TaskContext;
@@ -25,84 +27,131 @@ use iceberg::scan::{FileScanTask, TableScan};
 
 use crate::to_datafusion_error;
 
-/// File work retained by a query after manifest planning and before execution.
-/// Shared by task-local sources so their descriptors and reservation have one owner.
+/// File groups and their descriptor reservation share one lifetime. Each group is
+/// one output partition; supplied group order and empty partitions are retained.
 #[derive(Debug)]
 pub(crate) struct PlannedFileScan {
-    tasks: Vec<FileScanTask>,
+    groups: Vec<Vec<FileScanTask>>,
     _reservation: MemoryReservation,
 }
 
 impl PlannedFileScan {
-    pub(crate) fn tasks(&self) -> &[FileScanTask] {
-        &self.tasks
+    pub(crate) fn tasks(&self) -> impl ExactSizeIterator<Item = &FileScanTask> {
+        PlannedFiles {
+            inner: self.groups.iter().flatten(),
+            remaining: self.groups.iter().map(Vec::len).sum(),
+        }
     }
 
-    fn new(context: &TaskContext) -> Self {
+    pub(crate) fn groups(&self) -> &[Vec<FileScanTask>] {
+        &self.groups
+    }
+
+    pub(super) fn new(context: &TaskContext) -> Self {
         Self {
-            tasks: Vec::new(),
+            groups: Vec::new(),
             _reservation: MemoryConsumer::new("Iceberg file planning")
                 .register(context.memory_pool()),
         }
     }
 
-    fn push(&mut self, task: FileScanTask) -> Result<()> {
-        // Include owned paths/delete references and allow room for Vec capacity.
-        self._reservation
-            .try_grow(retained_size(&task).saturating_mul(2))?;
-        self.tasks.push(task);
-        Ok(())
-    }
-
-    pub(crate) fn from_tasks(
-        tasks: Vec<FileScanTask>,
+    pub(crate) fn from_groups(
+        groups: Vec<Vec<FileScanTask>>,
         context: &TaskContext,
     ) -> Result<Self> {
-        let mut planned = Self::new(context);
-        for task in tasks {
-            planned.push(task)?;
-        }
-        Ok(planned)
+        Self::reserve_groups(
+            groups,
+            MemoryConsumer::new("Iceberg file planning").register(context.memory_pool()),
+        )
     }
 
     /// Own a replacement assignment, charging it independently to the same pool.
-    pub(crate) fn with_tasks(&self, tasks: Vec<FileScanTask>) -> Result<Self> {
-        let mut planned = Self {
-            tasks: Vec::new(),
-            _reservation: self._reservation.new_empty(),
-        };
-        for task in tasks {
-            planned.push(task)?;
-        }
-        Ok(planned)
+    pub(crate) fn with_groups(&self, groups: Vec<Vec<FileScanTask>>) -> Result<Self> {
+        Self::reserve_groups(groups, self._reservation.new_empty())
     }
 
-    pub(crate) async fn collect(scan: TableScan, context: &TaskContext) -> Result<Self> {
-        let mut planned = Self::new(context);
+    fn reserve_groups(
+        mut groups: Vec<Vec<FileScanTask>>,
+        reservation: MemoryReservation,
+    ) -> Result<Self> {
+        if groups.is_empty() {
+            return exec_err!("Iceberg scan requires at least one file group");
+        }
+        // Do not retain arbitrary spare capacity from caller-owned buffers.
+        // Previously, copying into the flat assignment discarded that capacity.
+        groups.shrink_to_fit();
+        for group in &mut groups {
+            group.shrink_to_fit();
+            for task in group {
+                reservation.try_grow(retained_size(task).saturating_mul(2))?;
+            }
+        }
+        Ok(Self {
+            groups,
+            _reservation: reservation,
+        })
+    }
+
+    pub(crate) async fn collect(
+        scan: TableScan,
+        context: &TaskContext,
+        target_partitions: usize,
+    ) -> Result<Self> {
+        Self::new(context)
+            .collect_into(scan, target_partitions)
+            .await
+    }
+
+    pub(super) async fn collect_into(
+        mut self,
+        scan: TableScan,
+        target_partitions: usize,
+    ) -> Result<Self> {
         let mut stream = scan.plan_files().await.map_err(to_datafusion_error)?;
+        let target_partitions = target_partitions.max(1);
+        let mut partition = 0;
         while let Some(task) = stream.try_next().await.map_err(to_datafusion_error)? {
-            planned.push(task)?;
+            // Reserve before retaining each descriptor, not after full discovery.
+            self._reservation
+                .try_grow(retained_size(&task).saturating_mul(2))?;
+            // Grow only as files arrive, even for a very large partition target.
+            if partition == self.groups.len() {
+                self.groups.push(Vec::with_capacity(1));
+            }
+            self.groups[partition].push(task);
+            partition = (partition + 1) % target_partitions;
         }
-        Ok(planned)
+        // Empty discovery still has one partition. Explicit groups never pass
+        // through here, so all-empty supplied partitions retain their shape.
+        if self.groups.is_empty() {
+            self.groups.push(Vec::new());
+        }
+        Ok(self)
     }
 }
 
-/// Retain supplied file and partition order, including empty partitions.
-pub(super) fn flatten_groups(
-    groups: Vec<Vec<FileScanTask>>,
-) -> Result<(Vec<FileScanTask>, Vec<Vec<usize>>)> {
-    if groups.is_empty() {
-        return exec_err!("Iceberg scan requires at least one file group");
-    }
-    let mut tasks = Vec::new();
-    let mut partitions = Vec::with_capacity(groups.len());
-    for group in groups {
-        let start = tasks.len();
-        tasks.extend(group);
-        partitions.push((start..tasks.len()).collect());
-    }
-    Ok((tasks, partitions))
+// Flatten alone is not ExactSizeIterator. Track the remaining length in the
+// iterator, rather than caching a second mutable file count on PlannedFileScan.
+struct PlannedFiles<'a> {
+    inner: Flatten<Iter<'a, Vec<FileScanTask>>>,
+    remaining: usize,
 }
+
+impl<'a> Iterator for PlannedFiles<'a> {
+    type Item = &'a FileScanTask;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let task = self.inner.next()?;
+        self.remaining -= 1;
+        Some(task)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for PlannedFiles<'_> {}
 
 fn retained_size(task: &FileScanTask) -> usize {
     let mut bytes = size_of::<FileScanTask>()

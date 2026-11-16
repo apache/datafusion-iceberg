@@ -32,7 +32,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
 use super::eager::EagerIcebergDataSource;
-use super::file_planning::{PlannedFileScan, flatten_groups};
+use super::file_planning::PlannedFileScan;
 use super::predicate::convert_filters_to_predicate;
 use super::scan::{IcebergDataSource, build_table_scan};
 use crate::IcebergDataFusionConfig;
@@ -313,12 +313,10 @@ impl IcebergDataSourceBuilder<'_, PlannedFilesInput<PlannedReader>> {
     /// individual groups are valid. Tasks must match the supplied projected schema.
     pub fn build(self) -> Result<Arc<dyn DataSource>> {
         let input = self.input;
-        let (tasks, partitions) = flatten_groups(input.groups)?;
-        let files = PlannedFileScan::from_tasks(tasks, self.context)?;
+        let files = PlannedFileScan::from_groups(input.groups, self.context)?;
         Ok(Arc::new(EagerIcebergDataSource::from_planned_files(
             input.schema,
             files,
-            partitions,
             input.reader.file_io,
             input.reader.reader,
             self.fetch,
@@ -405,22 +403,21 @@ impl IcebergDataSourceBuilder<'_, TableScanInput> {
             Some(&projection),
             input.predicate.as_ref(),
         )?;
-        let files = PlannedFileScan::collect(scan, self.context).await?;
-        let partitions = files
-            .tasks()
-            .len()
-            .max(1)
-            .min(self.context.session_config().target_partitions().max(1));
-        let reader =
-            configured_reader(input.reader, &input.table, self.context, partitions);
-        let mut groups = vec![Vec::new(); partitions];
-        for index in 0..files.tasks().len() {
-            groups[index % partitions].push(index);
-        }
+        let files = PlannedFileScan::collect(
+            scan,
+            self.context,
+            self.context.session_config().target_partitions(),
+        )
+        .await?;
+        let reader = configured_reader(
+            input.reader,
+            &input.table,
+            self.context,
+            files.groups().len(),
+        );
         Ok(Arc::new(EagerIcebergDataSource::from_planned_files(
             schema,
             files,
-            groups,
             input.table.file_io().clone(),
             reader,
             self.fetch,

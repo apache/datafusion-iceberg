@@ -32,7 +32,7 @@ use iceberg::arrow::ArrowReader;
 use iceberg::io::FileIO;
 use iceberg::scan::FileScanTask;
 
-use super::file_planning::{PlannedFileScan, flatten_groups};
+use super::file_planning::PlannedFileScan;
 use super::reader::ScanReader;
 
 /// An Iceberg scan whose complete file assignment is available before execution.
@@ -46,14 +46,13 @@ pub struct EagerIcebergDataSource {
     reader: ScanReader,
     file_io: FileIO,
     files: Arc<PlannedFileScan>,
-    partitions: Arc<[Vec<usize>]>,
 }
 impl std::fmt::Debug for EagerIcebergDataSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EagerIcebergDataSource")
             .field("schema", &self.schema)
             .field("fetch", &self.fetch)
-            .field("partitions", &self.partitions)
+            .field("partitions", &self.files.groups().len())
             .finish_non_exhaustive()
     }
 }
@@ -61,7 +60,6 @@ impl EagerIcebergDataSource {
     pub(crate) fn from_planned_files(
         schema: SchemaRef,
         files: PlannedFileScan,
-        groups: Vec<Vec<usize>>,
         file_io: FileIO,
         reader: ArrowReader,
         fetch: Option<usize>,
@@ -71,7 +69,6 @@ impl EagerIcebergDataSource {
             fetch,
             file_io,
             files: Arc::new(files),
-            partitions: groups.into(),
             reader: ScanReader::new(reader),
         }
     }
@@ -86,10 +83,11 @@ impl EagerIcebergDataSource {
         &self.file_io
     }
 
-    /// Borrow all retained file tasks. Iteration does not promise row ordering.
-    /// Use [`Self::planned_partition_files`] to inspect partition membership.
+    /// Borrow all retained file tasks in partition order, then within each group.
+    /// This does not promise execution row ordering. Use
+    /// [`Self::planned_partition_files`] to inspect one partition's membership.
     pub fn planned_files(&self) -> impl ExactSizeIterator<Item = &FileScanTask> {
-        self.files.tasks().iter()
+        self.files.tasks()
     }
 
     /// Borrow the files that execution will read for one local partition.
@@ -100,10 +98,10 @@ impl EagerIcebergDataSource {
         &self,
         partition: usize,
     ) -> Result<impl ExactSizeIterator<Item = &FileScanTask>> {
-        let Some(indices) = self.partitions.get(partition) else {
+        let Some(group) = self.files.groups().get(partition) else {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         };
-        Ok(indices.iter().map(|&index| &self.files.tasks()[index]))
+        Ok(group.iter())
     }
 
     /// Replace the planned files, preserving the supplied local partitions and order.
@@ -119,11 +117,9 @@ impl EagerIcebergDataSource {
     /// # Errors
     /// Returns an error for zero groups or insufficient query memory.
     pub fn with_planned_files(&self, groups: Vec<Vec<FileScanTask>>) -> Result<Self> {
-        let (tasks, partitions) = flatten_groups(groups)?;
-        let files = self.files.with_tasks(tasks)?;
+        let files = self.files.with_groups(groups)?;
         let mut source = self.clone();
         source.files = Arc::new(files);
-        source.partitions = partitions.into();
         source.reader.metrics = Default::default();
         Ok(source)
     }
@@ -141,11 +137,10 @@ impl DataSource for EagerIcebergDataSource {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let count = self.planned_partition_files(partition)?.len();
-        let source = self.clone();
+        // Keep the groups and their reservation alive after the source is dropped.
+        let files = Arc::clone(&self.files);
         let tasks = futures::stream::iter(0..count)
-            .map(move |offset| {
-                Ok(source.files.tasks()[source.partitions[partition][offset]].clone())
-            })
+            .map(move |offset| Ok(files.groups()[partition][offset].clone()))
             .boxed();
         self.reader
             .open(tasks, Arc::clone(&self.schema), self.fetch, partition)
@@ -164,7 +159,7 @@ impl DataSource for EagerIcebergDataSource {
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            self.partitions.iter().map(Vec::len).sum::<usize>()
+            self.files.tasks().len()
         )?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
@@ -172,7 +167,7 @@ impl DataSource for EagerIcebergDataSource {
         Ok(())
     }
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.partitions.len())
+        Partitioning::UnknownPartitioning(self.files.groups().len())
     }
     fn eq_properties(&self) -> EquivalenceProperties {
         EquivalenceProperties::new(Arc::clone(&self.schema))
