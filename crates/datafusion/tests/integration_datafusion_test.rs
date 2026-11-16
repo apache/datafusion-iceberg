@@ -49,7 +49,7 @@ use iceberg::{
 use iceberg_datafusion::metadata::{
     IcebergMetadataDataSource, IcebergMetadataTableProvider,
 };
-use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::read::{IcebergDataSource, IcebergDataSourceBuilder};
 use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergDataFusionConfig,
@@ -916,13 +916,20 @@ async fn run(
 }
 
 /// Rebuilds `scan` from its accessors alone, as a codec would.
-fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
-    IcebergDataSource::builder(scan.table().clone(), scan.schema())
+async fn rebuild_scan(
+    scan: &IcebergDataSource,
+    ctx: &SessionContext,
+) -> Result<IcebergDataSource, Box<dyn Error>> {
+    let context = ctx.task_ctx();
+    let source = IcebergDataSourceBuilder::new(&context)
+        .with_schema(scan.schema())
+        .with_table(scan.table().clone())
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
         .build()
-        .unwrap()
+        .await?;
+    Ok(source.downcast_ref::<IcebergDataSource>().unwrap().clone())
 }
 
 async fn run_source(
@@ -1040,7 +1047,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         scan.predicate().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan, &ctx).await?;
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
@@ -1063,7 +1070,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan, &ctx).await?;
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
@@ -1077,10 +1084,14 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+    let partial = IcebergDataSourceBuilder::new(&ctx.task_ctx())
+        .with_schema(foo2_only)
+        .with_table(pinned.table().clone())
         .with_snapshot_id(Some(snapshot_id))
-        .build()?;
-    insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
+        .build()
+        .await?;
+    let partial = partial.downcast_ref::<IcebergDataSource>().unwrap();
+    insta::assert_snapshot!(&run_source(partial, &ctx).await?, @r#"
         +--------+
         | foo2   |
         +--------+

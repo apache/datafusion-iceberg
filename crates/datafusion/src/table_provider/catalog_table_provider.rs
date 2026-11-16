@@ -34,10 +34,9 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use crate::IcebergDataFusionConfig;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
-use crate::read::IcebergDataSource;
+use crate::read::IcebergDataSourceBuilder;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -140,22 +139,16 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot).
-        let source = IcebergDataSource::builder(table, self.schema.clone())
+        let context = state.task_ctx();
+        let source = IcebergDataSourceBuilder::new(&context)
+            .with_schema(self.schema.clone())
+            .with_table(table)
             .with_projection(projection)
             .with_filters(filters)
-            .with_fetch(limit);
-        if state
-            .config_options()
-            .extensions
-            .get::<IcebergDataFusionConfig>()
-            .is_some_and(|config| config.execution.eager_file_planning)
-        {
-            Ok(DataSourceExec::from_data_source(
-                source.build_eager(state.task_ctx()).await?,
-            ))
-        } else {
-            Ok(DataSourceExec::from_data_source(source.build()?))
-        }
+            .with_fetch(limit)
+            .build()
+            .await?;
+        Ok(Arc::new(DataSourceExec::new(source)))
     }
 
     fn supports_filters_pushdown(
@@ -253,6 +246,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::read::IcebergDataSource;
 
     #[tokio::test]
     async fn test_catalog_backed_provider_creation() {
@@ -466,10 +460,15 @@ mod tests {
         let out_of_range = schema.fields().len();
 
         // Columns come back in the projection's order, not the table's.
-        let source = IcebergDataSource::builder(table.clone(), schema.clone())
+        let context = SessionContext::new().task_ctx();
+        let source = IcebergDataSourceBuilder::new(&context)
+            .with_schema(schema.clone())
+            .with_table(table.clone())
             .with_projection(Some(&vec![1, 0]))
             .build()
+            .await
             .unwrap();
+        let source = source.downcast_ref::<IcebergDataSource>().unwrap();
         insta::assert_debug_snapshot!(source.projection(), @r#"
         [
             "name",
@@ -477,9 +476,12 @@ mod tests {
         ]
         "#);
 
-        let err = IcebergDataSource::builder(table, schema)
+        let err = IcebergDataSourceBuilder::new(&context)
+            .with_schema(schema)
+            .with_table(table)
             .with_projection(Some(&vec![0, out_of_range]))
             .build()
+            .await
             .unwrap_err();
         assert_eq!(
             err.to_string(),

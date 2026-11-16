@@ -375,19 +375,25 @@ async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
     let projection = vec![schema.index_of("pickup_date")?];
     let pickup_date = ScalarValue::Date32(Some(19732)); // 2024-01-10
     let reader = table.reader_builder().with_batch_size(7).build();
-    let builder = IcebergDataSource::builder(table, schema)
+    let context = harness.context().task_ctx();
+    let eager_context = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(4)
+            .with_option_extension(IcebergDataFusionConfig::default())
+            .set_bool("iceberg.execution.eager_file_planning", true),
+    )
+    .task_ctx();
+    let builder = IcebergDataSourceBuilder::new(&context)
+        .with_schema(schema)
+        .with_table(table)
         .with_reader(reader)
         .with_projection(Some(&projection))
         .with_filters(&[col("pickup_date").eq(lit(pickup_date))])
         .with_fetch(Some(19));
-    assert!(
-        builder
-            .clone()
-            .build_planned(&harness.context().task_ctx())
-            .is_err()
-    );
-    let lazy = builder.clone().build()?;
-    let source = builder.build_eager(harness.context().task_ctx()).await?;
+    let lazy = builder.clone().build().await?;
+    assert!(lazy.downcast_ref::<IcebergDataSource>().is_some());
+    let source = builder.with_context(&eager_context).build().await?;
+    let source = source.downcast_ref::<EagerIcebergDataSource>().unwrap();
     assert_eq!(source.schema().field(0).name(), "pickup_date");
     assert_eq!(source.planned_files().len(), 1);
     assert_eq!(source.output_partitioning().partition_count(), 1);
@@ -416,6 +422,35 @@ async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
 }
 
 #[tokio::test]
+async fn builder_preserves_session_reader_settings_at_execution()
+-> StdResult<(), Box<dyn Error>> {
+    let fixture = table_with_position_delete().await?;
+    let provider =
+        IcebergStaticTableProvider::try_new_from_table(fixture.table.clone()).await?;
+    let context =
+        SessionContext::new_with_config(SessionConfig::new().with_batch_size(1))
+            .task_ctx();
+    let source = IcebergDataSourceBuilder::new(&context)
+        .with_schema(provider.schema())
+        .with_table(fixture.table.clone())
+        .build()
+        .await?;
+
+    // The source keeps its construction settings even if another execution
+    // context has the default batch size. The fixture has three surviving rows.
+    let execution_context = SessionContext::new().task_ctx();
+    let batches = collect(source.open(0, execution_context)?).await?;
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.num_rows())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconstructed_scan_preserves_reader_settings_fetch_and_deletes()
 -> StdResult<(), Box<dyn Error>> {
     let fixture = table_with_position_delete().await?;
@@ -432,15 +467,17 @@ async fn reconstructed_scan_preserves_reader_settings_fetch_and_deletes()
         .with_batch_size(1)
         .with_data_file_concurrency_limit(1)
         .build();
-    let rebuilt = IcebergDataSourceBuilder::from_planned_files(
-        original.schema().clone(),
-        vec![files.clone(), vec![]],
-        fixture.table.file_io().clone(),
-        reader,
-    )
-    .with_fetch(Some(2))
-    .build_planned(&context.task_ctx())?;
-    let reassigned = rebuilt.with_planned_files(vec![vec![], files])?;
+    let rebuilt = IcebergDataSourceBuilder::new(&context.task_ctx())
+        .with_schema(original.schema().clone())
+        .with_planned_files(vec![files.clone(), vec![]])
+        .with_file_io(fixture.table.file_io().clone())
+        .with_reader(reader)
+        .with_fetch(Some(2))
+        .build()?;
+    let reassigned = rebuilt
+        .downcast_ref::<EagerIcebergDataSource>()
+        .unwrap()
+        .with_planned_files(vec![vec![], files])?;
     assert!(
         collect(reassigned.open(0, context.task_ctx())?)
             .await?
@@ -534,48 +571,21 @@ async fn assigned_file_groups_can_be_regrouped_and_reconstructed() -> Result<()>
     drop(table);
     drop(provider);
     drop(plan);
+    let context = harness.context().task_ctx();
     assert!(
-        IcebergDataSourceBuilder::from_planned_files(
-            assigned.schema().clone(),
-            vec![],
-            file_io.clone(),
-            reader.clone(),
-        )
-        .build_eager(harness.context().task_ctx())
-        .await
-        .is_err()
-    );
-    let builder = IcebergDataSourceBuilder::from_planned_files(
-        assigned.schema().clone(),
-        groups,
-        file_io,
-        reader,
-    );
-    assert!(
-        builder
-            .clone()
-            .with_snapshot_id(Some(1))
-            .build_eager(harness.context().task_ctx())
-            .await
+        IcebergDataSourceBuilder::new(&context)
+            .with_schema(assigned.schema().clone())
+            .with_planned_files(vec![])
+            .with_file_io(file_io.clone())
+            .with_reader(reader.clone())
+            .build()
             .is_err()
     );
-    assert!(
-        builder
-            .clone()
-            .with_projection(Some(&vec![0]))
-            .build_eager(harness.context().task_ctx())
-            .await
-            .is_err()
-    );
-    assert!(
-        builder
-            .clone()
-            .with_filters(&[col("pickup_date").eq(lit(ScalarValue::Date32(Some(19732))))])
-            .build_eager(harness.context().task_ctx())
-            .await
-            .is_err()
-    );
-    assert!(builder.clone().build().is_err());
+    let builder = IcebergDataSourceBuilder::new(&context)
+        .with_schema(assigned.schema().clone())
+        .with_planned_files(groups)
+        .with_file_io(file_io)
+        .with_reader(reader);
     let limited_runtime = Arc::new(
         RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(GreedyMemoryPool::new(1)))
@@ -585,20 +595,21 @@ async fn assigned_file_groups_can_be_regrouped_and_reconstructed() -> Result<()>
         SessionContext::new_with_config_rt(SessionConfig::new(), limited_runtime.clone());
     let error = builder
         .clone()
-        .build_eager(limited_context.task_ctx())
-        .await
+        .with_context(&limited_context.task_ctx())
+        .build()
         .unwrap_err();
     assert!(matches!(
         error,
         datafusion::error::DataFusionError::ResourcesExhausted(_)
     ));
     assert_eq!(limited_runtime.memory_pool.reserved(), 0);
-    let rebuilt = builder.build_planned(&harness.context().task_ctx())?;
+    let rebuilt = builder.build()?;
+    let rebuilt = rebuilt.downcast_ref::<EagerIcebergDataSource>().unwrap();
     // A reconstructed source supports the same value-based assignment setter.
     let replaced = rebuilt.with_planned_files(vec![vec![], vec![files[6].clone()]])?;
     assert_eq!(paths(&replaced, 1)?, paths(&nested, 1)?);
     assert_eq!(rebuilt.output_partitioning().partition_count(), 2);
-    assert_eq!(paths(&rebuilt, 0)?, paths(&assigned, 0)?);
+    assert_eq!(paths(rebuilt, 0)?, paths(&assigned, 0)?);
     for partition in 0..2 {
         let expected =
             collect(assigned.open(partition, harness.context().task_ctx())?).await?;
