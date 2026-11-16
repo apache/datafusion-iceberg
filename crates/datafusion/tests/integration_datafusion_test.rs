@@ -1222,7 +1222,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
 /// scan with no projection still returns only the provider's columns, matching
 /// its schema.
 #[tokio::test]
-async fn test_scan_after_schema_evolution_reads_provider_columns()
+async fn lazy_scan_after_schema_evolution_reads_provider_columns()
 -> Result<(), Box<dyn Error>> {
     let iceberg_catalog = get_iceberg_catalog().await;
     let namespace = NamespaceIdent::new("test_schema_evolution".to_string());
@@ -1236,7 +1236,12 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
             .await?,
     );
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_option_extension(IcebergDataFusionConfig::default())
+            .set_bool("iceberg.execution.eager_file_planning", false),
+    );
     ctx.register_table("t", provider.clone())?;
     ctx.sql("INSERT INTO t VALUES (1, 'alan')")
         .await?
@@ -1273,33 +1278,104 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         .collect()
         .await?;
 
-    for eager in [false, true] {
-        let ctx = SessionContext::new_with_config(
-            SessionConfig::new()
-                .with_target_partitions(1)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", eager),
-        );
-        let plan = provider.scan(&ctx.state(), None, &[], None).await?;
-        assert_eq!(plan.schema(), provider.schema());
-        // The rows come from two data files, which may be read in either order.
-        // They are joined under their own schema, not the plan's, so that a column
-        // the plan does not report would show.
-        let batches = run_batches(plan.as_ref(), &ctx).await?;
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
-        let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
-        let sorted = take_record_batch(&batch, &order)?;
-        let rendered = pretty_format_batches(&[sorted])?.to_string();
-        insta::allow_duplicates! {
-        insta::assert_snapshot!(&rendered, @r#"
-        +------+--------+
-        | foo1 | foo2   |
-        +------+--------+
-        | 1    | alan   |
-        | 2    | turing |
-        +------+--------+"#);
-        }
-    }
+    let plan = ctx
+        .sql("SELECT * FROM t")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert_eq!(plan.schema(), provider.schema());
+    // Normalize row order using the batches' actual schema, not the plan's,
+    // so an unexpected third column cannot be hidden by the assertion.
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+    let sorted = take_record_batch(&batch, &order)?;
+    insta::assert_snapshot!(pretty_format_batches(&[sorted])?.to_string(), @r#"
+    +------+--------+
+    | foo1 | foo2   |
+    +------+--------+
+    | 1    | alan   |
+    | 2    | turing |
+    +------+--------+"#);
+
+    Ok(())
+}
+
+/// Eager discovery must also use the registered provider's two columns when
+/// the latest snapshot contains a third column.
+#[tokio::test]
+async fn eager_scan_after_schema_evolution_reads_provider_columns()
+-> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_eager_schema_evolution".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
+
+    let provider = Arc::new(
+        IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
+            .await?,
+    );
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_option_extension(IcebergDataFusionConfig::default())
+            .set_bool("iceberg.execution.eager_file_planning", true),
+    );
+    ctx.register_table("t", provider.clone())?;
+    ctx.sql("INSERT INTO t VALUES (1, 'alan')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client.load_table(&ident).await?;
+    let tx = Transaction::new(&table);
+    tx.update_schema()
+        .add_column(AddColumn::optional(
+            "foo3",
+            Type::Primitive(PrimitiveType::Int),
+        ))
+        .apply(tx)?
+        .commit(client.as_ref())
+        .await?;
+
+    let evolved = IcebergCatalogTableProvider::try_new(
+        client.clone(),
+        ident.namespace().clone(),
+        ident.name(),
+    )
+    .await?;
+    insta::assert_snapshot!(display_schema(&evolved.schema()), @r#"
+    Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    Field { "foo3": nullable Int32, metadata: {"PARQUET:field_id": "3"} }
+    "#);
+    ctx.register_table("evolved", Arc::new(evolved))?;
+    ctx.sql("INSERT INTO evolved VALUES (2, 'turing', 3)")
+        .await?
+        .collect()
+        .await?;
+
+    let plan = ctx
+        .sql("SELECT * FROM t")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert_eq!(plan.schema(), provider.schema());
+    // Check batches under their actual schema to expose any extra column.
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+    let sorted = take_record_batch(&batch, &order)?;
+    insta::assert_snapshot!(pretty_format_batches(&[sorted])?.to_string(), @r#"
+    +------+--------+
+    | foo1 | foo2   |
+    +------+--------+
+    | 1    | alan   |
+    | 2    | turing |
+    +------+--------+"#);
 
     Ok(())
 }

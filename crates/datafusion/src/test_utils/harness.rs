@@ -27,22 +27,25 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage, OutputFile, Storage,
-    StorageConfig, StorageFactory,
+    FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage, LocalFsStorageFactory,
+    OutputFile, Storage, StorageConfig, StorageFactory,
 };
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, Result as IcebergResult,
     TableIdent,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{IcebergCatalogProvider, IcebergTableProviderFactory};
+use crate::{
+    IcebergCatalogProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
+};
 
 pub const FIXTURE_URI: &str = "s3://iceberg-test/warehouse/taxi";
 const WAREHOUSE_URI: &str = "s3://iceberg-test/warehouse/";
@@ -62,11 +65,17 @@ impl IcebergTestHarness {
         IcebergTestHarnessBuilder {
             config: SessionConfig::new().with_target_partitions(16),
             runtime_env: None,
+            tables: Vec::new(),
         }
     }
 
     pub fn context(&self) -> &SessionContext {
         &self.ctx
+    }
+
+    /// Plan a SQL query without executing it, for inspecting scan assignments.
+    pub async fn plan(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
+        self.ctx.sql(sql).await?.create_physical_plan().await
     }
 
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
@@ -89,6 +98,7 @@ impl IcebergTestHarness {
 pub struct IcebergTestHarnessBuilder {
     config: SessionConfig,
     runtime_env: Option<Arc<RuntimeEnv>>,
+    tables: Vec<(String, Table)>,
 }
 
 impl IcebergTestHarnessBuilder {
@@ -102,13 +112,24 @@ impl IcebergTestHarnessBuilder {
         self
     }
 
+    /// Register a supplied table instead of loading the bundled Taxi catalog.
+    /// Repeated calls register multiple tables in the same session.
+    pub fn with_table(mut self, name: impl Into<String>, table: Table) -> Self {
+        self.tables.push((name.into(), table));
+        self
+    }
+
     pub async fn build(self) -> Result<IcebergTestHarness> {
         let Self {
             config,
             runtime_env,
+            tables,
         } = self;
-        let storage_factory: Arc<dyn StorageFactory> =
-            Arc::new(FixtureStorageFactory::default());
+        let storage_factory: Arc<dyn StorageFactory> = if tables.is_empty() {
+            Arc::new(FixtureStorageFactory::default())
+        } else {
+            Arc::new(LocalFsStorageFactory)
+        };
         let builder = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config);
@@ -126,6 +147,16 @@ impl IcebergTestHarnessBuilder {
                 )),
             )
             .build();
+
+        let ctx = SessionContext::new_with_state(state);
+        if !tables.is_empty() {
+            for (name, table) in tables {
+                let provider =
+                    IcebergStaticTableProvider::try_new_from_table(table).await?;
+                ctx.register_table(name, Arc::new(provider))?;
+            }
+            return Ok(IcebergTestHarness { ctx });
+        }
 
         let catalog = MemoryCatalogBuilder::default()
             .with_storage_factory(storage_factory)
@@ -153,7 +184,6 @@ impl IcebergTestHarnessBuilder {
 
         let provider = IcebergCatalogProvider::try_new(Arc::new(catalog)).await?;
 
-        let ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
 
         Ok(IcebergTestHarness { ctx })

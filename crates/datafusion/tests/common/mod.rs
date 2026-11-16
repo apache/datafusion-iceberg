@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod position_deletes;
+pub mod scan_fixture;

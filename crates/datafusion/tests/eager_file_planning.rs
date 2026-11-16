@@ -16,297 +16,403 @@
 // under the License.
 
 use std::error::Error;
-use std::result::Result as StdResult;
+use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::test_util::batches_to_sort_string;
 use datafusion::common::{Result, stats::Precision};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
+use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::common::collect;
-use datafusion::physical_plan::{ExecutionPlanProperties, collect as collect_plan};
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
+use iceberg::scan::FileScanTask;
 use iceberg_datafusion::read::{
     EagerIcebergDataSource, IcebergDataSource, IcebergDataSourceBuilder,
 };
 use iceberg_datafusion::test_utils::IcebergTestHarness;
-use iceberg_datafusion::{
-    IcebergCatalogTableProvider, IcebergDataFusionConfig, IcebergStaticTableProvider,
-};
+use iceberg_datafusion::{IcebergCatalogTableProvider, IcebergDataFusionConfig};
 
 mod common;
+use common::scan_fixture::ScanFixture;
 
-use common::position_deletes::table_with_position_delete;
-
-fn eager_config() -> SessionConfig {
-    SessionConfig::new()
-        .with_target_partitions(4)
-        .with_option_extension(IcebergDataFusionConfig::default())
-        .set_bool("iceberg.execution.eager_file_planning", true)
-}
-
-fn iceberg_source(
-    plan: &dyn datafusion::physical_plan::ExecutionPlan,
-) -> &EagerIcebergDataSource {
-    plan.downcast_ref::<DataSourceExec>()
-        .expect("the Iceberg provider creates a DataSourceExec")
-        .data_source()
-        .downcast_ref::<EagerIcebergDataSource>()
-        .expect("the plan contains the Iceberg data source")
-}
+type TestResult = std::result::Result<(), Box<dyn Error>>;
 
 #[tokio::test]
-async fn plans_file_tasks_before_execution_without_changing_statistics() -> Result<()> {
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config())
+async fn eager_planning_exposes_files_and_balanced_partitions() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0])
+        .with_file([1])
+        .with_file([2])
+        .with_file([3])
+        .with_file([4])
+        .with_file([5])
+        .with_file([6])
         .build()
         .await?;
-    let lazy = IcebergTestHarness::new().await?;
-    let eager_provider = eager.context().table_provider("taxi").await?;
-    let lazy_provider = lazy.context().table_provider("taxi").await?;
-    let eager_plan = eager_provider
-        .scan(&eager.context().state(), None, &[], None)
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
         .await?;
-    let lazy_plan = lazy_provider
-        .scan(&lazy.context().state(), None, &[], None)
-        .await?;
-    let eager_source = iceberg_source(eager_plan.as_ref());
-    let lazy_source = lazy_plan
-        .downcast_ref::<DataSourceExec>()
-        .unwrap()
-        .data_source()
-        .downcast_ref::<IcebergDataSource>()
-        .unwrap();
 
-    assert!(eager_source.planned_partition_files(4).is_err());
-    let tasks: Vec<_> = eager_source.planned_files().collect();
-    for (partition, indices) in [vec![0, 4], vec![1, 5], vec![2, 6], vec![3]]
-        .into_iter()
-        .enumerate()
-    {
-        let assigned: Vec<_> = eager_source
-            .planned_partition_files(partition)?
-            .map(std::ptr::from_ref)
-            .collect();
-        let expected: Vec<_> = indices
-            .into_iter()
-            .map(|index| std::ptr::from_ref(tasks[index]))
-            .collect();
-        assert_eq!(assigned, expected);
-    }
-
-    assert_eq!(lazy_plan.output_partitioning().partition_count(), 1);
-    assert_eq!(eager_source.planned_files().len(), 7);
-    assert_eq!(eager_plan.output_partitioning().partition_count(), 4);
-    assert!(eager_source.open(4, eager.context().task_ctx()).is_err());
-    assert!(lazy_source.open(1, lazy.context().task_ctx()).is_err());
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
+    assert_eq!(source.planned_files().len(), 7);
+    let loads = (0..4)
+        .map(|p| source.planned_partition_files(p).map(|files| files.len()))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(loads, vec![2, 2, 2, 1]);
+    let mut names = source.planned_files().map(file_name).collect::<Vec<_>>();
+    names.sort();
+    insta::assert_snapshot!(names.join("\n"), @"
+    data-0.parquet
+    data-1.parquet
+    data-2.parquet
+    data-3.parquet
+    data-4.parquet
+    data-5.parquet
+    data-6.parquet
+    ");
+    // Planning descriptors does not claim exact query statistics.
     assert_eq!(
-        eager_source.partition_statistics(None)?.num_rows,
+        source.partition_statistics(None)?.num_rows,
         Precision::Absent
     );
     assert_eq!(
-        eager_source.partition_statistics(None)?.total_byte_size,
-        lazy_source.partition_statistics(None)?.total_byte_size
+        source.partition_statistics(None)?.total_byte_size,
+        Precision::Absent
     );
+    Ok(())
+}
 
-    let empty = eager_provider
-        .scan(
-            &eager.context().state(),
-            None,
-            &[col("pickup_date").eq(lit(ScalarValue::Date32(Some(0))))],
-            None,
+#[tokio::test]
+async fn eager_partition_count_is_bounded_by_selected_files() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .build()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(16)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
+    assert_eq!(source.output_partitioning().partition_count(), 2);
+    assert!(source.planned_partition_files(2).is_err());
+    assert!(source.open(2, harness.context().task_ctx()).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn eager_partition_pruning_selects_only_matching_files() -> TestResult {
+    // The bundled Taxi table has seven daily files, 25,000 rows per day.
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+
+    let (plan, rows) = harness
+        .query(
+            "SELECT pickup_date, COUNT(*) AS trips FROM taxi \
+         WHERE pickup_date = DATE '2024-01-10' \
+         GROUP BY pickup_date ORDER BY pickup_date",
         )
         .await?;
-    assert_eq!(iceberg_source(empty.as_ref()).planned_files().len(), 0);
-    assert_eq!(empty.output_partitioning().partition_count(), 1);
+    insta::assert_snapshot!(format!("{plan}\n{rows}"), @"
+    CoalescePartitionsExec
+      ProjectionExec: expr=[pickup_date@0 as pickup_date, count(Int64(1))@1 as trips]
+        AggregateExec: mode=FinalPartitioned, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))], ordering_mode=Sorted
+          RepartitionExec: partitioning=Hash([pickup_date@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))], ordering_mode=Sorted
+              FilterExec: pickup_date@0 = 2024-01-10
+                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                  DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=1
 
+    +-------------+-------+
+    | pickup_date | trips |
+    +-------------+-------+
+    | 2024-01-10  | 25000 |
+    +-------------+-------+
+    ");
     Ok(())
 }
 
 #[tokio::test]
-async fn eager_partition_count_is_bounded_by_selected_files() -> Result<()> {
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config().with_target_partitions(16))
+async fn eager_scan_retains_the_residual_filter() -> TestResult {
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
         .build()
         .await?;
-    let provider = eager.context().table_provider("taxi").await?;
-    let plan = provider
-        .scan(&eager.context().state(), None, &[], None)
-        .await?;
-    assert_eq!(plan.output_partitioning().partition_count(), 7);
-    Ok(())
-}
 
-#[tokio::test]
-async fn filtered_and_empty_eager_scans_match_lazy_results() -> Result<()> {
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config())
-        .build()
-        .await?;
-    let lazy = IcebergTestHarness::new().await?;
-    for (name, query) in [
-        (
-            "partition_pruning",
-            "SELECT pickup_date, COUNT(*) AS trips FROM taxi \
-             WHERE pickup_date = DATE '2024-01-10' \
-             GROUP BY pickup_date ORDER BY pickup_date",
-        ),
-        (
-            "residual_filter",
+    let (plan, rows) = harness
+        .query(
             "SELECT COUNT(*) AS trips FROM taxi \
-             WHERE pickup_date = DATE '2024-01-08' AND trip_distance > 50",
-        ),
-        (
-            "empty_scan",
-            "SELECT COUNT(*) AS trips FROM taxi \
-             WHERE pickup_date = DATE '2025-01-01'",
-        ),
-    ] {
-        let (plan, eager_batches) = eager.query(query).await?;
-        let (_, lazy_batches) = lazy.query(query).await?;
-        insta::assert_snapshot!(name, format!("{plan}\n{eager_batches}"));
-        assert_eq!(eager_batches, lazy_batches);
-    }
+         WHERE pickup_date = DATE '2024-01-08' AND trip_distance > 50",
+        )
+        .await?;
+    insta::assert_snapshot!(format!("{plan}\n{rows}"), @"
+    ProjectionExec: expr=[count(Int64(1))@0 as trips]
+      AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        CoalescePartitionsExec
+          AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+            FilterExec: pickup_date@1 = 2024-01-08 AND trip_distance@0 > 50, projection=[]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                DataSourceExec: format=iceberg, projection=[trip_distance, pickup_date], planned_files=1
+
+    +-------+
+    | trips |
+    +-------+
+    | 2     |
+    +-------+
+    ");
     Ok(())
 }
 
 #[tokio::test]
-async fn eager_multi_partition_limit_is_global() -> Result<()> {
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config())
+async fn pruning_all_files_keeps_one_empty_scan_partition() -> TestResult {
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
         .build()
         .await?;
-    let (plan, batches) = eager.query("SELECT 1 AS n FROM taxi LIMIT 3").await?;
-    insta::assert_snapshot!(format!("{plan}\n{batches}"));
+
+    let (plan, rows) = harness
+        .query("SELECT COUNT(*) AS trips FROM taxi WHERE pickup_date = DATE '2025-01-01'")
+        .await?;
+    insta::assert_snapshot!(format!("{plan}\n{rows}"), @"
+    ProjectionExec: expr=[count(Int64(1))@0 as trips]
+      AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        CoalescePartitionsExec
+          AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+            FilterExec: pickup_date@0 = 2025-01-01, projection=[]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=0
+
+    +-------+
+    | trips |
+    +-------+
+    | 0     |
+    +-------+
+    ");
     Ok(())
 }
 
 #[tokio::test]
-async fn eager_ordered_limit_matches_lazy_results() -> Result<()> {
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config())
+async fn eager_multi_partition_limit_is_global() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .with_file([4, 5])
         .build()
         .await?;
-    let lazy = IcebergTestHarness::new().await?;
-    let sql = "SELECT vendor_id, pickup_at FROM taxi \
-               ORDER BY pickup_at, vendor_id, pickup_location_id LIMIT 3";
-    let (plan, eager_batches) = eager.query(sql).await?;
-    let (_, lazy_batches) = lazy.query(sql).await?;
-    insta::assert_snapshot!(format!("{plan}\n{eager_batches}"));
-    assert_eq!(eager_batches, lazy_batches);
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(3)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+
+    // Select a constant: a global limit promises a count, not which unordered IDs win.
+    let (plan, rows) = harness.query("SELECT 1 AS n FROM items LIMIT 3").await?;
+    insta::assert_snapshot!(format!("{plan}\n{rows}"), @"
+    ProjectionExec: expr=[1 as n]
+      CoalescePartitionsExec: fetch=3
+        DataSourceExec: format=iceberg, projection=[], planned_files=3, fetch=3
+
+    +---+
+    | n |
+    +---+
+    | 1 |
+    | 1 |
+    | 1 |
+    +---+
+    ");
     Ok(())
 }
 
 #[tokio::test]
-async fn eager_and_lazy_scans_apply_position_deletes() -> StdResult<(), Box<dyn Error>> {
-    let fixture = table_with_position_delete().await?;
-    let eager = SessionContext::new_with_config(eager_config());
-    let table = fixture.table.clone();
-    let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-    let lazy = SessionContext::new();
+async fn eager_ordered_limit_matches_lazy_results() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([5, 1])
+        .with_file([4, 0])
+        .with_file([3, 2])
+        .build()
+        .await?;
+    let eager = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(3)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let lazy = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(SessionConfig::new().with_target_partitions(3))
+        .build()
+        .await?;
 
-    let state = eager.state();
-    let eager_plan = provider.scan(&state, None, &[], None).await?;
-    // Both unpartitioned files receive the delete task; the reader matches its path.
-    assert_eq!(
-        iceberg_source(eager_plan.as_ref())
-            .planned_files()
-            .filter(|task| !task.deletes().is_empty())
-            .count(),
-        2
-    );
-    assert_eq!(iceberg_source(eager_plan.as_ref()).planned_files().len(), 2);
-    let lazy_plan = provider.scan(&lazy.state(), None, &[], None).await?;
-    let eager_batches = collect_plan(eager_plan, state.task_ctx()).await?;
-    let lazy_batches = collect_plan(lazy_plan, lazy.task_ctx()).await?;
-    let ids = |batches: &[datafusion::arrow::array::RecordBatch]| {
-        let mut ids: Vec<i64> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .iter()
-                    .copied()
-            })
-            .collect();
-        ids.sort_unstable();
-        ids
-    };
-    assert_eq!(ids(&eager_batches), vec![1, 2, 3]);
-    assert_eq!(ids(&eager_batches), ids(&lazy_batches));
+    let sql = "SELECT id FROM items ORDER BY id LIMIT 3";
+    let (plan, rows) = eager.query(sql).await?;
+    let (_, lazy_rows) = lazy.query(sql).await?;
+    insta::assert_snapshot!(format!("{plan}\n{rows}"), @"
+    SortPreservingMergeExec: [id@0 ASC NULLS LAST], fetch=3
+      SortExec: TopK(fetch=3), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
+        DataSourceExec: format=iceberg, projection=[id], planned_files=3
+
+    +----+
+    | id |
+    +----+
+    | 0  |
+    | 1  |
+    | 2  |
+    +----+
+    ");
+    assert_eq!(rows, lazy_rows);
+    Ok(())
+}
+
+#[tokio::test]
+async fn eager_and_lazy_scans_apply_position_deletes() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .with_position_delete(0, 0)
+        .build()
+        .await?;
+    let eager = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let lazy = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(SessionConfig::new().with_target_partitions(2))
+        .build()
+        .await?;
+
+    let (_, rows) = eager.query("SELECT id FROM items ORDER BY id").await?;
+    let (_, lazy_rows) = lazy.query("SELECT id FROM items ORDER BY id").await?;
+    insta::assert_snapshot!(rows, @"
+    +----+
+    | id |
+    +----+
+    | 1  |
+    | 2  |
+    | 3  |
+    +----+
+    ");
+    assert_eq!(rows, lazy_rows);
     Ok(())
 }
 
 #[test]
-fn eager_scan_uses_the_tables_custom_runtime() -> Result<()> {
-    let io_runtime = tokio::runtime::Builder::new_multi_thread()
+fn eager_scan_can_execute_outside_the_table_creation_runtime() -> TestResult {
+    let table_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let (harness, provider) = io_runtime.block_on(async {
+    let fixture = table_runtime.block_on(
+        ScanFixture::builder()
+            .with_file([0, 1])
+            .with_file([2, 3])
+            .build(),
+    )?;
+    let query_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    query_runtime.block_on(async {
         let harness = IcebergTestHarness::builder()
-            .with_config(eager_config())
+            .with_table("items", fixture.table.clone())
+            .with_config(
+                SessionConfig::new()
+                    .with_target_partitions(2)
+                    .with_option_extension(IcebergDataFusionConfig::default())
+                    .set_bool("iceberg.execution.eager_file_planning", true),
+            )
             .build()
             .await?;
-        let provider = harness.context().table_provider("taxi").await?;
-        let catalog_provider = provider
-            .downcast_ref::<IcebergCatalogTableProvider>()
-            .expect("the fixture creates a catalog Iceberg provider");
-        let table = catalog_provider
-            .catalog()
-            .load_table(catalog_provider.table_ident())
-            .await
-            .map_err(iceberg_datafusion::to_datafusion_error)?;
-        let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-        Ok::<_, datafusion::error::DataFusionError>((harness, provider))
-    })?;
-    // The table retains its own runtime while planning is called from another runtime.
-    let planning_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    planning_runtime.block_on(async {
-        let state = harness.context().state();
-        let plan = provider.scan(&state, None, &[], None).await?;
-        assert_eq!(iceberg_source(plan.as_ref()).planned_files().len(), 7);
-        let mut rows = 0;
-        for partition in 0..plan.output_partitioning().partition_count() {
-            let batches = collect(plan.execute(partition, state.task_ctx())?).await?;
-            rows += batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-        }
-        assert_eq!(rows, 175_000);
+        let (_, rows) = harness.query("SELECT id FROM items ORDER BY id").await?;
+        insta::assert_snapshot!(rows, @"
+        +----+
+        | id |
+        +----+
+        | 0  |
+        | 1  |
+        | 2  |
+        | 3  |
+        +----+
+        ");
         Ok(())
     })
 }
 
 #[tokio::test]
-async fn eager_tasks_respect_the_query_memory_pool() -> Result<()> {
+async fn eager_discovery_fails_instead_of_exceeding_query_memory() -> TestResult {
+    let fixture = ScanFixture::builder().with_file([0, 1]).build().await?;
     let runtime = Arc::new(
         RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(GreedyMemoryPool::new(1)))
             .build()?,
     );
-    let eager = IcebergTestHarness::builder()
-        .with_config(eager_config())
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
         .with_runtime_env(runtime.clone())
         .build()
         .await?;
-    let provider = eager.context().table_provider("taxi").await?;
-    let error = provider
-        .scan(&eager.context().state(), None, &[], None)
-        .await
-        .expect_err("file metadata cannot fit in one byte");
+
+    let error = harness.plan("SELECT * FROM items").await.unwrap_err();
     assert!(
-        matches!(
-            error,
-            datafusion::error::DataFusionError::ResourcesExhausted(_)
-        ),
+        matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
         "{error}"
     );
     assert_eq!(runtime.memory_pool.reserved(), 0);
@@ -314,131 +420,176 @@ async fn eager_tasks_respect_the_query_memory_pool() -> Result<()> {
 }
 
 #[tokio::test]
-async fn retained_tasks_follow_plan_and_stream_lifetimes() -> Result<()> {
+async fn source_clones_and_streams_retain_descriptor_memory() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .build()
+        .await?;
     let runtime = Arc::new(
         RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(1024 * 1024)))
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64 * 1024)))
             .build()?,
     );
     let harness = IcebergTestHarness::builder()
-        .with_config(eager_config())
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
         .with_runtime_env(runtime.clone())
         .build()
         .await?;
-    let provider = harness.context().table_provider("taxi").await?;
-    let plan = provider
-        .scan(&harness.context().state(), None, &[], None)
-        .await?;
+
+    let plan = harness.plan("SELECT * FROM items").await?;
     let reserved = runtime.memory_pool.reserved();
     assert!(reserved > 0);
-    let source = iceberg_source(plan.as_ref()).clone();
+    let source = eager_source(plan.as_ref()).clone();
     drop(plan);
     assert_eq!(runtime.memory_pool.reserved(), reserved);
-    let subset = source
-        .with_planned_files(vec![vec![source.planned_files().next().unwrap().clone()]])?;
-    let subset_reserved = runtime.memory_pool.reserved() - reserved;
-    assert!(subset_reserved > 0);
-    // Replacement descriptors are owned and charged independently.
-    assert!(source.with_planned_files(vec![]).is_err());
-    assert_eq!(runtime.memory_pool.reserved(), reserved + subset_reserved);
-    let task = source.planned_files().next().unwrap().clone();
-    let oversized = vec![vec![task; 1024 * 1024 / subset_reserved + 1]];
-    let error = source.with_planned_files(oversized).unwrap_err();
-    assert!(matches!(
-        error,
-        datafusion::error::DataFusionError::ResourcesExhausted(_)
-    ));
-    assert_eq!(runtime.memory_pool.reserved(), reserved + subset_reserved);
+    let stream = source.open(0, harness.context().task_ctx())?;
     drop(source);
-    assert_eq!(runtime.memory_pool.reserved(), subset_reserved);
-    let stream = subset.open(0, harness.context().task_ctx())?;
-    drop(subset);
-    assert_eq!(runtime.memory_pool.reserved(), subset_reserved);
+    assert_eq!(runtime.memory_pool.reserved(), reserved);
     drop(stream);
     assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn public_builder_plans_projected_filtered_scans() -> Result<()> {
-    let harness = IcebergTestHarness::new().await?;
-    let provider = harness.context().table_provider("taxi").await?;
-    let provider = provider
-        .downcast_ref::<IcebergCatalogTableProvider>()
-        .unwrap();
-    let table = provider
-        .catalog()
-        .load_table(provider.table_ident())
-        .await
-        .map_err(iceberg_datafusion::to_datafusion_error)?;
-    let schema = provider.schema();
-    let projection = vec![schema.index_of("pickup_date")?];
-    let pickup_date = ScalarValue::Date32(Some(19732)); // 2024-01-10
-    let reader = table.reader_builder().with_batch_size(7).build();
-    let context = harness.context().task_ctx();
-    let eager_context = SessionContext::new_with_config(
-        SessionConfig::new()
-            .with_target_partitions(4)
-            .with_option_extension(IcebergDataFusionConfig::default())
-            .set_bool("iceberg.execution.eager_file_planning", true),
-    )
-    .task_ctx();
-    let builder = IcebergDataSourceBuilder::new(&context)
-        .with_schema(schema)
-        .with_table(table)
-        .with_reader(reader)
-        .with_projection(Some(&projection))
-        .with_filters(&[col("pickup_date").eq(lit(pickup_date))])
-        .with_fetch(Some(19));
-    let lazy = builder.clone().build().await?;
-    assert!(lazy.downcast_ref::<IcebergDataSource>().is_some());
-    let source = builder.with_context(&eager_context).build().await?;
-    let source = source.downcast_ref::<EagerIcebergDataSource>().unwrap();
-    assert_eq!(source.schema().field(0).name(), "pickup_date");
-    assert_eq!(source.planned_files().len(), 1);
-    assert_eq!(source.output_partitioning().partition_count(), 1);
-    let batches = collect(source.open(0, harness.context().task_ctx())?).await?;
-    let lazy_batches = collect(lazy.open(0, harness.context().task_ctx())?).await?;
+async fn replacement_assignments_have_independent_memory_reservations() -> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .build()
+        .await?;
+    let runtime = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(64 * 1024)))
+            .build()?,
+    );
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .with_runtime_env(runtime.clone())
+        .build()
+        .await?;
+
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
+    let original_reserved = runtime.memory_pool.reserved();
+    let task = source.planned_files().next().unwrap().clone();
+    let replacement = source.with_planned_files(vec![vec![task.clone()]])?;
+    let replacement_reserved = runtime.memory_pool.reserved() - original_reserved;
+    assert!(replacement_reserved > 0);
+    // The original and the successful replacement must survive a failed replacement.
+    let error = source
+        .with_planned_files(vec![vec![task; 4096]])
+        .unwrap_err();
+    assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
     assert_eq!(
-        batches_to_sort_string(&batches),
-        batches_to_sort_string(&lazy_batches)
+        runtime.memory_pool.reserved(),
+        original_reserved + replacement_reserved
     );
-    assert_eq!(
-        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-        19
-    );
-    assert!(
-        batches
-            .iter()
-            .chain(&lazy_batches)
-            .all(|batch| batch.num_rows() <= 7)
-    );
-    assert!(
-        batches
-            .iter()
-            .all(|batch| batch.schema().as_ref() == source.schema().as_ref())
-    );
+    drop(plan);
+    assert_eq!(runtime.memory_pool.reserved(), replacement_reserved);
+    drop(replacement);
+    assert_eq!(runtime.memory_pool.reserved(), 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn builder_preserves_session_reader_settings_at_execution()
--> StdResult<(), Box<dyn Error>> {
-    let fixture = table_with_position_delete().await?;
-    let provider =
-        IcebergStaticTableProvider::try_new_from_table(fixture.table.clone()).await?;
-    let context =
-        SessionContext::new_with_config(SessionConfig::new().with_batch_size(1))
-            .task_ctx();
-    let source = IcebergDataSourceBuilder::new(&context)
-        .with_schema(provider.schema())
-        .with_table(fixture.table.clone())
+async fn public_builder_preserves_projection_filters_and_an_explicit_reader() -> TestResult
+{
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(4)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let table = harness.context().table_provider("taxi").await?;
+    let table = table.downcast_ref::<IcebergCatalogTableProvider>().unwrap();
+    let iceberg_table = table.catalog().load_table(table.table_ident()).await?;
+    let projection = vec![table.schema().index_of("pickup_date")?];
+    let reader = iceberg_table.reader_builder().with_batch_size(2).build();
+    let context = harness.context().task_ctx();
+
+    let lazy = IcebergTestHarness::builder()
+        .with_config(SessionConfig::new().with_target_partitions(4))
+        .build()
+        .await?;
+    let builder = IcebergDataSourceBuilder::new(&context)
+        .with_schema(table.schema())
+        .with_table(iceberg_table)
+        .with_projection(Some(&projection))
+        // 19732 is 2024-01-10, selecting one daily Taxi file.
+        .with_filters(&[col("pickup_date").eq(lit(ScalarValue::Date32(Some(19732))))])
+        .with_reader(reader)
+        .with_fetch(Some(3));
+    let eager = builder.clone().build().await?;
+    let lazy_source = builder
+        .with_context(&lazy.context().task_ctx())
+        .build()
+        .await?;
+    assert!(lazy_source.downcast_ref::<IcebergDataSource>().is_some());
+    assert_eq!(
+        eager
+            .downcast_ref::<EagerIcebergDataSource>()
+            .unwrap()
+            .planned_files()
+            .len(),
+        1
+    );
+    let batches = collect(eager.open(0, context)?).await?;
+    let lazy_batches = collect(lazy_source.open(0, lazy.context().task_ctx())?).await?;
+    assert!(
+        batches
+            .iter()
+            .chain(&lazy_batches)
+            .all(|batch| batch.num_rows() <= 2)
+    );
+    let rows = pretty_format_batches(&batches)?.to_string();
+    insta::assert_snapshot!(rows, @"
+    +-------------+
+    | pickup_date |
+    +-------------+
+    | 2024-01-10  |
+    | 2024-01-10  |
+    | 2024-01-10  |
+    +-------------+
+    ");
+    assert_eq!(rows, pretty_format_batches(&lazy_batches)?.to_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn builder_preserves_session_reader_settings_at_execution() -> TestResult {
+    let fixture = ScanFixture::builder().with_file([0, 1, 2]).build().await?;
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(1),
+        )
         .build()
         .await?;
 
-    // The source keeps its construction settings even if another execution
-    // context has the default batch size. The fixture has three surviving rows.
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = scan_source(plan.as_ref());
+    assert!(source.downcast_ref::<IcebergDataSource>().is_some());
+    // A different execution context must not silently replace the construction settings.
     let execution_context = SessionContext::new().task_ctx();
+    assert!(source.open(1, execution_context.clone()).is_err());
     let batches = collect(source.open(0, execution_context)?).await?;
     assert_eq!(
         batches
@@ -451,39 +602,115 @@ async fn builder_preserves_session_reader_settings_at_execution()
 }
 
 #[tokio::test]
-async fn reconstructed_scan_preserves_reader_settings_fetch_and_deletes()
--> StdResult<(), Box<dyn Error>> {
-    let fixture = table_with_position_delete().await?;
-    let context = SessionContext::new_with_config(eager_config());
-    let provider =
-        IcebergStaticTableProvider::try_new_from_table(fixture.table.clone()).await?;
-    let plan = provider.scan(&context.state(), None, &[], None).await?;
-    let original = iceberg_source(plan.as_ref());
-    let mut files: Vec<_> = original.planned_files().cloned().collect();
-    files.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
+async fn replacement_groups_preserve_order_empty_partitions_and_repeated_tasks()
+-> TestResult {
+    let fixture = ScanFixture::builder()
+        .with_file([0])
+        .with_file([1])
+        .with_file([2])
+        .build()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
+    let files = files_by_name(source);
+
+    let assigned = source.with_planned_files(vec![
+        vec![files[2].clone(), files[0].clone(), files[2].clone()],
+        vec![],
+    ])?;
+    insta::assert_snapshot!(file_groups(&assigned)?, @"
+    partition 0: [data-2.parquet, data-0.parquet, data-2.parquet]
+    partition 1: []
+    ");
+    assert_eq!(assigned.planned_files().len(), 3);
+    let mut all_files = assigned.planned_files();
+    all_files.next();
+    assert_eq!(all_files.len(), 2);
+    let narrowed = assigned.with_planned_files(vec![vec![], vec![files[0].clone()]])?;
+    insta::assert_snapshot!(file_groups(&narrowed)?, @"
+    partition 0: []
+    partition 1: [data-0.parquet]
+    ");
+    assert_eq!(source.planned_files().len(), 3);
+    let batches = collect(assigned.open(0, harness.context().task_ctx())?).await?;
+    // Show the selected values as well as their multiplicity, not just a row count.
+    insta::assert_snapshot!(batches_to_sort_string(&batches), @"
+    +----+
+    | id |
+    +----+
+    | 0  |
+    | 2  |
+    | 2  |
+    +----+
+    ");
+    assert!(
+        collect(assigned.open(1, harness.context().task_ctx())?)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconstruction_preserves_groups_reader_settings_fetch_and_deletes() -> TestResult
+{
+    let fixture = ScanFixture::builder()
+        .with_file([0, 1])
+        .with_file([2, 3])
+        .with_position_delete(0, 0)
+        .build()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let original = eager_source(plan.as_ref());
+    let files = files_by_name(original);
+    let schema = original.schema().clone();
+    let file_io = fixture.table.file_io().clone();
     let reader = fixture
         .table
         .reader_builder()
         .with_batch_size(1)
         .with_data_file_concurrency_limit(1)
         .build();
-    let rebuilt = IcebergDataSourceBuilder::new(&context.task_ctx())
-        .with_schema(original.schema().clone())
-        .with_planned_files(vec![files.clone(), vec![]])
-        .with_file_io(fixture.table.file_io().clone())
+    let context = harness.context().task_ctx();
+    // Reconstruction has no table/catalog argument and cannot rediscover files.
+    drop(plan);
+    drop(harness);
+
+    let rebuilt = IcebergDataSourceBuilder::new(&context)
+        .with_schema(schema)
+        .with_planned_files(vec![vec![], files])
+        .with_file_io(file_io)
         .with_reader(reader)
         .with_fetch(Some(2))
         .build()?;
-    let reassigned = rebuilt
-        .downcast_ref::<EagerIcebergDataSource>()
-        .unwrap()
-        .with_planned_files(vec![vec![], files])?;
-    assert!(
-        collect(reassigned.open(0, context.task_ctx())?)
-            .await?
-            .is_empty()
-    );
-    let batches = collect(reassigned.open(1, context.task_ctx())?).await?;
+    let source = rebuilt.downcast_ref::<EagerIcebergDataSource>().unwrap();
+    insta::assert_snapshot!(file_groups(source)?, @"
+    partition 0: []
+    partition 1: [data-0.parquet, data-1.parquet]
+    ");
+    assert!(collect(source.open(0, context.clone())?).await?.is_empty());
+    assert!(source.open(2, context.clone()).is_err());
+    let batches = collect(source.open(1, context.clone())?).await?;
     assert_eq!(
         batches
             .iter()
@@ -491,137 +718,157 @@ async fn reconstructed_scan_preserves_reader_settings_fetch_and_deletes()
             .collect::<Vec<_>>(),
         vec![1, 1]
     );
-    let ids: Vec<_> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .iter()
-                .copied()
-        })
-        .collect();
-    assert_eq!(ids, vec![1, 2]); // ID 0 is deleted; fetch excludes ID 3.
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
+    +----+
+    | id |
+    +----+
+    | 1  |
+    | 2  |
+    +----+
+    ");
+    // Re-executing a reconstructed source must not consume its retained descriptors.
+    let again = collect(source.open(1, context)?).await?;
+    assert_eq!(
+        pretty_format_batches(&batches)?.to_string(),
+        pretty_format_batches(&again)?.to_string()
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn assigned_file_groups_can_be_regrouped_and_reconstructed() -> Result<()> {
+async fn reconstruction_requires_groups_but_allows_empty_partitions() -> TestResult {
+    let fixture = ScanFixture::builder().with_file([0, 1]).build().await?;
     let harness = IcebergTestHarness::builder()
-        .with_config(eager_config())
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
         .build()
         .await?;
-    let provider = harness.context().table_provider("taxi").await?;
-    let catalog = provider
-        .downcast_ref::<IcebergCatalogTableProvider>()
-        .unwrap();
-    let table = catalog
-        .catalog()
-        .load_table(catalog.table_ident())
-        .await
-        .map_err(iceberg_datafusion::to_datafusion_error)?;
-    let projection = vec![provider.schema().index_of("pickup_date")?];
-    let plan = provider
-        .scan(
-            &harness.context().state(),
-            Some(&projection),
-            &[col("trip_distance").gt(lit(20.0))],
-            None,
-        )
-        .await?;
-    let source = iceberg_source(plan.as_ref());
-    let files: Vec<_> = source.planned_files().cloned().collect();
-    let assigned = source
-        .with_planned_files(vec![vec![files[6].clone(), files[1].clone()], vec![]])?;
-    let paths = |source: &EagerIcebergDataSource, partition| -> Result<Vec<String>> {
-        Ok(source
-            .planned_partition_files(partition)?
-            .map(|task| task.data_file_path().to_owned())
-            .collect())
-    };
-    assert_eq!(
-        paths(&assigned, 0)?,
-        vec![files[6].data_file_path(), files[1].data_file_path()]
-    );
-    let nested = assigned.with_planned_files(vec![vec![], vec![files[6].clone()]])?;
-    assert_eq!(paths(&nested, 1)?, vec![files[6].data_file_path()]);
-    assert_eq!(nested.planned_files().len(), 1);
-    assert!(source.with_planned_files(vec![]).is_err());
-
-    let groups: Vec<_> = (0..2)
-        .map(|partition| {
-            Ok(assigned
-                .planned_partition_files(partition)?
-                .cloned()
-                .collect::<Vec<_>>())
-        })
-        .collect::<Result<_>>()?;
-    let encoded = serde_json::to_vec(&groups).unwrap();
-    let groups = serde_json::from_slice(&encoded).unwrap();
-    // Reconstruction needs only assigned descriptors, the projected schema and a
-    // locally configured reader. It never consults a catalog or plans manifests.
-    let reader = table
-        .reader_builder()
-        .with_data_file_concurrency_limit(1)
-        .build();
-    let file_io = table.file_io().clone();
-    drop(table);
-    drop(provider);
-    drop(plan);
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
     let context = harness.context().task_ctx();
+    let reader = fixture.table.reader_builder().build();
+
+    let error = source.with_planned_files(vec![]).unwrap_err();
+    insta::assert_snapshot!(error.to_string(), @"Execution error: Iceberg scan requires at least one file group");
+    let empty = IcebergDataSourceBuilder::new(&context)
+        .with_schema(source.schema().clone())
+        .with_planned_files(vec![])
+        .with_file_io(fixture.table.file_io().clone())
+        .with_reader(reader.clone())
+        .build()
+        .unwrap_err();
+    assert_eq!(empty.to_string(), error.to_string());
+    let empty_partitions = IcebergDataSourceBuilder::new(&context)
+        .with_schema(source.schema().clone())
+        .with_planned_files(vec![vec![], vec![]])
+        .with_file_io(fixture.table.file_io().clone())
+        .with_reader(reader)
+        .build()?;
+    let empty_partitions = empty_partitions
+        .downcast_ref::<EagerIcebergDataSource>()
+        .unwrap();
+    insta::assert_snapshot!(file_groups(empty_partitions)?, @"
+    partition 0: []
+    partition 1: []
+    ");
+    assert_eq!(empty_partitions.planned_files().len(), 0);
     assert!(
-        IcebergDataSourceBuilder::new(&context)
-            .with_schema(assigned.schema().clone())
-            .with_planned_files(vec![])
-            .with_file_io(file_io.clone())
-            .with_reader(reader.clone())
-            .build()
-            .is_err()
+        collect(empty_partitions.open(0, context.clone())?)
+            .await?
+            .is_empty()
     );
-    let builder = IcebergDataSourceBuilder::new(&context)
-        .with_schema(assigned.schema().clone())
-        .with_planned_files(groups)
-        .with_file_io(file_io)
-        .with_reader(reader);
+    assert!(
+        collect(empty_partitions.open(1, context)?)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconstruction_uses_the_replacement_context_memory_pool() -> TestResult {
+    let fixture = ScanFixture::builder().with_file([0, 1]).build().await?;
+    let harness = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT * FROM items").await?;
+    let source = eager_source(plan.as_ref());
+    let context = harness.context().task_ctx();
+    let reader = fixture.table.reader_builder().build();
     let limited_runtime = Arc::new(
         RuntimeEnvBuilder::new()
             .with_memory_pool(Arc::new(GreedyMemoryPool::new(1)))
             .build()?,
     );
-    let limited_context =
-        SessionContext::new_with_config_rt(SessionConfig::new(), limited_runtime.clone());
-    let error = builder
-        .clone()
-        .with_context(&limited_context.task_ctx())
+    let limited = IcebergTestHarness::builder()
+        .with_table("items", fixture.table.clone())
+        .with_config(SessionConfig::new().with_target_partitions(1))
+        .with_runtime_env(limited_runtime.clone())
+        .build()
+        .await?;
+    let rebuilt = IcebergDataSourceBuilder::new(&context)
+        .with_schema(source.schema().clone())
+        .with_planned_files(vec![source.planned_files().cloned().collect()])
+        .with_file_io(fixture.table.file_io().clone())
+        .with_reader(reader)
+        .with_context(&limited.context().task_ctx())
         .build()
         .unwrap_err();
-    assert!(matches!(
-        error,
-        datafusion::error::DataFusionError::ResourcesExhausted(_)
-    ));
+    assert!(matches!(rebuilt, DataFusionError::ResourcesExhausted(_)));
     assert_eq!(limited_runtime.memory_pool.reserved(), 0);
-    let rebuilt = builder.build()?;
-    let rebuilt = rebuilt.downcast_ref::<EagerIcebergDataSource>().unwrap();
-    // A reconstructed source supports the same value-based assignment setter.
-    let replaced = rebuilt.with_planned_files(vec![vec![], vec![files[6].clone()]])?;
-    assert_eq!(paths(&replaced, 1)?, paths(&nested, 1)?);
-    assert_eq!(rebuilt.output_partitioning().partition_count(), 2);
-    assert_eq!(paths(rebuilt, 0)?, paths(&assigned, 0)?);
-    for partition in 0..2 {
-        let expected =
-            collect(assigned.open(partition, harness.context().task_ctx())?).await?;
-        for _ in 0..2 {
-            let actual =
-                collect(rebuilt.open(partition, harness.context().task_ctx())?).await?;
-            assert_eq!(
-                batches_to_sort_string(&actual),
-                batches_to_sort_string(&expected)
-            );
-        }
-    }
-    assert!(rebuilt.open(2, harness.context().task_ctx()).is_err());
     Ok(())
+}
+
+fn scan_source(plan: &dyn ExecutionPlan) -> &dyn DataSource {
+    if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
+        return scan.data_source().as_ref();
+    }
+    let children = plan.children();
+    assert_eq!(children.len(), 1, "expected a query over one Iceberg scan");
+    scan_source(children[0].as_ref())
+}
+
+fn eager_source(plan: &dyn ExecutionPlan) -> &EagerIcebergDataSource {
+    scan_source(plan)
+        .downcast_ref::<EagerIcebergDataSource>()
+        .expect("expected eager Iceberg source")
+}
+
+fn file_name(task: &FileScanTask) -> String {
+    Path::new(task.data_file_path())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn files_by_name(source: &EagerIcebergDataSource) -> Vec<FileScanTask> {
+    let mut files = source.planned_files().cloned().collect::<Vec<_>>();
+    files.sort_by_key(file_name);
+    files
+}
+
+fn file_groups(source: &EagerIcebergDataSource) -> Result<String> {
+    (0..source.output_partitioning().partition_count())
+        .map(|partition| {
+            let names = source
+                .planned_partition_files(partition)?
+                .map(file_name)
+                .collect::<Vec<_>>();
+            Ok(format!("partition {partition}: [{}]", names.join(", ")))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|lines| lines.join("\n"))
 }
