@@ -104,6 +104,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_the_rows_returned_by_a_limited_iceberg_scan() -> Result<()> {
+        let harness = IcebergTestHarness::new().await?;
+        // Only row counts, so the output doesn't vary between runs.
+        harness
+            .query("SET datafusion.explain.analyze_categories = 'rows'")
+            .await?;
+        let (_, explain) = harness
+            .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi LIMIT 3")
+            .await?;
+
+        insta::assert_snapshot!(explain, @r"
+    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
+    | plan_type         | plan                                                                                                                            |
+    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
+    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                     |
+    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
+    |                   |                                                                                                                                 |
+    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
+    ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn avoids_scanning_for_limit_zero() -> Result<()> {
         let harness = IcebergTestHarness::new().await?;
         let (plan, batches) = harness
