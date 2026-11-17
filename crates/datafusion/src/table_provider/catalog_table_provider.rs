@@ -34,9 +34,10 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
+use crate::IcebergDataFusionConfig;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
-use crate::read::IcebergDataSource;
+use crate::read::IcebergDataSourceBuilder;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -126,7 +127,7 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -139,12 +140,17 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot)
-        let source = IcebergDataSource::builder(table, self.schema.clone())
+        let mut builder = IcebergDataSourceBuilder::new(&table, self.schema.clone())
             .with_projection(projection)
             .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
-        Ok(DataSourceExec::from_data_source(source))
+            .with_fetch(limit);
+        let iceberg_cfg = IcebergDataFusionConfig::from_config_or_default(state.config());
+        if iceberg_cfg.execution.eager_file_planning {
+            builder = builder
+                .try_with_eagerly_planned_file_scan_tasks(state)
+                .await?;
+        }
+        Ok(DataSourceExec::from_data_source(builder.build()?))
     }
 
     fn supports_filters_pushdown(
@@ -242,6 +248,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::read::IcebergDataSource;
 
     #[tokio::test]
     async fn test_catalog_backed_provider_creation() {
@@ -455,18 +462,20 @@ mod tests {
         let out_of_range = schema.fields().len();
 
         // Columns come back in the projection's order, not the table's.
-        let source = IcebergDataSource::builder(table.clone(), schema.clone())
+        let source = IcebergDataSourceBuilder::new(&table, schema.clone())
             .with_projection(Some(&vec![1, 0]))
             .build()
             .unwrap();
-        insta::assert_debug_snapshot!(source.projection(), @r#"
+        let schema = source.schema();
+        let cols = schema.fields().iter().map(|v| v.name()).collect::<Vec<_>>();
+        insta::assert_debug_snapshot!(cols, @r#"
         [
             "name",
             "id",
         ]
         "#);
 
-        let err = IcebergDataSource::builder(table, schema)
+        let err = IcebergDataSourceBuilder::new(&table, schema)
             .with_projection(Some(&vec![0, out_of_range]))
             .build()
             .unwrap_err();

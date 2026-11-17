@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod file_scan_task_provider;
 pub(crate) mod predicate;
 pub(crate) mod scan;
 
+pub use file_scan_task_provider::{
+    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderContext,
+    LazyFileScanTaskProvider,
+};
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};

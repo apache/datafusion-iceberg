@@ -17,6 +17,7 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
+use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSc
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
@@ -49,7 +51,9 @@ use iceberg::{
 use iceberg_datafusion::metadata::{
     IcebergMetadataDataSource, IcebergMetadataTableProvider,
 };
-use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::read::{
+    IcebergDataSource, IcebergDataSourceBuilder, LazyFileScanTaskProvider,
+};
 use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
@@ -914,11 +918,20 @@ async fn run(
     Ok(pretty_format_batches(&run_batches(plan, ctx).await?)?.to_string())
 }
 
+/// The lazy file discovery of a source built by [`IcebergDataSourceBuilder`].
+fn lazy_files(scan: &IcebergDataSource) -> &LazyFileScanTaskProvider {
+    (scan.file_scan_task_provider() as &dyn Any)
+        .downcast_ref::<LazyFileScanTaskProvider>()
+        .expect("lazy file discovery")
+}
+
 /// Rebuilds `scan` from its accessors alone, as a codec would.
 fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
-    IcebergDataSource::builder(scan.table().clone(), scan.schema())
-        .with_snapshot_id(scan.snapshot_id())
-        .with_predicate(scan.predicate().cloned())
+    let state = SessionStateBuilder::new().with_default_features().build();
+    let files = lazy_files(scan);
+    IcebergDataSourceBuilder::new(scan.table(), &state, scan.schema())
+        .with_snapshot_id(files.snapshot_id())
+        .with_predicate(files.predicate().cloned())
         .with_fetch(scan.fetch())
         .build()
         .unwrap()
@@ -1036,12 +1049,14 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(
-        scan.predicate().map(ToString::to_string).as_deref(),
+        lazy_files(scan)
+            .predicate()
+            .map(ToString::to_string)
+            .as_deref(),
         Some("foo1 = 1")
     );
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.schema(), scan.schema());
-    assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
         +------+------+
@@ -1061,7 +1076,9 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .data_source()
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
-    assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
+    let schema = scan.schema();
+    let cols = schema.fields().iter().map(|v| v.name()).collect::<Vec<_>>();
+    assert_eq!(cols, vec!["foo1", "foo2"]);
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
@@ -1076,7 +1093,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+    let partial = IcebergDataSourceBuilder::new(pinned.table(), &ctx.state(), foo2_only)
         .with_snapshot_id(Some(snapshot_id))
         .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"

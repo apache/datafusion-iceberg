@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use super::file_scan_task_provider::{
+    FileScanTaskProvider, FileScanTaskProviderContext, LazyFileScanTaskProvider,
+};
+use super::predicate::convert_filters_to_predicate;
+use crate::read::EagerFileScanTaskProvider;
+use crate::to_datafusion_error;
+
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::catalog::Session;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::source::DataSource;
@@ -27,106 +33,120 @@ use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
+use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
-use super::predicate::convert_filters_to_predicate;
-use crate::to_datafusion_error;
-
-/// Manages the scanning process of an Iceberg [`Table`], encapsulating the
-/// necessary details and computed properties required for execution planning.
+/// Reads an Iceberg [`Table`]: the file tasks supplied by its
+/// [`FileScanTaskProvider`], as batches of its projected schema.
+///
+/// Built with [`IcebergDataSourceBuilder`],
+/// which discovers files lazily during execution. Swap in another provider
+/// with [`Self::with_file_scan_task_provider`].
 #[derive(Debug, Clone)]
 pub struct IcebergDataSource {
-    /// A table in the catalog.
+    /// Table the files belong to, used to build the reader.
     table: Table,
-    /// Snapshot of the table to scan.
-    snapshot_id: Option<i64>,
     /// Schema returned by this data source after projection.
     schema: ArrowSchemaRef,
-    /// Projection column names in the output schema.
-    projection: Vec<String>,
-    /// Filter to apply to the table scan
-    predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
+    /// Files to read, by output partition.
+    file_scan_task_provider: Arc<dyn FileScanTaskProvider>,
+    /// Output rows and compute time recorded while reading.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergDataSource {
-    /// Starts building a source that scans `table` and returns the columns of
-    /// `schema`, all of them unless [`IcebergDataSourceBuilder::with_projection`]
-    /// selects some. Columns are read from Iceberg by name.
-    pub fn builder(table: Table, schema: ArrowSchemaRef) -> IcebergDataSourceBuilder {
-        IcebergDataSourceBuilder {
-            table,
-            schema,
-            projection: None,
-            snapshot_id: None,
-            predicate: None,
-            fetch: None,
-        }
-    }
-
     pub fn table(&self) -> &Table {
         &self.table
-    }
-
-    pub fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
     }
 
     pub fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
 
-    pub fn projection(&self) -> &[String] {
-        &self.projection
-    }
-
-    pub fn predicate(&self) -> Option<&Predicate> {
-        self.predicate.as_ref()
-    }
-
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
     }
+
+    /// Supplies the files this source reads. Downcast to inspect a concrete
+    /// provider.
+    pub fn file_scan_task_provider(&self) -> &dyn FileScanTaskProvider {
+        self.file_scan_task_provider.as_ref()
+    }
+
+    /// Returns a source that reads the files of `file_scan_task_provider`
+    /// instead, with fresh metrics. The
+    /// tasks must read this source's projected columns.
+    pub fn with_file_scan_task_provider(
+        &self,
+        file_scan_task_provider: Arc<dyn FileScanTaskProvider>,
+    ) -> Self {
+        Self {
+            file_scan_task_provider,
+            metrics: Default::default(),
+            ..self.clone()
+        }
+    }
 }
 
-/// Builds an [`IcebergDataSource`]. Created by [`IcebergDataSource::builder`].
+/// Builds an [`IcebergDataSource`].
+///
+/// [`Self::new`] takes what every scan needs; everything else is optional and
+/// set with the `with_*` methods, each defaulting to `None`.
 ///
 /// A table provider passes the table's schema and selects columns with
 /// [`Self::with_projection`]. To rebuild a source, such as in another process,
 /// pass its [`IcebergDataSource::schema`], which is already projected, and no
 /// projection.
-#[derive(Debug, Clone)]
-pub struct IcebergDataSourceBuilder {
-    table: Table,
+#[derive(Clone)]
+pub struct IcebergDataSourceBuilder<'a> {
+    table: &'a Table,
     schema: ArrowSchemaRef,
     projection: Option<Vec<usize>>,
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
     fetch: Option<usize>,
+    collected_file_scan_tasks: Option<Vec<Vec<FileScanTask>>>,
 }
 
-impl IcebergDataSourceBuilder {
+impl<'a> IcebergDataSourceBuilder<'a> {
+    /// Starts building a source that scans `table` and returns the columns of
+    /// `schema`, all of them unless [`Self::with_projection`] selects some.
+    /// Columns are read from Iceberg by name.
+    pub fn new(table: &'a Table, schema: ArrowSchemaRef) -> Self {
+        Self {
+            table,
+            schema,
+            projection: None,
+            snapshot_id: None,
+            predicate: None,
+            fetch: None,
+            collected_file_scan_tasks: None,
+        }
+    }
+
     /// Returns only the columns of the schema at these indices, or all of them
-    /// if `None` (the default). Indices are into the schema passed to
-    /// [`IcebergDataSource::builder`].
+    /// if `None`. Indices are into the schema passed to [`Self::new`].
     pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
         self.projection = projection.cloned();
         self
     }
 
-    /// Scans this snapshot, or the table's current one if `None` (the default).
+    /// Scans this snapshot, or the table's current one if `None`.
     pub fn with_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
         self.snapshot_id = snapshot_id;
         self
     }
 
-    /// Filters the scan with `predicate`, or not at all if `None` (the default).
+    /// Filters the scan with `predicate`, or not at all if `None`.
     pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
         self.predicate = predicate;
         self
@@ -139,34 +159,114 @@ impl IcebergDataSourceBuilder {
         self.with_predicate(convert_filters_to_predicate(filters))
     }
 
-    /// Stops after `fetch` rows, or reads every row if `None` (the default).
+    /// Stops after `fetch` rows, or reads every row if `None`.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
+    }
+
+    /// Reads these already planned file tasks, one output partition per
+    /// group, instead of discovering files. Use this to rebuild an eagerly
+    /// planned source, such as in another process.
+    pub fn with_file_scan_tasks(
+        mut self,
+        file_scan_tasks: Vec<Vec<FileScanTask>>,
+    ) -> Self {
+        self.collected_file_scan_tasks = Some(file_scan_tasks);
+        self
+    }
+
+    /// Gather all the [FileScanTask] in-memory, split round-robin into up to
+    /// `session`'s target partitions.
+    ///
+    /// Discovery uses the projection, snapshot and predicate set so far, so
+    /// call this after the other `with_*` methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if discovery fails.
+    pub async fn try_with_eagerly_planned_file_scan_tasks(
+        mut self,
+        session: &dyn Session,
+    ) -> Result<Self> {
+        let scan = match self.snapshot_id {
+            Some(snapshot_id) => self.table.scan().snapshot_id(snapshot_id),
+            None => self.table.scan(),
+        };
+
+        // Read only the projected columns, which are what `build` reports in
+        // the source's schema.
+        let projection: Vec<String> = self
+            .projected_schema()?
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let mut scan = scan.select(&projection);
+        if let Some(predicate) = &self.predicate {
+            scan = scan.with_filter(predicate.clone());
+        }
+        let scan = scan.build().map_err(to_datafusion_error)?;
+        let mut stream = futures::stream::once(async move { scan.plan_files().await })
+            .try_flatten()
+            .boxed();
+
+        let target_partitions = session.config().target_partitions();
+        let mut groups: Vec<Vec<FileScanTask>> = Vec::new();
+        let mut partition = 0;
+        while let Some(task) = stream.try_next().await.map_err(to_datafusion_error)? {
+            if partition == groups.len() {
+                groups.push(Vec::new());
+            }
+            groups[partition].push(task);
+            partition = (partition + 1) % target_partitions;
+        }
+
+        if groups.is_empty() {
+            groups.push(Vec::new());
+        }
+
+        self.collected_file_scan_tasks = Some(groups);
+        Ok(self)
     }
 
     /// Builds the source, which reads the columns of its projected schema by name.
     ///
     /// # Errors
     ///
-    /// Returns an error if the projection is out of bounds for the schema.
+    /// Returns an error if the projection is out of bounds for the schema, or
+    /// if [`Self::with_file_scan_tasks`] was given no groups.
     pub fn build(self) -> Result<IcebergDataSource> {
-        let schema = match &self.projection {
-            None => self.schema,
-            Some(projection) => Arc::new(self.schema.project(projection)?),
-        };
-        let projection = schema
+        let schema = self.projected_schema()?;
+        let projection: Vec<String> = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect();
+
         Ok(IcebergDataSource {
-            table: self.table,
-            snapshot_id: self.snapshot_id,
+            table: self.table.clone(),
             schema,
-            projection,
-            predicate: self.predicate,
             fetch: self.fetch,
+            file_scan_task_provider: match self.collected_file_scan_tasks {
+                Some(file_scan_tasks) => {
+                    Arc::new(EagerFileScanTaskProvider { file_scan_tasks })
+                }
+                None => Arc::new(LazyFileScanTaskProvider {
+                    snapshot_id: self.snapshot_id,
+                    projection,
+                    predicate: self.predicate,
+                }),
+            },
+            metrics: Default::default(),
+        })
+    }
+
+    /// The schema passed to [`Self::new`], narrowed to the projection.
+    fn projected_schema(&self) -> Result<ArrowSchemaRef> {
+        Ok(match &self.projection {
+            None => Arc::clone(&self.schema),
+            Some(projection) => Arc::new(self.schema.project(projection)?),
         })
     }
 }
@@ -181,47 +281,38 @@ impl DataSource for IcebergDataSource {
 
     fn open(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let fut = get_batch_stream(
-            self.table.clone(),
-            self.snapshot_id,
-            Some(self.projection.clone()),
-            self.predicate.clone(),
-            context
-                .session_config()
-                .options()
-                .execution
-                .parquet
-                .enable_page_index,
-            context.session_config().batch_size(),
-        );
-        let stream = futures::stream::once(fut).try_flatten();
-
-        // Apply the fetch if specified.
-        let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(limit) = self.fetch {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            limited_stream,
+        let tasks = Arc::clone(&self.file_scan_task_provider).open(
+            partition,
+            FileScanTaskProviderContext {
+                task_context: &context,
+                table: &self.table,
+            },
+        )?;
+        let config = context.session_config();
+        let reader = self
+            .table
+            .reader_builder()
+            .with_batch_size(config.batch_size())
+            .with_row_selection_enabled(
+                config.options().execution.parquet.enable_page_index,
+            );
+        let stream = reader
+            // DataFusion already runs partitions concurrently, so each one reads a
+            // single file at a time.
+            .with_data_file_concurrency_limit(1)
+            .build()
+            .read(tasks)
+            .map_err(to_datafusion_error)?
+            .stream()
+            .map_err(to_datafusion_error);
+        Ok(Box::pin(LimitStream::new(
+            Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream)),
+            0,
+            self.fetch,
+            BaselineMetrics::new(&self.metrics, partition),
         )))
     }
 
@@ -230,11 +321,15 @@ impl DataSource for IcebergDataSource {
         _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "format=iceberg",)?;
-        write!(f, ", projection=[{}]", self.projection.join(", "))?;
-        if let Some(predicate) = &self.predicate {
-            write!(f, ", predicate={predicate}")?;
-        }
+        // The schema is already projected, so its fields are the columns read.
+        let projection: Vec<&str> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        write!(f, "format=iceberg, projection=[{}]", projection.join(", "))?;
+        self.file_scan_task_provider.fmt_as(f)?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
         }
@@ -242,7 +337,11 @@ impl DataSource for IcebergDataSource {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        self.file_scan_task_provider.partitioning()
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.metrics.clone()
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
@@ -269,43 +368,4 @@ impl DataSource for IcebergDataSource {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         Ok(None)
     }
-}
-
-/// Asynchronously retrieves a stream of [`RecordBatch`] instances
-/// from a given table.
-///
-/// This function initializes a [`TableScan`], builds it,
-/// and then converts it into a stream of Arrow [`RecordBatch`]es.
-async fn get_batch_stream(
-    table: Table,
-    snapshot_id: Option<i64>,
-    column_names: Option<Vec<String>>,
-    predicate: Option<Predicate>,
-    enable_page_index: bool,
-    batch_size: usize,
-) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
-    let scan_builder = match snapshot_id {
-        Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
-        None => table.scan(),
-    };
-
-    let mut scan_builder = match column_names {
-        Some(column_names) => scan_builder.select(column_names),
-        None => scan_builder.select_all(),
-    };
-    if let Some(predicate) = predicate {
-        scan_builder = scan_builder.with_filter(predicate);
-    }
-    let table_scan = scan_builder
-        .with_row_selection_enabled(enable_page_index)
-        .with_batch_size(Some(batch_size))
-        .build()
-        .map_err(to_datafusion_error)?;
-
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
 }

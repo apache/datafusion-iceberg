@@ -30,8 +30,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
+use crate::IcebergDataFusionConfig;
 use crate::error::to_datafusion_error;
-use crate::read::IcebergDataSource;
+use crate::read::IcebergDataSourceBuilder;
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -120,19 +121,25 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh)
-        let source = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
+        let mut builder = IcebergDataSourceBuilder::new(&self.table, self.schema.clone())
             .with_snapshot_id(self.snapshot_id)
             .with_projection(projection)
             .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
-        Ok(DataSourceExec::from_data_source(source))
+            .with_fetch(limit);
+
+        let iceberg_cfg = IcebergDataFusionConfig::from_config_or_default(state.config());
+        if iceberg_cfg.execution.eager_file_planning {
+            builder = builder
+                .try_with_eagerly_planned_file_scan_tasks(state)
+                .await?;
+        }
+        Ok(DataSourceExec::from_data_source(builder.build()?))
     }
 
     fn supports_filters_pushdown(
@@ -167,6 +174,7 @@ mod tests {
     use iceberg::table::{StaticTable, Table};
 
     use super::*;
+    use crate::read::IcebergDataSource;
 
     #[tokio::test]
     async fn test_static_provider_from_table() {
