@@ -21,6 +21,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::Statistics;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
@@ -36,6 +37,10 @@ use iceberg::table::Table;
 
 use super::predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
+
+/// Snapshot summary fields from the spec's "Optional Snapshot Summary Fields".
+const TOTAL_RECORDS: &str = "total-records";
+const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -92,6 +97,38 @@ impl IcebergDataSource {
 
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+
+    /// Estimates the rows the scan returns before its predicate and fetch,
+    /// from the snapshot summary.
+    ///
+    /// `total-records` counts rows before deletes. A position delete removes
+    /// at most one row, so position deletes are subtracted. An equality delete
+    /// can remove any number of rows, so equality deletes are ignored. Summary
+    /// fields are optional, so a missing or invalid one leaves the estimate
+    /// unknown rather than failing the query.
+    fn estimated_num_rows(&self) -> Precision<usize> {
+        let metadata = self.table.metadata();
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
+            None => match metadata.current_snapshot() {
+                Some(snapshot) => Some(snapshot),
+                // The scan of a table with no current snapshot reads nothing.
+                None => return Precision::Exact(0),
+            },
+        };
+        // The scan fails on a snapshot id that doesn't exist.
+        let Some(snapshot) = snapshot else {
+            return Precision::Absent;
+        };
+        let summary = &snapshot.summary().additional_properties;
+        let count = |key| summary.get(key)?.parse::<usize>().ok();
+        match count(TOTAL_RECORDS) {
+            Some(records) => Precision::Inexact(
+                records.saturating_sub(count(TOTAL_POSITION_DELETES).unwrap_or(0)),
+            ),
+            None => Precision::Absent,
+        }
     }
 }
 
@@ -250,7 +287,13 @@ impl DataSource for IcebergDataSource {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+        let mut statistics = Statistics::new_unknown(&self.schema);
+        statistics.num_rows = self.estimated_num_rows();
+        // Iceberg's `total-files-size` is compressed and covers every column
+        // and delete file, so estimate the in-memory size of the projected
+        // columns instead, as DataFusion's Parquet source does.
+        statistics.calculate_total_byte_size(&self.schema);
+        Ok(Arc::new(statistics.with_fetch(self.fetch, 0, 1)?))
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -308,4 +351,210 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::common::Statistics;
+    use datafusion::common::stats::Precision;
+    use datafusion::datasource::source::DataSource;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{
+        FormatVersion, MAIN_BRANCH, NestedField, Operation, PartitionSpec, PrimitiveType,
+        Schema, Snapshot, SortOrder, Summary, TableMetadataBuilder, Type,
+    };
+    use iceberg::table::Table;
+    use iceberg::{Runtime, TableIdent};
+
+    use super::IcebergDataSource;
+
+    /// Returns a table with one snapshot per summary, oldest first, with ids
+    /// counting up from 1. The last snapshot is the current one.
+    fn table_with_snapshot_summaries(summaries: &[&[(&str, &str)]]) -> Table {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
+                    .into(),
+                NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec = PartitionSpec::builder(schema.clone()).build().unwrap();
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let mut builder = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/table".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap();
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        for (snapshot_id, summary) in (1..).zip(summaries) {
+            let snapshot = Snapshot::builder()
+                .with_snapshot_id(snapshot_id)
+                .with_parent_snapshot_id((snapshot_id > 1).then_some(snapshot_id - 1))
+                .with_sequence_number(snapshot_id)
+                .with_timestamp_ms(now_ms + snapshot_id)
+                .with_manifest_list(format!(
+                    "/test/table/metadata/snap-{snapshot_id}.avro"
+                ))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: summary
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                })
+                .with_schema_id(0)
+                .build();
+            builder = builder.set_branch_snapshot(snapshot, MAIN_BRANCH).unwrap();
+        }
+
+        Table::builder()
+            .metadata(builder.build().unwrap().metadata)
+            .identifier(TableIdent::from_strs(["test", "table"]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/metadata.json")
+            .runtime(Runtime::current())
+            .build()
+            .unwrap()
+    }
+
+    /// Statistics of a scan of `table`'s fixed-width `id` column.
+    fn id_scan_statistics(
+        table: Table,
+        snapshot_id: Option<i64>,
+        fetch: Option<usize>,
+    ) -> Statistics {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let source = IcebergDataSource::builder(table, schema)
+            .with_projection(Some(&vec![0]))
+            .with_snapshot_id(snapshot_id)
+            .with_fetch(fetch)
+            .build()
+            .unwrap();
+        Arc::unwrap_or_clone(source.partition_statistics(None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reports_no_rows_for_a_table_without_snapshots() {
+        let statistics =
+            id_scan_statistics(table_with_snapshot_summaries(&[]), None, None);
+        assert_eq!(statistics.num_rows, Precision::Exact(0));
+        assert_eq!(statistics.total_byte_size, Precision::Exact(0));
+    }
+
+    #[tokio::test]
+    async fn estimates_rows_from_the_snapshot_summary() {
+        let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
+        let statistics = id_scan_statistics(table, None, None);
+        assert_eq!(statistics.num_rows, Precision::Inexact(100));
+        assert_eq!(statistics.total_byte_size, Precision::Inexact(800));
+    }
+
+    #[tokio::test]
+    async fn subtracts_position_deletes_but_not_equality_deletes() {
+        let table = table_with_snapshot_summaries(&[&[
+            ("total-records", "100"),
+            ("total-position-deletes", "30"),
+            ("total-equality-deletes", "50"),
+        ]]);
+        let statistics = id_scan_statistics(table, None, None);
+        assert_eq!(statistics.num_rows, Precision::Inexact(70));
+    }
+
+    #[tokio::test]
+    async fn estimates_no_rows_when_position_deletes_exceed_records() {
+        let table = table_with_snapshot_summaries(&[&[
+            ("total-records", "10"),
+            ("total-position-deletes", "20"),
+        ]]);
+        let statistics = id_scan_statistics(table, None, None);
+        assert_eq!(statistics.num_rows, Precision::Inexact(0));
+    }
+
+    #[tokio::test]
+    async fn ignores_an_invalid_position_delete_count() {
+        let table = table_with_snapshot_summaries(&[&[
+            ("total-records", "100"),
+            ("total-position-deletes", "-1"),
+        ]]);
+        let statistics = id_scan_statistics(table, None, None);
+        assert_eq!(statistics.num_rows, Precision::Inexact(100));
+    }
+
+    #[tokio::test]
+    async fn reports_unknown_rows_without_a_valid_record_count() {
+        for summary in [
+            &[][..],
+            &[("total-records", "-1")],
+            &[("total-records", "many")],
+        ] {
+            let table = table_with_snapshot_summaries(&[summary]);
+            let statistics = id_scan_statistics(table, None, None);
+            assert_eq!(statistics.num_rows, Precision::Absent, "{summary:?}");
+            assert_eq!(statistics.total_byte_size, Precision::Absent, "{summary:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_unknown_rows_for_a_missing_snapshot() {
+        let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
+        let statistics = id_scan_statistics(table, Some(2), None);
+        assert_eq!(statistics.num_rows, Precision::Absent);
+    }
+
+    #[tokio::test]
+    async fn uses_the_summary_of_the_scanned_snapshot() {
+        let table = table_with_snapshot_summaries(&[
+            &[("total-records", "100")],
+            &[("total-records", "200")],
+        ]);
+        assert_eq!(
+            id_scan_statistics(table.clone(), Some(1), None).num_rows,
+            Precision::Inexact(100)
+        );
+        assert_eq!(
+            id_scan_statistics(table, None, None).num_rows,
+            Precision::Inexact(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn caps_rows_at_the_fetch() {
+        let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
+        let statistics = id_scan_statistics(table, None, Some(10));
+        assert_eq!(statistics.num_rows, Precision::Inexact(10));
+        assert_eq!(statistics.total_byte_size, Precision::Inexact(80));
+    }
+
+    #[tokio::test]
+    async fn omits_the_byte_size_of_variable_width_columns() {
+        let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let source = IcebergDataSource::builder(table, schema).build().unwrap();
+        let statistics = source.partition_statistics(None).unwrap();
+        assert_eq!(statistics.num_rows, Precision::Inexact(100));
+        assert_eq!(statistics.total_byte_size, Precision::Absent);
+    }
 }
