@@ -17,24 +17,67 @@
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::physical_plan::Partitioning;
+use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use iceberg::expr::Predicate;
+use iceberg::table::Table;
 
 use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
+use crate::read::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
 /// Discovers files while executing, in a single partition: the files of a
 /// snapshot that may match a predicate.
 #[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
-    pub(crate) snapshot_id: Option<i64>,
-    pub(crate) projection: Vec<String>,
-    pub(crate) predicate: Option<Predicate>,
+    table: Table,
+    snapshot_id: Option<i64>,
+    projection: Vec<String>,
+    predicate: Option<Predicate>,
 }
 
 impl LazyFileScanTaskProvider {
+    /// Retains the table and projected column names without discovering files.
+    /// The names must match the data source's output schema.
+    pub fn new(table: Table, projection: Vec<String>) -> Self {
+        Self {
+            table,
+            projection,
+            snapshot_id: None,
+            predicate: None,
+        }
+    }
+
+    /// Selects a snapshot, or the retained table's current snapshot for `None`.
+    pub fn with_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
+        self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Sets the predicate used to prune files and filter their rows.
+    pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
+        self.predicate = predicate;
+        self
+    }
+
+    /// Pushes down supported parts of DataFusion filters. The caller must still
+    /// apply the original filters, as unsupported parts are omitted.
+    pub fn with_filters(self, filters: &[Expr]) -> Self {
+        self.with_predicate(convert_filters_to_predicate(filters))
+    }
+
+    /// Table retained for discovery, including its metadata and storage access.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Names of the columns selected during discovery.
+    pub fn projection(&self) -> &[String] {
+        &self.projection
+    }
+
     /// Snapshot to scan, or the table's current one if `None`.
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
@@ -53,12 +96,15 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
 
     fn open(
         self: Arc<Self>,
-        _partition: usize,
-        ctx: FileScanTaskProviderContext,
+        partition: usize,
+        _ctx: FileScanTaskProviderContext,
     ) -> Result<iceberg::scan::FileScanTaskStream> {
+        if partition != 0 {
+            return exec_err!("Invalid Iceberg scan partition {partition}");
+        }
         let scan = match self.snapshot_id {
-            Some(snapshot_id) => ctx.table.scan().snapshot_id(snapshot_id),
-            None => ctx.table.scan(),
+            Some(snapshot_id) => self.table.scan().snapshot_id(snapshot_id),
+            None => self.table.scan(),
         };
         let mut scan = scan.select(&self.projection);
         if let Some(predicate) = &self.predicate {

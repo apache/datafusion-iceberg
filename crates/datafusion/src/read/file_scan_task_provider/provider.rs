@@ -21,7 +21,6 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
-use iceberg::table::Table;
 
 /// Supplies the file tasks an [`IcebergDataSource`](crate::read::IcebergDataSource)
 /// reads, split into output partitions.
@@ -60,7 +59,8 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
     }
 }
 
+/// Execution context for a task stream. Discovery-specific inputs, such as a
+/// table, belong to the provider rather than the data source.
 pub struct FileScanTaskProviderContext<'a> {
     pub task_context: &'a Arc<TaskContext>,
-    pub table: &'a Table,
 }

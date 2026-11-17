@@ -20,3 +20,18 @@
 # Apache Iceberg DataFusion Integration
 
 This crate contains the integration of Apache DataFusion and Apache Iceberg.
+
+## File task providers
+
+`IcebergDataSource` reads a `FileScanTaskProvider` using a shared, process-local
+reader. It does not require a table. `LazyFileScanTaskProvider` retains a table and
+scan options and discovers files when its stream is polled;
+`EagerFileScanTaskProvider::plan` collects that discovery stream before execution.
+Table providers choose between these using `iceberg.execution.eager_file_planning`.
+
+Already-planned groups can be supplied with `EagerFileScanTaskProvider::try_new`
+and `IcebergDataSourceBuilder::with_file_scan_task_provider`. Source construction
+is synchronous, requires no current runtime, and performs no discovery. Supply an
+already-projected schema and a reader configured for the process that will execute
+it; the builder's FileIO must match that reader. See the builder's API documentation
+for a reconstruction example. Custom task providers use the same source.

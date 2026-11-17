@@ -26,7 +26,7 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -52,12 +52,29 @@ pub struct IcebergTestHarness {
     ctx: SessionContext,
 }
 
-impl IcebergTestHarness {
-    pub async fn new() -> Result<Self> {
+/// Session configuration for the existing fixture catalog.
+pub struct IcebergTestHarnessBuilder {
+    config: SessionConfig,
+}
+
+impl Default for IcebergTestHarnessBuilder {
+    fn default() -> Self {
+        Self {
+            config: SessionConfig::new().with_target_partitions(16),
+        }
+    }
+}
+
+impl IcebergTestHarnessBuilder {
+    pub fn with_config(mut self, config: SessionConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub async fn build(self) -> Result<IcebergTestHarness> {
         let state = SessionStateBuilder::new()
             .with_default_features()
-            // Plan snapshots must not vary with the runner's CPU count.
-            .with_config(SessionConfig::new().with_target_partitions(16))
+            .with_config(self.config)
             // We register a factory in addition to the catalog below
             // so that tests can be written against the factory's behaviours
             .with_table_factory(
@@ -97,7 +114,26 @@ impl IcebergTestHarness {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
 
-        Ok(Self { ctx })
+        Ok(IcebergTestHarness { ctx })
+    }
+}
+
+impl IcebergTestHarness {
+    pub fn builder() -> IcebergTestHarnessBuilder {
+        IcebergTestHarnessBuilder::default()
+    }
+
+    pub async fn new() -> Result<Self> {
+        Self::builder().build().await
+    }
+
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// Plans without executing, for inspecting providers and discovery timing.
+    pub async fn plan(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
+        self.ctx.sql(sql).await?.create_physical_plan().await
     }
 
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {

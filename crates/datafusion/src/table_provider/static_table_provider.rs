@@ -30,9 +30,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
-use crate::IcebergDataFusionConfig;
+use super::scan::scan_table;
 use crate::error::to_datafusion_error;
-use crate::read::IcebergDataSourceBuilder;
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -126,20 +125,18 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Use cached table (no refresh)
-        let mut builder = IcebergDataSourceBuilder::new(&self.table, self.schema.clone())
-            .with_snapshot_id(self.snapshot_id)
-            .with_projection(projection)
-            .with_filters(filters)
-            .with_fetch(limit);
-
-        let iceberg_cfg = IcebergDataFusionConfig::from_config_or_default(state.config());
-        if iceberg_cfg.execution.eager_file_planning {
-            builder = builder
-                .try_with_eagerly_planned_file_scan_tasks(state)
-                .await?;
-        }
-        Ok(DataSourceExec::from_data_source(builder.build()?))
+        // Use cached table (no refresh).
+        let source = scan_table(
+            &self.table,
+            self.schema.clone(),
+            state,
+            projection,
+            filters,
+            limit,
+            self.snapshot_id,
+        )
+        .await?;
+        Ok(DataSourceExec::from_data_source(source))
     }
 
     fn supports_filters_pushdown(
