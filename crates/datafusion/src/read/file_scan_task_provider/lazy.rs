@@ -17,6 +17,7 @@
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, exec_err};
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
@@ -33,24 +34,94 @@ use crate::to_datafusion_error;
 #[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
     table: Table,
+    schema: SchemaRef,
     snapshot_id: Option<i64>,
     projection: Vec<String>,
     predicate: Option<Predicate>,
 }
 
 impl LazyFileScanTaskProvider {
-    /// Retains the table and projected column names without discovering files.
-    /// The names must match the data source's output schema.
-    pub fn new(table: Table, projection: Vec<String>) -> Self {
-        Self {
+    /// Configures discovery from a table and the schema advertised by its table
+    /// provider. Projection indices refer to this schema, not the table's current
+    /// schema. To reconstruct a provider, pass its already-projected schema and
+    /// omit the projection.
+    pub fn builder(table: Table, schema: SchemaRef) -> LazyFileScanTaskProviderBuilder {
+        LazyFileScanTaskProviderBuilder {
             table,
-            projection,
+            schema,
+            projection: None,
             snapshot_id: None,
             predicate: None,
         }
     }
 
+    /// Table retained for discovery, including its metadata and storage access.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Output schema after projection, matching the columns selected by discovery.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// Names of the columns selected during discovery, in output schema order.
+    pub fn projection(&self) -> &[String] {
+        &self.projection
+    }
+
+    /// Snapshot to scan, or the table's current one if `None`.
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+
+    /// Filter used to skip files, if any.
+    pub fn predicate(&self) -> Option<&Predicate> {
+        self.predicate.as_ref()
+    }
+}
+
+/// Configures a table scan without discovering files or constructing a reader.
+///
+/// The builder applies projection once, retaining both the resulting Arrow schema
+/// and its column names in the provider. Reader settings and fetch belong to the
+/// data source, not to file discovery.
+///
+/// ```
+/// # use datafusion::{arrow::datatypes::SchemaRef, common::Result, prelude::Expr};
+/// # use iceberg::table::Table;
+/// # use iceberg_datafusion::read::LazyFileScanTaskProvider;
+/// fn discovery(
+///     table: Table,
+///     schema: SchemaRef,
+///     projection: Option<&Vec<usize>>,
+///     filters: &[Expr],
+/// ) -> Result<LazyFileScanTaskProvider> {
+///     LazyFileScanTaskProvider::builder(table, schema)
+///         .with_projection(projection)
+///         .with_filters(filters)
+///         .build()
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct LazyFileScanTaskProviderBuilder {
+    table: Table,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    snapshot_id: Option<i64>,
+    predicate: Option<Predicate>,
+}
+
+impl LazyFileScanTaskProviderBuilder {
+    /// Selects columns from the supplied schema in this order, or all its columns
+    /// for `None`. Indices are validated when [`Self::build`] is called.
+    pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
+        self.projection = projection.cloned();
+        self
+    }
+
     /// Selects a snapshot, or the retained table's current snapshot for `None`.
+    /// The supplied schema is not replaced with the snapshot's schema.
     pub fn with_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
         self.snapshot_id = snapshot_id;
         self
@@ -68,24 +139,30 @@ impl LazyFileScanTaskProvider {
         self.with_predicate(convert_filters_to_predicate(filters))
     }
 
-    /// Table retained for discovery, including its metadata and storage access.
-    pub fn table(&self) -> &Table {
-        &self.table
-    }
-
-    /// Names of the columns selected during discovery.
-    pub fn projection(&self) -> &[String] {
-        &self.projection
-    }
-
-    /// Snapshot to scan, or the table's current one if `None`.
-    pub fn snapshot_id(&self) -> Option<i64> {
-        self.snapshot_id
-    }
-
-    /// Filter used to skip files, if any.
-    pub fn predicate(&self) -> Option<&Predicate> {
-        self.predicate.as_ref()
+    /// Validates projection and builds a lazy provider without file discovery.
+    /// Its stream discovers files only when polled, or can be collected before
+    /// execution by [`super::eager::EagerFileScanTaskProvider::plan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a projection index is outside the supplied schema.
+    pub fn build(self) -> Result<LazyFileScanTaskProvider> {
+        let schema = match self.projection {
+            Some(projection) => Arc::new(self.schema.project(&projection)?),
+            None => self.schema,
+        };
+        let projection = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        Ok(LazyFileScanTaskProvider {
+            table: self.table,
+            schema,
+            projection,
+            snapshot_id: self.snapshot_id,
+            predicate: self.predicate,
+        })
     }
 }
 

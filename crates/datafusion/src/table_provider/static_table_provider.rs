@@ -30,8 +30,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
-use super::scan::scan_table;
+use super::scan::build_source;
 use crate::error::to_datafusion_error;
+use crate::read::LazyFileScanTaskProvider;
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -126,16 +127,13 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh).
-        let source = scan_table(
-            &self.table,
-            self.schema.clone(),
-            state,
-            projection,
-            filters,
-            limit,
-            self.snapshot_id,
-        )
-        .await?;
+        let discovery =
+            LazyFileScanTaskProvider::builder(self.table.clone(), self.schema.clone())
+                .with_projection(projection)
+                .with_snapshot_id(self.snapshot_id)
+                .with_filters(filters)
+                .build()?;
+        let source = build_source(discovery, state, limit).await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 

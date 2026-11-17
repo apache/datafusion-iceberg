@@ -19,5 +19,5 @@ mod lazy;
 mod provider;
 
 pub use eager::EagerFileScanTaskProvider;
-pub use lazy::LazyFileScanTaskProvider;
+pub use lazy::{LazyFileScanTaskProvider, LazyFileScanTaskProviderBuilder};
 pub use provider::{FileScanTaskProvider, FileScanTaskProviderContext};

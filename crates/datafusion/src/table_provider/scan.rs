@@ -17,11 +17,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::prelude::Expr;
-use iceberg::table::Table;
 
 use crate::IcebergDataFusionConfig;
 use crate::read::{
@@ -29,39 +26,25 @@ use crate::read::{
     IcebergDataSourceBuilder, LazyFileScanTaskProvider,
 };
 
-/// Table planning is the only path that needs metadata. Both table providers
-/// select their snapshot before entering here; reconstruction skips this helper.
-pub(super) async fn scan_table(
-    table: &Table,
-    schema: SchemaRef,
+/// Assembles a source from configured discovery and session reader settings.
+/// Projection, snapshot and filters have already been set by the caller.
+pub(super) async fn build_source(
+    discovery: LazyFileScanTaskProvider,
     state: &dyn Session,
-    projection: Option<&Vec<usize>>,
-    filters: &[Expr],
     fetch: Option<usize>,
-    snapshot_id: Option<i64>,
 ) -> Result<IcebergDataSource> {
-    let schema = match projection {
-        Some(projection) => Arc::new(schema.project(projection)?),
-        None => schema,
-    };
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    let discovery = Arc::new(
-        LazyFileScanTaskProvider::new(table.clone(), columns)
-            .with_snapshot_id(snapshot_id)
-            .with_filters(filters),
-    );
+    let schema = discovery.schema();
+    let file_io = discovery.table().file_io().clone();
     let config = state.config();
-    let reader = table
+    let reader = discovery
+        .table()
         .reader_builder()
         .with_batch_size(config.batch_size())
         .with_row_selection_enabled(config.options().execution.parquet.enable_page_index)
         // DataFusion already runs output partitions concurrently.
         .with_data_file_concurrency_limit(1)
         .build();
+    let discovery = Arc::new(discovery);
     let provider: Arc<dyn FileScanTaskProvider> =
         if IcebergDataFusionConfig::from_config_or_default(config)
             .execution
@@ -71,7 +54,7 @@ pub(super) async fn scan_table(
         } else {
             discovery
         };
-    IcebergDataSourceBuilder::new(schema, table.file_io().clone(), reader)
+    IcebergDataSourceBuilder::new(schema, file_io, reader)
         .with_file_scan_task_provider(provider)
         .with_fetch(fetch)
         .build()

@@ -60,10 +60,9 @@ async fn lazy_discovery_does_not_read_manifests_until_polled() -> Result<()> {
         .runtime(iceberg::Runtime::current())
         .build()
         .map_err(iceberg_datafusion::to_datafusion_error)?;
-    let discovery = Arc::new(LazyFileScanTaskProvider::new(
-        inaccessible_table,
-        lazy.projection().to_vec(),
-    ));
+    let discovery = Arc::new(
+        LazyFileScanTaskProvider::builder(inaccessible_table, lazy.schema()).build()?,
+    );
     let context = harness.context().task_ctx();
     let mut tasks = discovery.open(
         0,
@@ -72,6 +71,97 @@ async fn lazy_discovery_does_not_read_manifests_until_polled() -> Result<()> {
         },
     )?;
     assert!(tasks.try_next().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn lazy_builder_keeps_projected_schema_and_task_columns_in_order() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(SessionConfig::new().with_target_partitions(1))
+        .build()
+        .await?;
+    let plan = harness
+        .plan("SELECT * FROM taxi WHERE pickup_date = DATE '2024-01-10'")
+        .await?;
+    let source = iceberg_source(&plan);
+    let lazy = (source.file_scan_task_provider() as &dyn Any)
+        .downcast_ref::<LazyFileScanTaskProvider>()
+        .unwrap();
+    let schema = lazy.schema();
+    // Reverse the fixture's relative order: date (field 13), then vendor (field 1).
+    let projection = vec![
+        schema.index_of("pickup_date")?,
+        schema.index_of("vendor_id")?,
+    ];
+    let discovery = Arc::new(
+        LazyFileScanTaskProvider::builder(lazy.table().clone(), schema)
+            .with_projection(Some(&projection))
+            .with_predicate(lazy.predicate().cloned())
+            .build()?,
+    );
+    let columns = discovery
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    insta::assert_debug_snapshot!(columns, @r#"
+    [
+        "pickup_date",
+        "vendor_id",
+    ]
+    "#);
+    assert_eq!(discovery.projection(), columns);
+    let context = harness.context().task_ctx();
+    let tasks = Arc::clone(&discovery)
+        .open(
+            0,
+            FileScanTaskProviderContext {
+                task_context: &context,
+            },
+        )?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(iceberg_datafusion::to_datafusion_error)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].project_field_ids(), &[13, 1]);
+
+    let projected = IcebergDataSourceBuilder::new(
+        discovery.schema(),
+        source.file_io().clone(),
+        source.reader().clone(),
+    )
+    .with_file_scan_task_provider(discovery)
+    .with_fetch(Some(1))
+    .build()?;
+    let batches = projected.open(0, context)?.try_collect::<Vec<_>>().await?;
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
+    +-------------+-----------+
+    | pickup_date | vendor_id |
+    +-------------+-----------+
+    | 2024-01-10  | 2         |
+    +-------------+-----------+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lazy_builder_rejects_projection_outside_the_supplied_schema() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(SessionConfig::new().with_target_partitions(1))
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
+    let source = iceberg_source(&plan);
+    let lazy = (source.file_scan_task_provider() as &dyn Any)
+        .downcast_ref::<LazyFileScanTaskProvider>()
+        .unwrap();
+    // The supplied schema has only one column, even though the table has thirteen.
+    let error = LazyFileScanTaskProvider::builder(lazy.table().clone(), lazy.schema())
+        .with_projection(Some(&vec![1]))
+        .build()
+        .unwrap_err();
+    insta::assert_snapshot!(error.to_string(), @"Arrow error: Schema error: project index 1 out of bounds, max field 1");
     Ok(())
 }
 

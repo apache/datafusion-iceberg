@@ -34,9 +34,10 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use super::scan::scan_table;
+use super::scan::build_source;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
+use crate::read::LazyFileScanTaskProvider;
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -139,16 +140,11 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot).
-        let source = scan_table(
-            &table,
-            self.schema.clone(),
-            state,
-            projection,
-            filters,
-            limit,
-            None,
-        )
-        .await?;
+        let discovery = LazyFileScanTaskProvider::builder(table, self.schema.clone())
+            .with_projection(projection)
+            .with_filters(filters)
+            .build()?;
+        let source = build_source(discovery, state, limit).await?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
@@ -447,58 +443,6 @@ mod tests {
             iceberg_scan.fetch(),
             Some(5),
             "Limit should be set to 5 in the scan plan"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_scan_projection() {
-        let (catalog, namespace, table_name, _temp_dir) =
-            get_test_catalog_and_table().await;
-        let table_ident = TableIdent::new(namespace, table_name);
-        let table = catalog.load_table(&table_ident).await.unwrap();
-        let schema =
-            Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
-        let out_of_range = schema.fields().len();
-
-        // Columns come back in the projection's order, not the table's.
-        let state = SessionContext::new().state();
-        let source = scan_table(
-            &table,
-            schema.clone(),
-            &state,
-            Some(&vec![1, 0]),
-            &[],
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let schema = source.schema();
-        let cols = schema.fields().iter().map(|v| v.name()).collect::<Vec<_>>();
-        insta::assert_debug_snapshot!(cols, @r#"
-        [
-            "name",
-            "id",
-        ]
-        "#);
-
-        let err = scan_table(
-            &table,
-            schema,
-            &state,
-            Some(&vec![0, out_of_range]),
-            &[],
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "Arrow error: Schema error: project index {out_of_range} out of \
-                 bounds, max field {out_of_range}"
-            )
         );
     }
 
