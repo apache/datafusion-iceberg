@@ -40,7 +40,7 @@ use crate::read::IcebergDataSource;
 /// or when you want to avoid catalog overhead.
 ///
 /// For catalog-backed tables with write support and automatic refresh, use
-/// [`IcebergTableProvider`](super::IcebergCatalogTableProvider) instead.
+/// [`IcebergCatalogTableProvider`](super::IcebergCatalogTableProvider) instead.
 #[derive(Debug, Clone)]
 pub struct IcebergStaticTableProvider {
     /// The static table instance (never refreshed)
@@ -55,7 +55,7 @@ impl IcebergStaticTableProvider {
     /// Creates a static provider from a table instance.
     ///
     /// Uses the table's current snapshot for all queries. Does not support write operations.
-    pub async fn try_new_from_table(table: Table) -> Result<Self> {
+    pub fn try_new_from_table(table: Table) -> Result<Self> {
         let schema = Arc::new(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(to_datafusion_error)?,
@@ -71,10 +71,7 @@ impl IcebergStaticTableProvider {
     ///
     /// Queries the specified snapshot for all operations. Useful for time-travel queries.
     /// Does not support write operations.
-    pub async fn try_new_from_table_snapshot(
-        table: Table,
-        snapshot_id: i64,
-    ) -> Result<Self> {
+    pub fn try_new_from_table_snapshot(table: Table, snapshot_id: i64) -> Result<Self> {
         let snapshot = table
             .metadata()
             .snapshot_by_id(snapshot_id)
@@ -151,7 +148,7 @@ impl TableProvider for IcebergStaticTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!(
             "Write operations are not supported on IcebergStaticTableProvider. \
-             Use IcebergTableProvider with a catalog for write support."
+             Use IcebergCatalogTableProvider with a catalog for write support."
         )
     }
 }
@@ -172,9 +169,7 @@ mod tests {
     async fn test_static_provider_from_table() {
         let table = get_test_table_from_metadata_file().await;
         let table_provider =
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .unwrap();
+            IcebergStaticTableProvider::try_new_from_table(table.clone()).unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -201,7 +196,6 @@ mod tests {
             table.clone(),
             snapshot_id,
         )
-        .await
         .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
@@ -225,9 +219,7 @@ mod tests {
     async fn test_static_provider_rejects_writes() {
         let table = get_test_table_from_metadata_file().await;
         let table_provider =
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .unwrap();
+            IcebergStaticTableProvider::try_new_from_table(table.clone()).unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -249,9 +241,7 @@ mod tests {
     async fn test_static_provider_scan() {
         let table = get_test_table_from_metadata_file().await;
         let table_provider =
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .unwrap();
+            IcebergStaticTableProvider::try_new_from_table(table.clone()).unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("mytable", Arc::new(table_provider))
             .unwrap();
@@ -268,9 +258,7 @@ mod tests {
 
         let table = get_test_table_from_metadata_file().await;
         let table_provider =
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .unwrap();
+            IcebergStaticTableProvider::try_new_from_table(table.clone()).unwrap();
 
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -303,9 +291,7 @@ mod tests {
 
         let table = get_test_table_from_metadata_file().await;
         let table_provider =
-            IcebergStaticTableProvider::try_new_from_table(table.clone())
-                .await
-                .unwrap();
+            IcebergStaticTableProvider::try_new_from_table(table.clone()).unwrap();
 
         let ctx = SessionContext::new();
         let state = ctx.state();

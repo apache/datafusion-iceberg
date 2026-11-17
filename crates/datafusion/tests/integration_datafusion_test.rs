@@ -1008,8 +1008,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let table = client.load_table(&ident).await?;
     let snapshot_id = table.metadata().current_snapshot_id().unwrap();
     let pinned =
-        IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
-            .await?;
+        IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)?;
     assert_eq!(pinned.snapshot_id(), Some(snapshot_id));
     ctx.register_table("pinned", Arc::new(pinned.clone()))?;
     // A later write, so a scan reading the current snapshot rather than the
@@ -1103,10 +1102,10 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let provider = metadata_scan.provider();
     assert_eq!(provider.table().identifier(), &ident);
     let rebuilt = IcebergMetadataDataSource::try_new(
-        IcebergMetadataTableProvider::new(
+        IcebergMetadataTableProvider::try_new(
             provider.table().clone(),
             provider.metadata_type().clone(),
-        ),
+        )?,
         None,
     )?;
     let batches = run_batches(metadata_exec, &ctx).await?;

@@ -257,8 +257,7 @@ fn scalar_function_to_iceberg_predicate(
 /// [`Reference`] such that `isnan(arg)` is logically equivalent to
 /// `isnan(reference)`.
 ///
-/// Filter pushdown is reported as `Inexact` (see
-/// [`IcebergTableProvider::supports_filters_pushdown`]), so DataFusion
+/// Both table providers report filter pushdown as `Inexact`, so DataFusion
 /// re-applies the original predicate after scanning. We therefore only need the
 /// pushed-down predicate to be implied by the original filter (it may match
 /// extra rows, but must never drop a matching one). Every transformation handled
@@ -272,8 +271,6 @@ fn scalar_function_to_iceberg_predicate(
 ///
 /// Multiplication/division by zero and `c / x` are intentionally rejected: e.g.
 /// `x * 0` is NaN when `x` is `±inf`, so it does not imply `x` is NaN.
-///
-/// [`IcebergTableProvider::supports_filters_pushdown`]: crate::table_provider::IcebergCatalogTableProvider
 fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),
