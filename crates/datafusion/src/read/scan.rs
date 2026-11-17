@@ -105,8 +105,9 @@ impl IcebergDataSource {
     /// `total-records` counts rows before deletes. A position delete removes
     /// at most one row, so position deletes are subtracted. An equality delete
     /// can remove any number of rows, so equality deletes are ignored. Summary
-    /// fields are optional, so a missing or invalid one leaves the estimate
-    /// unknown rather than failing the query.
+    /// fields are optional. A missing or invalid `total-records` leaves the
+    /// estimate unknown, and a missing or invalid `total-position-deletes`
+    /// counts as zero, rather than failing the query.
     fn estimated_num_rows(&self) -> Precision<usize> {
         let metadata = self.table.metadata();
         let snapshot = match self.snapshot_id {
@@ -286,12 +287,15 @@ impl DataSource for IcebergDataSource {
         EquivalenceProperties::new(self.schema.clone())
     }
 
+    // The source has one output partition (see `output_partitioning`), so a
+    // partition's statistics are the scan's.
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         let mut statistics = Statistics::new_unknown(&self.schema);
         statistics.num_rows = self.estimated_num_rows();
         // Iceberg's `total-files-size` is compressed and covers every column
         // and delete file, so estimate the in-memory size of the projected
-        // columns instead, as DataFusion's Parquet source does.
+        // columns from their widths, as DataFusion's Parquet source does for
+        // fixed-width columns.
         statistics.calculate_total_byte_size(&self.schema);
         Ok(Arc::new(statistics.with_fetch(self.fetch, 0, 1)?))
     }
@@ -357,7 +361,6 @@ async fn get_batch_stream(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::Statistics;
@@ -396,19 +399,12 @@ mod tests {
             HashMap::new(),
         )
         .unwrap();
-        let now_ms = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
         for (snapshot_id, summary) in (1..).zip(summaries) {
             let snapshot = Snapshot::builder()
                 .with_snapshot_id(snapshot_id)
                 .with_parent_snapshot_id((snapshot_id > 1).then_some(snapshot_id - 1))
                 .with_sequence_number(snapshot_id)
-                .with_timestamp_ms(now_ms + snapshot_id)
+                .with_timestamp_ms(1_700_000_000_000 + snapshot_id)
                 .with_manifest_list(format!(
                     "/test/table/metadata/snap-{snapshot_id}.avro"
                 ))
@@ -506,6 +502,8 @@ mod tests {
             &[][..],
             &[("total-records", "-1")],
             &[("total-records", "many")],
+            // u64::MAX + 1
+            &[("total-records", "18446744073709551616")],
         ] {
             let table = table_with_snapshot_summaries(&[summary]);
             let statistics = id_scan_statistics(table, None, None);
