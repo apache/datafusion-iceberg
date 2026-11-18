@@ -97,6 +97,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_the_history_table() -> Result<()> {
+        let table = create_taxi_table().await?;
+        let catalog = IcebergCatalogProvider::try_new(table.catalog()).await?;
+
+        // Leaves out `made_current_at`, the commit time, which changes on every run.
+        let (plan, results) = IcebergTestHarness::builder()
+            .with_catalog("iceberg", Arc::new(catalog))
+            .query(
+                "SELECT snapshot_id, parent_id, is_current_ancestor \
+                 FROM iceberg.default.taxi$history",
+            )
+            .await?;
+        insta::assert_snapshot!(plan, @"
+        CooperativeExec
+          DataSourceExec: format=iceberg_metadata
+        ");
+        insta::assert_snapshot!(results, @"
+        +-------------+-----------+---------------------+
+        | snapshot_id | parent_id | is_current_ancestor |
+        +-------------+-----------+---------------------+
+        | 1           |           | true                |
+        +-------------+-----------+---------------------+
+        ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         let fixtures = FixtureCatalog::try_new().await?;
         let schema = Schema::builder()
