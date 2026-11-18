@@ -251,6 +251,7 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, ", provider=lazy")?;
         if let Some(predicate) = &self.predicate {
             write!(f, ", predicate={predicate}")?;
         }

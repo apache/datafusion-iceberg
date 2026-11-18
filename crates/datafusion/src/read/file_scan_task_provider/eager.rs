@@ -19,6 +19,7 @@ use datafusion::common::{Result, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
 use iceberg::scan::FileScanTask;
+use std::collections::BTreeSet;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -78,6 +79,25 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, ", planned_files={}", self.tasks().count())
+        write!(
+            f,
+            ", provider=eager, planned_files={}",
+            self.tasks().count()
+        )?;
+        // Assigned tasks may have different predicates. Report the distinct task
+        // predicates rather than assuming a single filter applies to every file.
+        let predicates = self
+            .tasks()
+            .filter_map(FileScanTask::predicate)
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        if !predicates.is_empty() {
+            write!(
+                f,
+                ", predicates=[{}]",
+                predicates.into_iter().collect::<Vec<_>>().join(", ")
+            )?;
+        }
+        Ok(())
     }
 }

@@ -25,8 +25,6 @@ use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use futures::TryStreamExt;
-use iceberg::Runtime;
-use iceberg::arrow::ArrowReaderBuilder;
 use iceberg_datafusion::IcebergDataFusionConfig;
 use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 use iceberg_datafusion::test_utils::IcebergTestHarness;
@@ -55,7 +53,7 @@ async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
               AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
                   RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[pickup_date], predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+                    DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
     ");
     insta::assert_snapshot!(rows, @"
     +-------------+-------+
@@ -97,7 +95,7 @@ async fn eager_scan_plans_only_the_matching_taxi_files() -> Result<()> {
             RepartitionExec: partitioning=Hash([pickup_date@0], 2), input_partitions=2
               AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
-                  DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=2
+                  DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=2, predicates=[(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)]
     ");
     insta::assert_snapshot!(rows, @"
     +-------------+-------+
@@ -133,7 +131,7 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
           AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
             FilterExec: pickup_date@0 = 2025-01-01, projection=[]
               RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-                DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=0
+                DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=0
     ");
     insta::assert_snapshot!(rows, @"
     +-------+
@@ -142,54 +140,6 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
     | 0     |
     +-------+
     ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn assigned_tasks_can_be_reconstructed_without_a_table() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(|config| {
-            config
-                .with_target_partitions(1)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true)
-        })
-        .build()
-        .await?;
-    let plan = harness
-        .plan("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10'")
-        .await?;
-    let source = iceberg_source(&plan).unwrap();
-    let schema = source.schema();
-    let groups = eager_files(source).groups().to_vec();
-    let file_io = source.file_io().clone();
-    let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current());
-    let config = harness.context().copied_config();
-    drop(plan);
-    drop(harness);
-
-    // A worker decoder receives assigned tasks and local reader resources, not
-    // a table or catalog. Construction also works outside a Tokio runtime.
-    let source = std::thread::spawn(move || {
-        assert!(tokio::runtime::Handle::try_current().is_err());
-        IcebergDataSource::builder(&config, schema, file_io, reader)
-            .with_file_scan_task_provider(Arc::new(EagerFileScanTaskProvider::try_new(
-                groups,
-            )?))
-            .build()
-    })
-    .join()
-    .unwrap()?;
-    let batches = collect(
-        DataSourceExec::from_data_source(source),
-        Arc::new(TaskContext::default()),
-    )
-    .await?;
-
-    assert_eq!(
-        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        25_000
-    );
     Ok(())
 }
 

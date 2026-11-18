@@ -52,7 +52,7 @@ logical_plan
 02)--TableScan: default.default.query_test_table projection=[id, name, score, category], fetch=3
 physical_plan
 01)CooperativeExec
-02)--DataSourceExec: format=iceberg, projection=[id, name, score, category], fetch=3
+02)--DataSourceExec: format=iceberg, projection=[id, name, score, category], provider=lazy, fetch=3
 
 # Test SELECT * with ORDER BY and LIMIT
 query ITRT

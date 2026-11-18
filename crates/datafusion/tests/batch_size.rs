@@ -36,7 +36,7 @@ async fn scan_honors_session_batch_size() -> Result<()> {
     // not be about the scan.
     insta::assert_snapshot!(plan, @r"
     CooperativeExec
-      DataSourceExec: format=iceberg, projection=[pickup_date]
+      DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy
     ");
     let max_rows = batches.iter().map(|batch| batch.num_rows()).max();
     assert_eq!(max_rows, Some(2000));
