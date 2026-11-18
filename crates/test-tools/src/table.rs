@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::exec_datafusion_err;
+use datafusion::common::{exec_datafusion_err, exec_err};
 use datafusion::error::Result;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::memory::MemoryCatalog;
@@ -203,7 +203,9 @@ impl FixtureTable {
     /// actions, and there is none for some of the changes fixtures need, such
     /// as choosing snapshot ids. This writes the next metadata file and then
     /// re-registers the table under it, which the in-memory catalog does
-    /// without touching the table's files.
+    /// without touching the table's files. Fails if the catalog's table no
+    /// longer points at this handle's metadata, e.g. after an `INSERT INTO`
+    /// through the catalog, instead of silently discarding that change.
     pub(crate) async fn commit(&mut self, metadata: TableMetadata) -> Result<()> {
         let location = MetadataLocation::from_str(self.metadata_location()?)
             .map_err(df_err)?
@@ -213,6 +215,12 @@ impl FixtureTable {
             .await
             .map_err(df_err)?;
         let ident = self.ident().clone();
+        let current = self.catalog.load_table(&ident).await.map_err(df_err)?;
+        if current.metadata_location() != self.table.metadata_location() {
+            return exec_err!(
+                "{ident} changed in the catalog after this handle last saw it"
+            );
+        }
         self.catalog.drop_table(&ident).await.map_err(df_err)?;
         self.table = self
             .catalog

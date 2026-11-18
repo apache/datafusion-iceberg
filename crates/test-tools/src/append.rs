@@ -29,6 +29,7 @@ use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestListWriter,
     ManifestWriterBuilder, Operation, Snapshot, SnapshotSummaryCollector, Summary,
+    UNASSIGNED_SEQUENCE_NUMBER,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -73,8 +74,9 @@ impl<'a> Append<'a> {
     /// Adds one data file containing `batch`.
     ///
     /// Columns are matched to the table's by name and cast to its types.
-    /// Columns of the table that `batch` lacks are null. On a partitioned
-    /// table every row must belong to the same partition.
+    /// Columns of the table that `batch` lacks are null. `batch` must have at
+    /// least one row, and on a partitioned table every row must belong to the
+    /// same partition.
     pub fn file(mut self, batch: RecordBatch) -> Self {
         self.files.push(batch);
         self
@@ -126,6 +128,9 @@ impl<'a> Append<'a> {
         ));
         let mut data_files = Vec::with_capacity(self.files.len());
         for batch in self.files {
+            if batch.num_rows() == 0 {
+                return exec_err!("a data file needs at least one row");
+            }
             let batch = conform(&batch, &arrow_schema)?;
             let partition_key = match &splitter {
                 None => None,
@@ -161,7 +166,7 @@ impl<'a> Append<'a> {
         let mut summary = SnapshotSummaryCollector::default();
         for data_file in &data_files {
             manifest_writer
-                .add_file(data_file.clone(), sequence_number)
+                .add_file(data_file.clone(), UNASSIGNED_SEQUENCE_NUMBER)
                 .map_err(df_err)?;
             summary.add_file(data_file, schema.clone(), partition_spec.clone());
         }
@@ -306,7 +311,8 @@ mod tests {
     use datafusion::error::{DataFusionError, Result};
     use futures::TryStreamExt;
     use iceberg::TableIdent;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Transform, Type};
+    use iceberg::spec::{Manifest, NestedField, PrimitiveType, Schema, Transform, Type};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
     use crate::error::df_err;
     use crate::{FixtureCatalog, FixtureTable};
@@ -458,6 +464,97 @@ mod tests {
             files[0].file_path()
         );
         assert_eq!(scanned_ids(&table).await?, vec![7]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_an_empty_file() -> Result<()> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let mut table = create_table(&fixtures).await?;
+        let error = table
+            .append()
+            .file(batch(vec![], vec![]))
+            .file(batch(vec![1], vec!["a"]))
+            .commit()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a data file needs at least one row"),
+            "{error}"
+        );
+        assert!(table.table().metadata().current_snapshot().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leaves_sequence_numbers_to_be_inherited() -> Result<()> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let mut table = create_table(&fixtures).await?;
+        table
+            .append()
+            .file(batch(vec![1], vec!["a"]))
+            .commit()
+            .await?;
+
+        // Read the manifest's raw bytes, since loading it through the
+        // manifest list fills in the inherited sequence numbers.
+        let iceberg_table = table.table();
+        let snapshot = iceberg_table.metadata().current_snapshot().unwrap();
+        let manifests = iceberg_table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(df_err)?;
+        let manifest_file = &manifests.entries()[0];
+        assert_eq!(manifest_file.sequence_number, 1);
+        let bytes = iceberg_table
+            .file_io()
+            .new_input(&manifest_file.manifest_path)
+            .map_err(df_err)?
+            .read()
+            .await
+            .map_err(df_err)?;
+        let manifest = Manifest::parse_avro(&bytes).map_err(df_err)?;
+        for entry in manifest.entries() {
+            assert_eq!(entry.sequence_number(), None);
+            assert_eq!(entry.file_sequence_number, None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_overwrite_a_change_made_through_the_catalog() -> Result<()> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let mut table = create_table(&fixtures).await?;
+        table
+            .append()
+            .file(batch(vec![1], vec!["a"]))
+            .commit()
+            .await?;
+
+        let catalog = fixtures.catalog();
+        let tx = Transaction::new(table.table());
+        let tx = tx
+            .update_table_properties()
+            .set("changed".to_string(), "elsewhere".to_string())
+            .apply(tx)
+            .map_err(df_err)?;
+        let changed = tx.commit(catalog.as_ref()).await.map_err(df_err)?;
+
+        let error = table
+            .append()
+            .file(batch(vec![2], vec!["a"]))
+            .commit()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed in the catalog"),
+            "{error}"
+        );
+        let loaded = catalog.load_table(table.ident()).await.map_err(df_err)?;
+        assert_eq!(loaded.metadata_location(), changed.metadata_location());
         Ok(())
     }
 }
