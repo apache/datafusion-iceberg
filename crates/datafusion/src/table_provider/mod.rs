@@ -22,7 +22,6 @@
 
 mod catalog_table_provider;
 mod factory;
-mod scan;
 mod static_table_provider;
 
 pub use catalog_table_provider::IcebergCatalogTableProvider;

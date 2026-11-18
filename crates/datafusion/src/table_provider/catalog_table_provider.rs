@@ -34,10 +34,9 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use super::scan::build_source;
 use crate::error::to_datafusion_error;
 use crate::metadata::table::IcebergMetadataTableProvider;
-use crate::read::LazyFileScanTaskProvider;
+use crate::read::{FileScanTaskProviderBuilder, IcebergDataSource};
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
@@ -140,11 +139,24 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot).
-        let discovery = LazyFileScanTaskProvider::builder(table, self.schema.clone())
-            .with_projection(projection)
-            .with_filters(filters)
-            .build()?;
-        let source = build_source(discovery, state, limit).await?;
+        let (schema, tasks) = FileScanTaskProviderBuilder::new(
+            state.task_ctx(),
+            table.clone(),
+            self.schema.clone(),
+        )
+        .with_projection(projection)
+        .with_filters(filters)
+        .build()
+        .await?;
+        let source = IcebergDataSource::builder(
+            state.config(),
+            schema,
+            table.file_io().clone(),
+            table.reader_builder(),
+        )
+        .with_file_scan_task_provider(tasks)
+        .with_fetch(limit)
+        .build()?;
         Ok(DataSourceExec::from_data_source(source))
     }
 

@@ -20,8 +20,8 @@ pub(crate) mod predicate;
 pub(crate) mod scan;
 
 pub use file_scan_task_provider::{
-    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderContext,
-    LazyFileScanTaskProvider, LazyFileScanTaskProviderBuilder,
+    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderBuilder,
+    FileScanTaskProviderContext, LazyFileScanTaskProvider,
 };
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};

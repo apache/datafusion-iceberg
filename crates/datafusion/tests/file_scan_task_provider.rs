@@ -31,8 +31,8 @@ use iceberg::io::FileIO;
 use iceberg::table::Table;
 use iceberg_datafusion::IcebergDataFusionConfig;
 use iceberg_datafusion::read::{
-    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderContext,
-    IcebergDataSource, IcebergDataSourceBuilder, LazyFileScanTaskProvider,
+    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderBuilder,
+    FileScanTaskProviderContext, IcebergDataSource, LazyFileScanTaskProvider,
 };
 use iceberg_datafusion::test_utils::IcebergTestHarness;
 
@@ -60,10 +60,14 @@ async fn lazy_discovery_does_not_read_manifests_until_polled() -> Result<()> {
         .runtime(iceberg::Runtime::current())
         .build()
         .map_err(iceberg_datafusion::to_datafusion_error)?;
-    let discovery = Arc::new(
-        LazyFileScanTaskProvider::builder(inaccessible_table, lazy.schema()).build()?,
-    );
     let context = harness.context().task_ctx();
+    let (_, discovery) = FileScanTaskProviderBuilder::new(
+        Arc::clone(&context),
+        inaccessible_table,
+        lazy.schema(),
+    )
+    .build()
+    .await?;
     let mut tasks = discovery.open(
         0,
         FileScanTaskProviderContext {
@@ -93,14 +97,16 @@ async fn lazy_builder_keeps_projected_schema_and_task_columns_in_order() -> Resu
         schema.index_of("pickup_date")?,
         schema.index_of("vendor_id")?,
     ];
-    let discovery = Arc::new(
-        LazyFileScanTaskProvider::builder(lazy.table().clone(), schema)
-            .with_projection(Some(&projection))
-            .with_predicate(lazy.predicate().cloned())
-            .build()?,
-    );
-    let columns = discovery
-        .schema()
+    let (schema, discovery) = FileScanTaskProviderBuilder::new(
+        harness.context().task_ctx(),
+        lazy.table().clone(),
+        schema,
+    )
+    .with_projection(Some(&projection))
+    .with_predicate(lazy.predicate().cloned())
+    .build()
+    .await?;
+    let columns = schema
         .fields()
         .iter()
         .map(|field| field.name().clone())
@@ -111,7 +117,10 @@ async fn lazy_builder_keeps_projected_schema_and_task_columns_in_order() -> Resu
         "vendor_id",
     ]
     "#);
-    assert_eq!(discovery.projection(), columns);
+    let projected_lazy = (discovery.as_ref() as &dyn Any)
+        .downcast_ref::<LazyFileScanTaskProvider>()
+        .unwrap();
+    assert_eq!(projected_lazy.projection(), columns);
     let context = harness.context().task_ctx();
     let tasks = Arc::clone(&discovery)
         .open(
@@ -126,11 +135,13 @@ async fn lazy_builder_keeps_projected_schema_and_task_columns_in_order() -> Resu
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].project_field_ids(), &[13, 1]);
 
-    let projected = IcebergDataSourceBuilder::new(
-        discovery.schema(),
+    let projected = IcebergDataSource::builder(
+        &harness.context().copied_config(),
+        schema,
         source.file_io().clone(),
-        source.reader().clone(),
+        lazy.table().reader_builder(),
     )
+    .with_reader(source.reader().clone())
     .with_file_scan_task_provider(discovery)
     .with_fetch(Some(1))
     .build()?;
@@ -157,10 +168,15 @@ async fn lazy_builder_rejects_projection_outside_the_supplied_schema() -> Result
         .downcast_ref::<LazyFileScanTaskProvider>()
         .unwrap();
     // The supplied schema has only one column, even though the table has thirteen.
-    let error = LazyFileScanTaskProvider::builder(lazy.table().clone(), lazy.schema())
-        .with_projection(Some(&vec![1]))
-        .build()
-        .unwrap_err();
+    let error = FileScanTaskProviderBuilder::new(
+        harness.context().task_ctx(),
+        lazy.table().clone(),
+        lazy.schema(),
+    )
+    .with_projection(Some(&vec![1]))
+    .build()
+    .await
+    .unwrap_err();
     insta::assert_snapshot!(error.to_string(), @"Arrow error: Schema error: project index 1 out of bounds, max field 1");
     Ok(())
 }
@@ -214,9 +230,7 @@ async fn eager_planning_consumes_the_lazy_providers_discovery() -> Result<()> {
         .downcast_ref::<LazyFileScanTaskProvider>()
         .unwrap()
         .clone();
-    let eager =
-        EagerFileScanTaskProvider::plan(Arc::new(lazy), harness.context().task_ctx())
-            .await?;
+    let eager = lazy.into_eager(harness.context().task_ctx()).await?;
     assert_eq!(
         eager.groups().iter().map(Vec::len).collect::<Vec<_>>(),
         vec![3, 2, 2]
@@ -252,12 +266,17 @@ async fn reconstruction_needs_no_table_or_current_runtime() -> Result<()> {
         source.file_io().clone(),
         source.reader().clone(),
     );
+    let reader_builder =
+        ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current());
+    // An explicit reader must override the constructor's session defaults.
+    let config = harness.context().copied_config().with_batch_size(7);
     drop(plan);
     drop(harness);
 
     let source = std::thread::spawn(move || {
         assert!(tokio::runtime::Handle::try_current().is_err());
-        IcebergDataSourceBuilder::new(schema, file_io, reader)
+        IcebergDataSource::builder(&config, schema, file_io, reader_builder)
+            .with_reader(reader)
             .with_file_scan_task_provider(Arc::new(EagerFileScanTaskProvider::try_new(
                 groups,
             )?))
@@ -384,13 +403,79 @@ async fn empty_eager_discovery_keeps_one_partition() -> Result<()> {
 }
 
 #[tokio::test]
+async fn lazy_scan_uses_constructor_reader_settings() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(1),
+        )
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 3").await?;
+    let source = iceberg_source(&plan);
+    assert!(
+        (source.file_scan_task_provider() as &dyn Any).is::<LazyFileScanTaskProvider>()
+    );
+
+    // Execution uses different defaults; the source retains construction settings.
+    let batches = source
+        .open(0, Arc::new(TaskContext::default()))?
+        .try_collect::<Vec<_>>()
+        .await?;
+    insta::assert_debug_snapshot!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), @"
+    [
+        1,
+        1,
+        1,
+    ]
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn eager_scan_uses_constructor_reader_settings() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true),
+        )
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 3").await?;
+    let source = iceberg_source(&plan);
+    assert!(
+        (source.file_scan_task_provider() as &dyn Any).is::<EagerFileScanTaskProvider>()
+    );
+
+    let batches = source
+        .open(0, Arc::new(TaskContext::default()))?
+        .try_collect::<Vec<_>>()
+        .await?;
+    insta::assert_debug_snapshot!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), @"
+    [
+        2,
+        1,
+    ]
+    ");
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconstruction_requires_a_task_provider() -> Result<()> {
     let file_io = FileIO::new_with_fs();
-    let reader =
-        ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current()).build();
-    let error = IcebergDataSourceBuilder::new(Arc::new(Schema::empty()), file_io, reader)
-        .build()
-        .unwrap_err();
+    let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current());
+    let error = IcebergDataSource::builder(
+        &SessionConfig::new(),
+        Arc::new(Schema::empty()),
+        file_io,
+        reader,
+    )
+    .build()
+    .unwrap_err();
     insta::assert_snapshot!(error.to_string(), @"Execution error: An Iceberg source requires a file task provider");
     Ok(())
 }

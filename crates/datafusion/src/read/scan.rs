@@ -33,8 +33,9 @@ use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
+use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
-use iceberg::arrow::ArrowReader;
+use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 
 /// Reads the tasks of a [`FileScanTaskProvider`] using a process-local reader.
@@ -63,6 +64,34 @@ impl Debug for IcebergDataSource {
 }
 
 impl IcebergDataSource {
+    /// Starts source construction with session reader settings and explicit local
+    /// storage/runtime resources. `reader` must use the supplied `file_io`.
+    /// Batch size and page-index settings come from `config`; file concurrency
+    /// defaults to one because DataFusion runs partitions concurrently.
+    /// A later [`IcebergDataSourceBuilder::with_reader`] overrides these defaults.
+    /// No discovery or current-runtime lookup is performed, even with eager
+    /// planning enabled: the caller supplies the task provider explicitly.
+    pub fn builder(
+        config: &SessionConfig,
+        schema: ArrowSchemaRef,
+        file_io: FileIO,
+        reader: ArrowReaderBuilder,
+    ) -> IcebergDataSourceBuilder {
+        IcebergDataSourceBuilder {
+            schema,
+            file_io,
+            reader: reader
+                .with_batch_size(config.batch_size())
+                .with_row_selection_enabled(
+                    config.options().execution.parquet.enable_page_index,
+                )
+                .with_data_file_concurrency_limit(1)
+                .build(),
+            fetch: None,
+            file_scan_task_provider: None,
+        }
+    }
+
     pub fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -105,24 +134,27 @@ impl IcebergDataSource {
 /// Assembles a source from its output schema, storage, reader and task provider.
 ///
 /// Construction is synchronous and performs no discovery, file I/O or runtime
-/// lookup. Configure the supplied reader before building; the execution context
-/// passed to `open` does not replace its settings. FileIO must match the reader's
-/// storage, and the provider's tasks must produce the supplied output schema.
+/// lookup. Start with [`IcebergDataSource::builder`], which applies session reader
+/// settings, or override them with [`Self::with_reader`]. The execution context
+/// passed to `open` does not replace the retained reader's settings. FileIO must
+/// match the reader's storage, and tasks must produce the supplied output schema.
 ///
 /// ```
 /// # use std::sync::Arc;
 /// # use datafusion::arrow::datatypes::SchemaRef;
 /// # use datafusion::common::Result;
-/// # use iceberg::{arrow::ArrowReader, io::FileIO, scan::FileScanTask};
-/// # use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource, IcebergDataSourceBuilder};
+/// # use datafusion::prelude::SessionConfig;
+/// # use iceberg::{arrow::ArrowReaderBuilder, io::FileIO, scan::FileScanTask};
+/// # use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 /// fn reconstruct(
+///     config: &SessionConfig,
 ///     schema: SchemaRef,
 ///     file_io: FileIO,
-///     reader: ArrowReader,
+///     reader: ArrowReaderBuilder,
 ///     groups: Vec<Vec<FileScanTask>>,
 /// ) -> Result<IcebergDataSource> {
 ///     let provider = EagerFileScanTaskProvider::try_new(groups)?;
-///     IcebergDataSourceBuilder::new(schema, file_io, reader)
+///     IcebergDataSource::builder(config, schema, file_io, reader)
 ///         .with_file_scan_task_provider(Arc::new(provider))
 ///         .build()
 /// }
@@ -137,15 +169,12 @@ pub struct IcebergDataSourceBuilder {
 }
 
 impl IcebergDataSourceBuilder {
-    /// Starts with an already-projected schema and an explicitly configured reader.
-    pub fn new(schema: ArrowSchemaRef, file_io: FileIO, reader: ArrowReader) -> Self {
-        Self {
-            schema,
-            file_io,
-            reader,
-            fetch: None,
-            file_scan_task_provider: None,
-        }
+    /// Uses an explicitly configured, shared reader instead of session defaults.
+    /// Its FileIO must match the FileIO supplied at builder construction. Retaining
+    /// a reader also retains its cached delete files across output partitions.
+    pub fn with_reader(mut self, reader: ArrowReader) -> Self {
+        self.reader = reader;
+        self
     }
 
     /// Supplies task delivery. Required before calling [`Self::build`].

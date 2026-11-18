@@ -19,13 +19,16 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{Result, exec_err};
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
+use super::eager::EagerFileScanTaskProvider;
 use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
+use crate::IcebergDataFusionConfig;
 use crate::read::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
@@ -41,18 +44,39 @@ pub struct LazyFileScanTaskProvider {
 }
 
 impl LazyFileScanTaskProvider {
-    /// Configures discovery from a table and the schema advertised by its table
-    /// provider. Projection indices refer to this schema, not the table's current
-    /// schema. To reconstruct a provider, pass its already-projected schema and
-    /// omit the projection.
-    pub fn builder(table: Table, schema: SchemaRef) -> LazyFileScanTaskProviderBuilder {
-        LazyFileScanTaskProviderBuilder {
-            table,
-            schema,
-            projection: None,
-            snapshot_id: None,
-            predicate: None,
+    /// Consumes discovery and retains its tasks in round-robin groups, using the
+    /// context's target partition count. The result no longer retains the table.
+    /// Empty discovery produces one empty group. Dropping this future drops the
+    /// discovery stream; this method does not spawn a background collector.
+    pub async fn into_eager(
+        self,
+        context: Arc<TaskContext>,
+    ) -> Result<EagerFileScanTaskProvider> {
+        let target = context.session_config().target_partitions();
+        if target == 0 {
+            return exec_err!(
+                "Iceberg eager planning requires at least one target partition"
+            );
         }
+        let mut tasks = Arc::new(self).open(
+            0,
+            FileScanTaskProviderContext {
+                task_context: &context,
+            },
+        )?;
+        let mut groups = Vec::new();
+        let mut partition = 0;
+        while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
+            if partition == groups.len() {
+                groups.push(Vec::new());
+            }
+            groups[partition].push(task);
+            partition = (partition + 1) % target;
+        }
+        if groups.is_empty() {
+            groups.push(Vec::new());
+        }
+        EagerFileScanTaskProvider::try_new(groups)
     }
 
     /// Table retained for discovery, including its metadata and storage access.
@@ -81,30 +105,36 @@ impl LazyFileScanTaskProvider {
     }
 }
 
-/// Configures a table scan without discovering files or constructing a reader.
+/// Builds a task provider and its projected schema from a table scan request.
 ///
-/// The builder applies projection once, retaining both the resulting Arrow schema
-/// and its column names in the provider. Reader settings and fetch belong to the
-/// data source, not to file discovery.
+/// Configuration is supplied at construction. `iceberg.execution.eager_file_planning`
+/// selects eager collection; otherwise discovery remains deferred until execution.
+/// The projected schema is returned alongside the provider so callers never need
+/// to recover it by downcasting an eager or lazy implementation. Reader settings
+/// and fetch belong to the data-source builder.
 ///
 /// ```
-/// # use datafusion::{arrow::datatypes::SchemaRef, common::Result, prelude::Expr};
+/// # use std::sync::Arc;
+/// # use datafusion::{arrow::datatypes::SchemaRef, common::Result, execution::TaskContext, prelude::Expr};
 /// # use iceberg::table::Table;
-/// # use iceberg_datafusion::read::LazyFileScanTaskProvider;
-/// fn discovery(
+/// # use iceberg_datafusion::read::{FileScanTaskProvider, FileScanTaskProviderBuilder};
+/// async fn plan_tasks(
+///     context: Arc<TaskContext>,
 ///     table: Table,
 ///     schema: SchemaRef,
 ///     projection: Option<&Vec<usize>>,
 ///     filters: &[Expr],
-/// ) -> Result<LazyFileScanTaskProvider> {
-///     LazyFileScanTaskProvider::builder(table, schema)
+/// ) -> Result<(SchemaRef, Arc<dyn FileScanTaskProvider>)> {
+///     FileScanTaskProviderBuilder::new(context, table, schema)
 ///         .with_projection(projection)
 ///         .with_filters(filters)
 ///         .build()
+///         .await
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct LazyFileScanTaskProviderBuilder {
+pub struct FileScanTaskProviderBuilder {
+    context: Arc<TaskContext>,
     table: Table,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
@@ -112,7 +142,21 @@ pub struct LazyFileScanTaskProviderBuilder {
     predicate: Option<Predicate>,
 }
 
-impl LazyFileScanTaskProviderBuilder {
+impl FileScanTaskProviderBuilder {
+    /// Starts with the planning context and the schema advertised by the table
+    /// provider. Projection indices refer to this schema, not the table's current
+    /// schema. Pass an already-projected schema and omit projection to retain it.
+    pub fn new(context: Arc<TaskContext>, table: Table, schema: SchemaRef) -> Self {
+        Self {
+            context,
+            table,
+            schema,
+            projection: None,
+            snapshot_id: None,
+            predicate: None,
+        }
+    }
+
     /// Selects columns from the supplied schema in this order, or all its columns
     /// for `None`. Indices are validated when [`Self::build`] is called.
     pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
@@ -139,14 +183,14 @@ impl LazyFileScanTaskProviderBuilder {
         self.with_predicate(convert_filters_to_predicate(filters))
     }
 
-    /// Validates projection and builds a lazy provider without file discovery.
-    /// Its stream discovers files only when polled, or can be collected before
-    /// execution by [`super::eager::EagerFileScanTaskProvider::plan`].
+    /// Validates projection and builds the configured eager or lazy provider.
+    /// Lazy mode performs no file discovery; eager mode awaits [`LazyFileScanTaskProvider::into_eager`].
+    /// The returned schema matches the columns selected by both implementations.
     ///
     /// # Errors
     ///
-    /// Returns an error if a projection index is outside the supplied schema.
-    pub fn build(self) -> Result<LazyFileScanTaskProvider> {
+    /// Returns projection errors, or discovery errors when eager planning is enabled.
+    pub async fn build(self) -> Result<(SchemaRef, Arc<dyn FileScanTaskProvider>)> {
         let schema = match self.projection {
             Some(projection) => Arc::new(self.schema.project(&projection)?),
             None => self.schema,
@@ -156,13 +200,25 @@ impl LazyFileScanTaskProviderBuilder {
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        Ok(LazyFileScanTaskProvider {
+        let discovery = LazyFileScanTaskProvider {
             table: self.table,
-            schema,
+            schema: Arc::clone(&schema),
             projection,
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
-        })
+        };
+        let provider: Arc<dyn FileScanTaskProvider> =
+            if IcebergDataFusionConfig::from_config_or_default(
+                self.context.session_config(),
+            )
+            .execution
+            .eager_file_planning
+            {
+                Arc::new(discovery.into_eager(self.context).await?)
+            } else {
+                Arc::new(discovery)
+            };
+        Ok((schema, provider))
     }
 }
 

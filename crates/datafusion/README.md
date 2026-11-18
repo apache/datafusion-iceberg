@@ -24,21 +24,26 @@ This crate contains the integration of Apache DataFusion and Apache Iceberg.
 ## File task providers
 
 `IcebergDataSource` reads a `FileScanTaskProvider` using a shared, process-local
-reader. It does not require a table. `LazyFileScanTaskProvider` retains a table and
-scan options and discovers files when its stream is polled. Configure it with
-`LazyFileScanTaskProvider::builder(table, schema)`, followed by `with_projection`,
-`with_snapshot_id` and `with_filters` as needed. `build()` validates the projection
-and keeps the projected output schema and discovery columns together; it does not
-read manifests. Use the provider's `schema()` when assembling the source.
+reader. It does not require a table.
 
-`EagerFileScanTaskProvider::plan` collects that same discovery stream before
-execution. Table providers choose between these using
-`iceberg.execution.eager_file_planning`. Reader configuration and fetch remain
-source settings, independent of the discovery builder.
+`FileScanTaskProviderBuilder::new(context, table, schema)` receives configuration
+at construction. Set `with_projection`, `with_snapshot_id` and `with_filters` as
+needed, then await `build()` for the projected schema and task provider together.
+The builder selects eager or lazy discovery from
+`iceberg.execution.eager_file_planning`; callers do not branch on that setting.
+Lazy construction does not read manifests. Eager construction consumes the same
+discovery through `LazyFileScanTaskProvider::into_eager`, retaining only file tasks.
+
+`IcebergDataSource::builder(config, schema, file_io, reader_builder)` applies session
+reader settings at construction. Pass storage and the reader builder directly
+from the table, not through its discovery provider. The retained reader uses the
+session batch size and page-index setting, with one concurrent file per partition.
+`with_reader` can override those defaults with an existing configured reader.
 
 Already-planned groups can be supplied with `EagerFileScanTaskProvider::try_new`
-and `IcebergDataSourceBuilder::with_file_scan_task_provider`. Source construction
-is synchronous, requires no current runtime, and performs no discovery. Supply an
-already-projected schema and a reader configured for the process that will execute
-it; the builder's FileIO must match that reader. See the builder's API documentation
-for a reconstruction example. Custom task providers use the same source.
+and `with_file_scan_task_provider`. Source construction remains synchronous and
+performs no discovery, even when eager planning is enabled. It requires no current
+runtime: the supplied reader builder already holds the process-local runtime.
+Its FileIO must match the source's FileIO, and tasks must produce the supplied
+projected schema. See the builder's API documentation for a reconstruction example.
+Custom task providers use the same source; no factory or transform is required.

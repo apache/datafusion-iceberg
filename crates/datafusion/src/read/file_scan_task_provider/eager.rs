@@ -16,16 +16,13 @@
 // under the License.
 
 use datafusion::common::{Result, exec_err};
-use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use iceberg::scan::FileScanTask;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use super::lazy::LazyFileScanTaskProvider;
 use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
-use crate::to_datafusion_error;
 
 /// Files discovered before execution, in groups that each become one output
 /// partition. Group order and empty groups are retained.
@@ -47,41 +44,6 @@ impl EagerFileScanTaskProvider {
             );
         }
         Ok(Self { file_scan_tasks })
-    }
-
-    /// Discovers all tasks now, split round-robin into up to the context's target
-    /// partitions. The returned provider retains only the tasks, not the table.
-    /// Dropping this future drops the discovery stream; no background collector
-    /// is spawned. An empty scan retains one empty output partition.
-    pub async fn plan(
-        discovery: Arc<LazyFileScanTaskProvider>,
-        context: Arc<TaskContext>,
-    ) -> Result<Self> {
-        let target = context.session_config().target_partitions();
-        if target == 0 {
-            return exec_err!(
-                "Iceberg eager planning requires at least one target partition"
-            );
-        }
-        let mut tasks = discovery.open(
-            0,
-            FileScanTaskProviderContext {
-                task_context: &context,
-            },
-        )?;
-        let mut groups = Vec::new();
-        let mut partition = 0;
-        while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
-            if partition == groups.len() {
-                groups.push(Vec::new());
-            }
-            groups[partition].push(task);
-            partition = (partition + 1) % target;
-        }
-        if groups.is_empty() {
-            groups.push(Vec::new());
-        }
-        Self::try_new(groups)
     }
 
     /// All file tasks, in partition order and then group order.
