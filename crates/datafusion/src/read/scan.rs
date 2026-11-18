@@ -27,6 +27,8 @@ use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::Expr;
@@ -53,6 +55,8 @@ pub struct IcebergDataSource {
     predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
     fetch: Option<usize>,
+    /// Execution metrics, reported by `EXPLAIN ANALYZE`.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergDataSource {
@@ -167,6 +171,7 @@ impl IcebergDataSourceBuilder {
             projection,
             predicate: self.predicate,
             fetch: self.fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -181,7 +186,7 @@ impl DataSource for IcebergDataSource {
 
     fn open(
         &self,
-        _partition: usize,
+        partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let fut = get_batch_stream(
@@ -198,30 +203,14 @@ impl DataSource for IcebergDataSource {
             context.session_config().batch_size(),
         );
         let stream = futures::stream::once(fut).try_flatten();
-
-        // Apply the fetch if specified.
-        let limited_stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-            if let Some(limit) = self.fetch {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
-            limited_stream,
+        let stream = Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream));
+        // With no fetch, the limit passes every row through, still recording
+        // the output metrics.
+        Ok(Box::pin(LimitStream::new(
+            stream,
+            0,
+            self.fetch,
+            BaselineMetrics::new(&self.metrics, partition),
         )))
     }
 
@@ -261,6 +250,10 @@ impl DataSource for IcebergDataSource {
 
     fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+
+    fn metrics(&self) -> ExecutionPlanMetricsSet {
+        self.metrics.clone()
     }
 
     fn try_swapping_with_projection(

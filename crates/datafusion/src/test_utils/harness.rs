@@ -16,8 +16,10 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -50,10 +52,13 @@ const NAMESPACE_NAME: &str = "public";
 
 pub struct IcebergTestHarness {
     ctx: SessionContext,
+    parquet_reads: Arc<AtomicUsize>,
 }
 
 impl IcebergTestHarness {
     pub async fn new() -> Result<Self> {
+        let storage_factory = FixtureStorageFactory::default();
+        let parquet_reads = storage_factory.parquet_reads.clone();
         let state = SessionStateBuilder::new()
             .with_default_features()
             // Plan snapshots must not vary with the runner's CPU count.
@@ -63,13 +68,13 @@ impl IcebergTestHarness {
             .with_table_factory(
                 "ICEBERG".to_string(),
                 Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
-                    Arc::new(FixtureStorageFactory::default()),
+                    Arc::new(storage_factory.clone()),
                 )),
             )
             .build();
 
         let catalog = MemoryCatalogBuilder::default()
-            .with_storage_factory(Arc::new(FixtureStorageFactory::default()))
+            .with_storage_factory(Arc::new(storage_factory))
             .load(
                 CATALOG_NAME,
                 HashMap::from([(
@@ -97,7 +102,7 @@ impl IcebergTestHarness {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
 
-        Ok(Self { ctx })
+        Ok(Self { ctx, parquet_reads })
     }
 
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
@@ -114,17 +119,29 @@ impl IcebergTestHarness {
 
         Ok((displayable(plan.as_ref()).indent(true).to_string(), batches))
     }
+
+    /// Returns how many byte ranges have been read from Parquet files since
+    /// the last call, and resets the count. Iceberg reads metadata and
+    /// manifest files whole, so only Parquet reads go through
+    /// [`Storage::reader`].
+    pub fn take_parquet_reads(&self) -> usize {
+        self.parquet_reads.swap(0, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FixtureStorageFactory {
     root: PathBuf,
+    /// Shared by every storage this factory builds.
+    #[serde(skip)]
+    parquet_reads: Arc<AtomicUsize>,
 }
 
 impl Default for FixtureStorageFactory {
     fn default() -> Self {
         Self {
             root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/iceberg"),
+            parquet_reads: Arc::default(),
         }
     }
 }
@@ -134,6 +151,7 @@ impl StorageFactory for FixtureStorageFactory {
     fn build(&self, _config: &StorageConfig) -> IcebergResult<Arc<dyn Storage>> {
         Ok(Arc::new(FixtureStorage {
             root: self.root.clone(),
+            parquet_reads: self.parquet_reads.clone(),
         }))
     }
 }
@@ -141,6 +159,8 @@ impl StorageFactory for FixtureStorageFactory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FixtureStorage {
     root: PathBuf,
+    #[serde(skip)]
+    parquet_reads: Arc<AtomicUsize>,
 }
 
 impl FixtureStorage {
@@ -175,7 +195,10 @@ impl Storage for FixtureStorage {
     }
 
     async fn reader(&self, path: &str) -> IcebergResult<Box<dyn FileRead>> {
-        self.local().reader(&self.local_path(path)?).await
+        Ok(Box::new(CountingFileRead {
+            inner: self.local().reader(&self.local_path(path)?).await?,
+            reads: self.parquet_reads.clone(),
+        }))
     }
 
     async fn write(&self, path: &str, bytes: Bytes) -> IcebergResult<()> {
@@ -211,5 +234,19 @@ impl Storage for FixtureStorage {
 
     fn new_output(&self, path: &str) -> IcebergResult<OutputFile> {
         Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+/// Counts the byte ranges read through `inner`.
+struct CountingFileRead {
+    inner: Box<dyn FileRead>,
+    reads: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl FileRead for CountingFileRead {
+    async fn read(&self, range: Range<u64>) -> IcebergResult<Bytes> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read(range).await
     }
 }
