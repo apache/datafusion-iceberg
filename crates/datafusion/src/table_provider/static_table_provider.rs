@@ -131,7 +131,7 @@ impl TableProvider for IcebergStaticTableProvider {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
-            .try_build()?;
+            .build()?;
         Ok(DataSourceExec::from_data_source(source))
     }
 

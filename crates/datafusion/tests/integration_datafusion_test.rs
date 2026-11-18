@@ -920,7 +920,7 @@ fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
         .with_snapshot_id(scan.snapshot_id())
         .with_predicate(scan.predicate().cloned())
         .with_fetch(scan.fetch())
-        .try_build()
+        .build()
         .unwrap()
 }
 
@@ -1077,7 +1077,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
     let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
         .with_snapshot_id(Some(snapshot_id))
-        .try_build()?;
+        .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
         +--------+
         | foo2   |

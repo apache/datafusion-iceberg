@@ -154,7 +154,7 @@ impl IcebergDataSourceBuilder {
     /// # Errors
     ///
     /// Returns an error if the projection is out of bounds for the schema.
-    pub fn try_build(self) -> Result<IcebergDataSource> {
+    pub fn build(self) -> Result<IcebergDataSource> {
         let schema = match &self.projection {
             None => self.schema,
             Some(projection) => Arc::new(self.schema.project(projection)?),

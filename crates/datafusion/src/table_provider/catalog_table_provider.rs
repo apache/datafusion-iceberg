@@ -143,7 +143,7 @@ impl TableProvider for IcebergCatalogTableProvider {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(limit)
-            .try_build()?;
+            .build()?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
@@ -457,7 +457,7 @@ mod tests {
         // Columns come back in the projection's order, not the table's.
         let source = IcebergDataSource::builder(table.clone(), schema.clone())
             .with_projection(Some(&vec![1, 0]))
-            .try_build()
+            .build()
             .unwrap();
         let projected = source.schema();
         let names: Vec<_> = projected.fields().iter().map(|f| f.name()).collect();
@@ -470,7 +470,7 @@ mod tests {
 
         let err = IcebergDataSource::builder(table, schema)
             .with_projection(Some(&vec![0, out_of_range]))
-            .try_build()
+            .build()
             .unwrap_err();
         assert_eq!(
             err.to_string(),
