@@ -63,7 +63,7 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 - Names like `<table>$snapshots`, `$manifests`, and `$history` resolve to `IcebergMetadataTableProvider`.
 - SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods, which call the async catalog through `spawn_blocking` + `block_on`. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.
 
-### Table providers (`table/`)
+### Table providers (`table_provider/`)
 
 - **`IcebergCatalogTableProvider`**: catalog-backed. It caches the Arrow schema at construction but reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
 - **`IcebergStaticTableProvider`**: wraps a fixed `Table`, optionally pinned to a snapshot id for time travel. Read-only.
@@ -71,11 +71,11 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 ### Read path and filter pushdown
 
-`IcebergTableScan` converts the projection to column names and the filters to a single Iceberg `Predicate` (`read/predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
+`IcebergDataSource` converts the projection to column names and the filters to a single Iceberg `Predicate` (`read/predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
 
 Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `predicate.rs`; for example, it is why casts and some NaN arithmetic are deliberately not pushed down. Removing a cast is left to DataFusion's simplifier (`unwrap_cast_in_comparison`), which rewrites a comparison only when the result doesn't change.
 
-### Write path (`IcebergTableProvider::insert_into`)
+### Write path (`IcebergCatalogTableProvider::insert_into`)
 
 ```
 input
@@ -105,7 +105,7 @@ Library code returns `datafusion::error::Result`. Convert iceberg errors with `t
   - `test_encrypted_round_trip`: format V3, encrypted with in-memory KMS key `test-master-key`
 
   All other tables are created by `CREATE TABLE` inside the `.slt` files.
-- Several `.slt` files assert `EXPLAIN` output, such as `IcebergTableScan projection:[...] predicate:[...] limit:[...]`. Changes to the scan's `DisplayAs`, to pushdown, or to the DataFusion version require updating those expectations by hand; the harness has no auto-complete mode.
+- Several `.slt` files assert `EXPLAIN` output, such as `DataSourceExec: format=iceberg, projection=[...], predicate=..., fetch=...`. Changes to `IcebergDataSource::fmt_as`, to pushdown, or to the DataFusion version require updating those expectations by hand; the harness has no auto-complete mode.
 
 ## Dependencies
 
