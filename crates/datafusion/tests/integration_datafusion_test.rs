@@ -1040,7 +1040,6 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     );
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.schema(), scan.schema());
-    assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
         +------+------+
@@ -1060,7 +1059,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .data_source()
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
-    assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
+    assert_eq!(scan.schema(), pinned.schema());
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;

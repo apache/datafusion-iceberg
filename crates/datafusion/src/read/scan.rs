@@ -47,10 +47,9 @@ pub struct IcebergDataSource {
     table: Table,
     /// Snapshot of the table to scan.
     snapshot_id: Option<i64>,
-    /// Schema returned by this data source after projection.
+    /// Schema returned by this data source after projection. Its columns are
+    /// read from Iceberg by name.
     schema: ArrowSchemaRef,
-    /// Projection column names in the output schema.
-    projection: Vec<String>,
     /// Filter to apply to the table scan
     predicate: Option<Predicate>,
     /// Optional limit on the number of rows to return
@@ -86,16 +85,21 @@ impl IcebergDataSource {
         self.schema.clone()
     }
 
-    pub fn projection(&self) -> &[String] {
-        &self.projection
-    }
-
     pub fn predicate(&self) -> Option<&Predicate> {
         self.predicate.as_ref()
     }
 
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+
+    /// The names of the columns this source reads, in output order.
+    fn column_names(&self) -> Vec<String> {
+        self.schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
     }
 }
 
@@ -159,16 +163,10 @@ impl IcebergDataSourceBuilder {
             None => self.schema,
             Some(projection) => Arc::new(self.schema.project(projection)?),
         };
-        let projection = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
         Ok(IcebergDataSource {
             table: self.table,
             snapshot_id: self.snapshot_id,
             schema,
-            projection,
             predicate: self.predicate,
             fetch: self.fetch,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -192,7 +190,7 @@ impl DataSource for IcebergDataSource {
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
-            Some(self.projection.clone()),
+            Some(self.column_names()),
             self.predicate.clone(),
             context
                 .session_config()
@@ -220,7 +218,7 @@ impl DataSource for IcebergDataSource {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         write!(f, "format=iceberg",)?;
-        write!(f, ", projection=[{}]", self.projection.join(", "))?;
+        write!(f, ", projection=[{}]", self.column_names().join(", "))?;
         if let Some(predicate) = &self.predicate {
             write!(f, ", predicate={predicate}")?;
         }

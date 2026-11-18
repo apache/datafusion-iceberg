@@ -460,7 +460,9 @@ mod tests {
             .with_projection(Some(&vec![1, 0]))
             .build()
             .unwrap();
-        insta::assert_debug_snapshot!(source.projection(), @r#"
+        let projected = source.schema();
+        let names: Vec<_> = projected.fields().iter().map(|f| f.name()).collect();
+        insta::assert_debug_snapshot!(names, @r#"
         [
             "name",
             "id",
