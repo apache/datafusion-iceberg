@@ -77,7 +77,7 @@ The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` o
 
 ### Catalog → schema → table
 
-`IcebergCatalogProvider` wraps an `iceberg::Catalog` and builds one `IcebergSchemaProvider` per namespace, each holding an `IcebergCatalogTableProvider` per table. Namespaces and tables are listed once, at construction, and are never refreshed. Tables created by other clients after that point are invisible.
+`IcebergCatalogProvider` wraps an `iceberg::Catalog` and builds one `IcebergSchemaProvider` per namespace, each holding the names of its tables. Each table lookup loads the table and builds a new `IcebergCatalogTableProvider`, so every query sees the table's current schema. Namespaces and table names are listed once, at construction, and are never refreshed. Tables created by other clients after that point are invisible.
 
 - Names like `<table>$snapshots`, `$manifests`, and `$history` resolve to `IcebergMetadataTableProvider`.
 - SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods, which call the async catalog through `spawn_blocking` + `block_on`. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.

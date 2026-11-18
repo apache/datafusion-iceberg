@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::DashSet;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{exec_datafusion_err, exec_err, plan_datafusion_err};
 use datafusion::datasource::TableProvider;
@@ -26,47 +26,42 @@ use datafusion::error::Result;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
-use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::FormatVersion;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
+use crate::metadata::IcebergMetadataTableProvider;
 use crate::table_provider::IcebergCatalogTableProvider;
 use crate::to_datafusion_error;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
+///
+/// Each lookup loads the table from the catalog and returns a new provider, so
+/// a query sees the table's schema as it is when the query is planned.
 #[derive(Debug)]
 pub(crate) struct IcebergSchemaProvider {
     /// Reference to the Iceberg catalog
     catalog: Arc<dyn Catalog>,
     /// The namespace this schema represents
     namespace: NamespaceIdent,
-    /// A concurrent map where keys are table names
-    /// and values are dynamic references to objects implementing the
-    /// [`TableProvider`] trait.
+    /// The names of the namespace's tables.
     /// Wrapped in Arc to allow sharing across async boundaries in register_table.
-    tables: Arc<DashMap<String, Arc<IcebergCatalogTableProvider>>>,
+    tables: Arc<DashSet<String>>,
 }
 
 impl IcebergSchemaProvider {
     /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
-    /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
-    ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
+    /// for the provided namespace in the Iceberg [`Catalog`], listing the
+    /// namespace's tables.
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
     ) -> Result<Self> {
-        // TODO:
-        // Tables and providers should be cached based on table_name
-        // if we have a cache miss; we update our internal cache & check again
-        // As of right now; tables might become stale.
-        let table_names: Vec<_> = client
+        // TODO: The table names are listed once, so tables created or dropped
+        // by other clients after this point are not seen (#24).
+        let tables = client
             .list_tables(&namespace)
             .await
             .map_err(to_datafusion_error)?
@@ -74,29 +69,10 @@ impl IcebergSchemaProvider {
             .map(|tbl| tbl.name().to_string())
             .collect();
 
-        let providers = try_join_all(
-            table_names
-                .iter()
-                .map(|name| {
-                    IcebergCatalogTableProvider::try_new(
-                        client.clone(),
-                        namespace.clone(),
-                        name,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
-        let tables = Arc::new(DashMap::new());
-        for (name, provider) in table_names.into_iter().zip(providers) {
-            tables.insert(name, Arc::new(provider));
-        }
-
         Ok(IcebergSchemaProvider {
             catalog: client,
             namespace,
-            tables,
+            tables: Arc::new(tables),
         })
     }
 }
@@ -119,29 +95,51 @@ impl SchemaProvider for IcebergSchemaProvider {
 
     fn table_exist(&self, name: &str) -> bool {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
-            self.tables.contains_key(table_name)
+            self.tables.contains(table_name)
                 && MetadataTableType::try_from(metadata_table_name).is_ok()
         } else {
-            self.tables.contains_key(name)
+            self.tables.contains(name)
         }
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        if let Some((table_name, metadata_table_name)) = name.split_once('$') {
-            let metadata_table_type = MetadataTableType::try_from(metadata_table_name)
-                .map_err(|e| plan_datafusion_err!("{e}"))?;
-            if let Some(table) = self.tables.get(table_name) {
-                let metadata_table = table.metadata_table(metadata_table_type).await?;
-                return Ok(Some(Arc::new(metadata_table)));
-            } else {
-                return Ok(None);
+        let (table_name, metadata_table_type) = match name.split_once('$') {
+            Some((table_name, metadata_table_name)) => {
+                let metadata_table_type =
+                    MetadataTableType::try_from(metadata_table_name)
+                        .map_err(|e| plan_datafusion_err!("{e}"))?;
+                (table_name, Some(metadata_table_type))
             }
+            None => (name, None),
+        };
+        if !self.tables.contains(table_name) {
+            return Ok(None);
         }
 
-        Ok(self
-            .tables
-            .get(name)
-            .map(|entry| entry.value().clone() as Arc<dyn TableProvider>))
+        let provider: Arc<dyn TableProvider> = match metadata_table_type {
+            None => Arc::new(
+                IcebergCatalogTableProvider::try_new(
+                    self.catalog.clone(),
+                    self.namespace.clone(),
+                    table_name,
+                )
+                .await?,
+            ),
+            Some(metadata_table_type) => {
+                let table_ident =
+                    TableIdent::new(self.namespace.clone(), table_name.into());
+                let table = self
+                    .catalog
+                    .load_table(&table_ident)
+                    .await
+                    .map_err(to_datafusion_error)?;
+                Arc::new(IcebergMetadataTableProvider::try_new(
+                    table,
+                    metadata_table_type,
+                )?)
+            }
+        };
+        Ok(Some(provider))
     }
 
     fn register_table(
@@ -190,16 +188,7 @@ impl SchemaProvider for IcebergSchemaProvider {
                     .await
                     .map_err(to_datafusion_error)?;
 
-                // Create a new table provider using the catalog reference
-                let table_provider = IcebergCatalogTableProvider::try_new(
-                    catalog.clone(),
-                    namespace.clone(),
-                    name_clone.clone(),
-                )
-                .await?;
-
-                // Store the new table provider
-                tables.insert(name_clone, Arc::new(table_provider));
+                tables.insert(name_clone);
 
                 Ok(None)
             })
@@ -226,20 +215,23 @@ impl SchemaProvider for IcebergSchemaProvider {
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async move {
-                let table_ident = TableIdent::new(namespace, table_name.clone());
+                // Load the table before dropping it, to return its provider
+                let removed = IcebergCatalogTableProvider::try_new(
+                    catalog.clone(),
+                    namespace,
+                    table_name.clone(),
+                )
+                .await?;
 
                 // Drop the table from the Iceberg catalog
                 catalog
-                    .drop_table(&table_ident)
+                    .drop_table(removed.table_ident())
                     .await
                     .map_err(to_datafusion_error)?;
 
-                // Remove from local cache and return the removed provider
-                let removed = tables
-                    .remove(&table_name)
-                    .map(|(_, table)| table as Arc<dyn TableProvider>);
+                tables.remove(&table_name);
 
-                Ok(removed)
+                Ok(Some(Arc::new(removed) as Arc<dyn TableProvider>))
             })
         });
 
