@@ -16,7 +16,10 @@
 // under the License.
 
 pub(crate) mod predicate;
+mod reader;
 pub(crate) mod scan;
+mod task_source;
 
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};
+pub use task_source::{FileScanTaskSource, TableScanTaskSource};

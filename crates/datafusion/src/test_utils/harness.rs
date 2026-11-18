@@ -100,6 +100,11 @@ impl IcebergTestHarness {
         Ok(Self { ctx })
     }
 
+    /// Session used for planning and executing fixture-table scans.
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
         let (plan, batches) = self.query_batches(sql).await?;
         Ok((plan, pretty_format_batches(&batches)?.to_string()))
