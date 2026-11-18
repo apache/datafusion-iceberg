@@ -15,33 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::vec;
-
 use datafusion::arrow::datatypes::DataType;
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use datafusion::scalar::ScalarValue;
-use iceberg::expr::{
-    BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression,
-};
+use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference};
 use iceberg::spec::{Datum, PrimitiveLiteral};
 
-// A datafusion expression could be an Iceberg predicate, column, or literal.
-enum TransformedResult {
-    Predicate(Predicate),
-    // Implied by the expression but not equivalent to it, because an unconvertible
-    // AND operand was dropped. Sound to push down, unsound to negate.
-    PartialPredicate(Predicate),
-    Column(Reference),
-    Literal(Datum),
-    NotTransformed,
+/// A filter converted to an iceberg [`Predicate`].
+enum Converted {
+    /// Matches exactly the rows the filter matches.
+    Exact(Predicate),
+    /// Implied by the filter but not equivalent to it, because an unconvertible
+    /// AND operand was dropped. Sound to push down, unsound to negate.
+    Implied(Predicate),
 }
 
-enum OpTransformedResult {
-    Operator(PredicateOperator),
-    And,
-    Or,
-    NotTransformed,
+impl Converted {
+    fn into_predicate(self) -> Predicate {
+        match self {
+            Converted::Exact(predicate) | Converted::Implied(predicate) => predicate,
+        }
+    }
 }
 
 /// Converts DataFusion filters ([`Expr`]) to an iceberg [`Predicate`].
@@ -55,149 +50,152 @@ pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
 }
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
-    match to_iceberg_predicate(expr) {
-        TransformedResult::Predicate(predicate)
-        | TransformedResult::PartialPredicate(predicate) => Some(predicate),
-        TransformedResult::Column(column) => {
-            // A bare column in a filter context represents a boolean column check
-            // Convert it to: column = true
-            Some(Predicate::Binary(BinaryExpression::new(
-                PredicateOperator::Eq,
-                column,
-                Datum::bool(true),
-            )))
-        }
-        TransformedResult::Literal(_) => {
-            // Literal values in filter context cannot be pushed down
-            None
-        }
-        _ => None,
+    // A bare column as a whole filter is a boolean column check: `col = true`.
+    // TODO: Also convert it as an AND or OR operand, as `NOT col` already is.
+    // `col = true` is equivalent to a boolean column, so that is sound.
+    match column(expr) {
+        Some(column) => Some(column.equal_to(Datum::bool(true))),
+        None => predicate(expr).map(Converted::into_predicate),
     }
 }
 
-fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
-    match expr {
-        Expr::BinaryExpr(binary) => {
-            let left = to_iceberg_predicate(&binary.left);
-            let right = to_iceberg_predicate(&binary.right);
-            let op = to_iceberg_operation(binary.op);
-            match op {
-                OpTransformedResult::Operator(op) => {
-                    to_iceberg_binary_predicate(left, right, op)
-                }
-                OpTransformedResult::And => to_iceberg_and_predicate(left, right),
-                OpTransformedResult::Or => to_iceberg_or_predicate(left, right),
-                OpTransformedResult::NotTransformed => TransformedResult::NotTransformed,
-            }
-        }
-        Expr::Not(exp) => {
-            let expr = to_iceberg_predicate(exp);
-            match expr {
-                TransformedResult::Predicate(p) => TransformedResult::Predicate(!p),
-                TransformedResult::Column(column) => {
-                    // NOT of a bare boolean column: NOT col => col = false
-                    TransformedResult::Predicate(Predicate::Binary(
-                        BinaryExpression::new(
-                            PredicateOperator::Eq,
-                            column,
-                            Datum::bool(false),
-                        ),
-                    ))
-                }
-                _ => TransformedResult::NotTransformed,
-            }
-        }
-        Expr::Column(column) => TransformedResult::Column(Reference::new(column.name())),
-        Expr::Literal(literal, _) => match scalar_value_to_datum(literal) {
-            Some(data) => TransformedResult::Literal(data),
-            None => TransformedResult::NotTransformed,
+/// Converts a filter expression, or returns `None` if no part of it can be
+/// pushed down.
+fn predicate(expr: &Expr) -> Option<Converted> {
+    let exact = match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => return and(predicate(left), predicate(right)),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => return Some(or(predicate(left)?, predicate(right)?)),
+        Expr::BinaryExpr(binary) => comparison(binary)?,
+        Expr::Not(inner) => match column(inner) {
+            // NOT of a bare boolean column: `col = false`
+            Some(column) => column.equal_to(Datum::bool(false)),
+            None => match predicate(inner)? {
+                Converted::Exact(p) => !p,
+                Converted::Implied(_) => return None,
+            },
         },
-        Expr::InList(inlist) => {
-            let mut datums = vec![];
-            for expr in &inlist.list {
-                let p = to_iceberg_predicate(expr);
-                match p {
-                    TransformedResult::Literal(l) => datums.push(l),
-                    _ => return TransformedResult::NotTransformed,
-                }
-            }
-
-            let expr = to_iceberg_predicate(&inlist.expr);
-            match expr {
-                TransformedResult::Column(r) => match inlist.negated {
-                    false => TransformedResult::Predicate(r.is_in(datums)),
-                    true => TransformedResult::Predicate(r.is_not_in(datums)),
-                },
-                _ => TransformedResult::NotTransformed,
+        Expr::InList(InList {
+            expr,
+            list,
+            negated,
+        }) => {
+            let column = column(expr)?;
+            let datums = list.iter().map(literal).collect::<Option<Vec<_>>>()?;
+            if *negated {
+                column.is_not_in(datums)
+            } else {
+                column.is_in(datums)
             }
         }
-        Expr::IsNull(expr) => {
-            let p = to_iceberg_predicate(expr);
-            match p {
-                TransformedResult::Column(r) => TransformedResult::Predicate(
-                    Predicate::Unary(UnaryExpression::new(PredicateOperator::IsNull, r)),
-                ),
-                _ => TransformedResult::NotTransformed,
-            }
-        }
-        Expr::IsNotNull(expr) => {
-            let p = to_iceberg_predicate(expr);
-            match p {
-                TransformedResult::Column(r) => TransformedResult::Predicate(
-                    Predicate::Unary(UnaryExpression::new(PredicateOperator::NotNull, r)),
-                ),
-                _ => TransformedResult::NotTransformed,
-            }
-        }
+        Expr::IsNull(expr) => column(expr)?.is_null(),
+        Expr::IsNotNull(expr) => column(expr)?.is_not_null(),
+        // Only a simple prefix pattern (`'prefix%'`) is pushed down. Iceberg's
+        // StartsWith is case-sensitive, so ILIKE isn't, and neither is an
+        // explicit ESCAPE clause.
+        // TODO: Support an ESCAPE clause by having `like_prefix` unescape with
+        // that character instead of `\`.
         Expr::Like(Like {
             negated,
             expr,
             pattern,
-            escape_char,
-            case_insensitive,
+            escape_char: None,
+            case_insensitive: false,
         }) => {
-            // Only support simple prefix patterns (e.g., 'prefix%')
-            // Note: Iceberg's StartsWith operator is case-sensitive, so we cannot
-            // push down case-insensitive LIKE (ILIKE) patterns
-            // An explicit ESCAPE clause is also not supported for pushdown
-            if escape_char.is_some() || *case_insensitive {
-                return TransformedResult::NotTransformed;
-            }
-
-            // Extract the pattern string
-            let pattern_str = match to_iceberg_predicate(pattern) {
-                TransformedResult::Literal(d) => match d.literal() {
-                    PrimitiveLiteral::String(s) => s.clone(),
-                    _ => return TransformedResult::NotTransformed,
-                },
-                _ => return TransformedResult::NotTransformed,
+            let datum = literal(pattern)?;
+            let PrimitiveLiteral::String(pattern) = datum.literal() else {
+                return None;
             };
-
-            // Check if it's a simple prefix pattern (ends with % and no other wildcards)
-            if let Some(prefix) = like_prefix(&pattern_str) {
-                // Get the column reference
-                let column = match to_iceberg_predicate(expr) {
-                    TransformedResult::Column(r) => r,
-                    _ => return TransformedResult::NotTransformed,
-                };
-
-                // Create the appropriate predicate
-                let predicate = if *negated {
-                    column.not_starts_with(Datum::string(prefix))
-                } else {
-                    column.starts_with(Datum::string(prefix))
-                };
-
-                TransformedResult::Predicate(predicate)
+            let prefix = Datum::string(like_prefix(pattern)?);
+            let column = column(expr)?;
+            if *negated {
+                column.not_starts_with(prefix)
             } else {
-                // Complex LIKE patterns cannot be pushed down
-                TransformedResult::NotTransformed
+                column.starts_with(prefix)
             }
         }
+        // Scalar functions are identified by name, unlike dedicated `Expr`
+        // variants such as `Expr::IsNull`.
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            scalar_function_to_iceberg_predicate(func.name(), args)
+            match (func.name(), args.as_slice()) {
+                ("isnan", [arg]) => resolve_nan_preserving_reference(arg)?.is_nan(),
+                _ => return None,
+            }
         }
-        _ => TransformedResult::NotTransformed,
+        _ => return None,
+    };
+    Some(Converted::Exact(exact))
+}
+
+/// Drops an unconvertible operand, which leaves a predicate implied by the
+/// conjunction.
+fn and(left: Option<Converted>, right: Option<Converted>) -> Option<Converted> {
+    match (left, right) {
+        (Some(Converted::Exact(left)), Some(Converted::Exact(right))) => {
+            Some(Converted::Exact(left.and(right)))
+        }
+        (Some(left), Some(right)) => Some(Converted::Implied(
+            left.into_predicate().and(right.into_predicate()),
+        )),
+        (Some(kept), None) | (None, Some(kept)) => {
+            Some(Converted::Implied(kept.into_predicate()))
+        }
+        (None, None) => None,
+    }
+}
+
+/// Takes both operands: dropping one would drop the rows only it matches.
+fn or(left: Converted, right: Converted) -> Converted {
+    match (left, right) {
+        (Converted::Exact(left), Converted::Exact(right)) => {
+            Converted::Exact(left.or(right))
+        }
+        (left, right) => {
+            Converted::Implied(left.into_predicate().or(right.into_predicate()))
+        }
+    }
+}
+
+/// Converts `column op literal`, or `literal op column` with `op` swapped.
+fn comparison(binary: &BinaryExpr) -> Option<Predicate> {
+    let (column, op, datum) = match (column(&binary.left), literal(&binary.right)) {
+        (Some(column), Some(datum)) => (column, binary.op, datum),
+        _ => (
+            column(&binary.right)?,
+            binary.op.swap()?,
+            literal(&binary.left)?,
+        ),
+    };
+    let op = match op {
+        Operator::Eq => PredicateOperator::Eq,
+        Operator::NotEq => PredicateOperator::NotEq,
+        Operator::Lt => PredicateOperator::LessThan,
+        Operator::LtEq => PredicateOperator::LessThanOrEq,
+        Operator::Gt => PredicateOperator::GreaterThan,
+        Operator::GtEq => PredicateOperator::GreaterThanOrEq,
+        _ => return None,
+    };
+    Some(Predicate::Binary(BinaryExpression::new(op, column, datum)))
+}
+
+fn column(expr: &Expr) -> Option<Reference> {
+    match expr {
+        Expr::Column(column) => Some(Reference::new(column.name())),
+        _ => None,
+    }
+}
+
+fn literal(expr: &Expr) -> Option<Datum> {
+    match expr {
+        Expr::Literal(value, _) => scalar_value_to_datum(value),
+        _ => None,
     }
 }
 
@@ -217,40 +215,6 @@ fn like_prefix(pattern: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn to_iceberg_operation(op: Operator) -> OpTransformedResult {
-    match op {
-        Operator::Eq => OpTransformedResult::Operator(PredicateOperator::Eq),
-        Operator::NotEq => OpTransformedResult::Operator(PredicateOperator::NotEq),
-        Operator::Lt => OpTransformedResult::Operator(PredicateOperator::LessThan),
-        Operator::LtEq => OpTransformedResult::Operator(PredicateOperator::LessThanOrEq),
-        Operator::Gt => OpTransformedResult::Operator(PredicateOperator::GreaterThan),
-        Operator::GtEq => {
-            OpTransformedResult::Operator(PredicateOperator::GreaterThanOrEq)
-        }
-        // AND OR
-        Operator::And => OpTransformedResult::And,
-        Operator::Or => OpTransformedResult::Or,
-        // Others not supported
-        _ => OpTransformedResult::NotTransformed,
-    }
-}
-
-/// Translates a DataFusion scalar function into an Iceberg predicate.
-/// Unlike dedicated Expr variants (e.g. `Expr::IsNull`), scalar functions are
-/// identified by name at runtime, so we need to handle them here.
-fn scalar_function_to_iceberg_predicate(
-    func_name: &str,
-    args: &[Expr],
-) -> TransformedResult {
-    match func_name {
-        "isnan" if args.len() == 1 => match resolve_nan_preserving_reference(&args[0]) {
-            Some(r) => TransformedResult::Predicate(r.is_nan()),
-            None => TransformedResult::NotTransformed,
-        },
-        _ => TransformedResult::NotTransformed,
-    }
 }
 
 /// Attempts to resolve a numeric expression argument down to a single column
@@ -360,85 +324,6 @@ fn finite_literal(expr: &Expr) -> Option<f64> {
     }
 }
 
-fn to_iceberg_and_predicate(
-    left: TransformedResult,
-    right: TransformedResult,
-) -> TransformedResult {
-    match (left, right) {
-        (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
-            TransformedResult::Predicate(left.and(right))
-        }
-        (
-            TransformedResult::Predicate(left)
-            | TransformedResult::PartialPredicate(left),
-            TransformedResult::Predicate(right)
-            | TransformedResult::PartialPredicate(right),
-        ) => TransformedResult::PartialPredicate(left.and(right)),
-        (
-            TransformedResult::Predicate(kept)
-            | TransformedResult::PartialPredicate(kept),
-            _,
-        )
-        | (
-            _,
-            TransformedResult::Predicate(kept)
-            | TransformedResult::PartialPredicate(kept),
-        ) => TransformedResult::PartialPredicate(kept),
-        _ => TransformedResult::NotTransformed,
-    }
-}
-
-fn to_iceberg_or_predicate(
-    left: TransformedResult,
-    right: TransformedResult,
-) -> TransformedResult {
-    match (left, right) {
-        (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
-            TransformedResult::Predicate(left.or(right))
-        }
-        (
-            TransformedResult::Predicate(left)
-            | TransformedResult::PartialPredicate(left),
-            TransformedResult::Predicate(right)
-            | TransformedResult::PartialPredicate(right),
-        ) => TransformedResult::PartialPredicate(left.or(right)),
-        _ => TransformedResult::NotTransformed,
-    }
-}
-
-fn to_iceberg_binary_predicate(
-    left: TransformedResult,
-    right: TransformedResult,
-    op: PredicateOperator,
-) -> TransformedResult {
-    let (r, d, op) = match (left, right) {
-        (TransformedResult::NotTransformed, _) => {
-            return TransformedResult::NotTransformed;
-        }
-        (_, TransformedResult::NotTransformed) => {
-            return TransformedResult::NotTransformed;
-        }
-        (TransformedResult::Column(r), TransformedResult::Literal(d)) => (r, d, op),
-        (TransformedResult::Literal(d), TransformedResult::Column(r)) => {
-            (r, d, reverse_predicate_operator(op))
-        }
-        _ => return TransformedResult::NotTransformed,
-    };
-    TransformedResult::Predicate(Predicate::Binary(BinaryExpression::new(op, r, d)))
-}
-
-fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
-    match op {
-        PredicateOperator::Eq => PredicateOperator::Eq,
-        PredicateOperator::NotEq => PredicateOperator::NotEq,
-        PredicateOperator::GreaterThan => PredicateOperator::LessThan,
-        PredicateOperator::GreaterThanOrEq => PredicateOperator::LessThanOrEq,
-        PredicateOperator::LessThan => PredicateOperator::GreaterThan,
-        PredicateOperator::LessThanOrEq => PredicateOperator::GreaterThanOrEq,
-        _ => unreachable!("Reverse {}", op),
-    }
-}
-
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
 /// Convert a scalar value to an iceberg datum.
@@ -477,6 +362,8 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::TimestampNanosecond(Some(v), Some(_)) => {
             Some(Datum::timestamptz_nanos(*v))
         }
+        // TODO: Convert `Decimal128` literals with `Datum::decimal`, so filters
+        // on decimal columns are pushed down.
         _ => None,
     }
 }
@@ -513,6 +400,9 @@ mod tests {
                 Field::new("qux", DataType::Float64, true).with_metadata(HashMap::from(
                     [(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())],
                 )),
+                Field::new("b", DataType::Boolean, true).with_metadata(HashMap::from([
+                    (PARQUET_FIELD_ID_META_KEY.to_string(), "5".to_string()),
+                ])),
             ]);
         DFSchema::try_from_qualified_schema("my_table", &arrow_schema).unwrap()
     }
@@ -582,23 +472,73 @@ mod tests {
 
     #[test]
     fn test_predicate_conversion_with_single_unsupported_condition() {
-        let predicate = convert_to_iceberg_predicate("foo + 1 = 1");
-        assert_eq!(predicate, None);
-
-        let predicate = convert_to_iceberg_predicate("length(bar) = 1");
-        assert_eq!(predicate, None);
-
-        let predicate = convert_to_iceberg_predicate("foo in (1, 2, foo)");
-        assert_eq!(predicate, None);
+        for sql in [
+            "foo + 1 = 1",
+            "length(bar) = 1",
+            "foo in (1, 2, foo)",
+            "1 in (foo)",
+            "foo + 1 is null",
+            "foo = qux",
+            "1 = 1",
+            "foo is distinct from 1",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "sql: {sql}");
+        }
     }
 
     #[test]
     fn test_predicate_conversion_with_single_condition_rev() {
-        let predicate = convert_to_iceberg_predicate("1 < foo").unwrap();
+        let foo = || Reference::new("foo");
+        for (sql, expected) in [
+            ("1 = foo", foo().equal_to(Datum::long(1))),
+            ("1 != foo", foo().not_equal_to(Datum::long(1))),
+            ("1 < foo", foo().greater_than(Datum::long(1))),
+            ("1 <= foo", foo().greater_than_or_equal_to(Datum::long(1))),
+            ("1 > foo", foo().less_than(Datum::long(1))),
+            ("1 >= foo", foo().less_than_or_equal_to(Datum::long(1))),
+        ] {
+            assert_eq!(
+                convert_to_iceberg_predicate(sql),
+                Some(expected),
+                "sql: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_boolean_column() {
+        let b = || Reference::new("b");
+        let foo = || Reference::new("foo");
+
+        // A bare boolean column is a filter only on its own. A top-level AND is
+        // split into separate filters, so `b` here is on its own.
         assert_eq!(
-            predicate,
-            Reference::new("foo").greater_than(Datum::long(1))
+            convert_to_iceberg_predicate("b"),
+            Some(b().equal_to(Datum::bool(true)))
         );
+        assert_eq!(
+            convert_to_iceberg_predicate("not b"),
+            Some(b().equal_to(Datum::bool(false)))
+        );
+        assert_eq!(
+            convert_to_iceberg_predicate("b and foo > 1"),
+            Some(
+                b().equal_to(Datum::bool(true))
+                    .and(foo().greater_than(Datum::long(1)))
+            )
+        );
+
+        // As an operand of OR or of a nested AND, it isn't converted.
+        assert_eq!(convert_to_iceberg_predicate("b or foo > 1"), None);
+        assert_eq!(
+            convert_to_iceberg_predicate("(b and foo > 1) or foo < 0"),
+            Some(
+                foo()
+                    .greater_than(Datum::long(1))
+                    .or(foo().less_than(Datum::long(0)))
+            )
+        );
+        assert_eq!(convert_to_iceberg_predicate("not (b and foo > 1)"), None);
     }
 
     #[test]
@@ -873,6 +813,14 @@ mod tests {
     fn test_predicate_conversion_with_ilike() {
         // Case-insensitive LIKE (ILIKE) is not supported
         let sql = "bar ILIKE 'test%'";
+        let predicate = convert_to_iceberg_predicate(sql);
+        assert_eq!(predicate, None);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_like_escape_clause() {
+        // An explicit ESCAPE clause is not supported
+        let sql = "bar LIKE 'test%' ESCAPE '#'";
         let predicate = convert_to_iceberg_predicate(sql);
         assert_eq!(predicate, None);
     }
