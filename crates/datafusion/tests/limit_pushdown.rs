@@ -128,6 +128,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stops_reading_the_iceberg_scan_once_the_limit_is_reached() -> Result<()> {
+        let harness = IcebergTestHarness::new().await?;
+        harness.query_batches("SELECT * FROM taxi").await?;
+        let full_scan_reads = harness.take_parquet_reads();
+        harness.query_batches("SELECT * FROM taxi LIMIT 3").await?;
+        let limited_scan_reads = harness.take_parquet_reads();
+
+        // The exact counts depend on how many data files iceberg opens at
+        // once, which follows the runner's CPU count, so compare the two scans.
+        assert!(
+            limited_scan_reads < full_scan_reads,
+            "a scan with LIMIT 3 read {limited_scan_reads} Parquet ranges, \
+             a full scan {full_scan_reads}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn avoids_scanning_for_limit_zero() -> Result<()> {
         let harness = IcebergTestHarness::new().await?;
         let (plan, batches) = harness
