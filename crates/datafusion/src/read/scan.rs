@@ -38,9 +38,8 @@ use iceberg::table::Table;
 use super::predicate::convert_filters_to_predicate;
 use crate::to_datafusion_error;
 
-/// Snapshot summary fields from the spec's "Optional Snapshot Summary Fields".
+/// Snapshot summary field from the spec's "Optional Snapshot Summary Fields".
 const TOTAL_RECORDS: &str = "total-records";
-const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
 
 /// Manages the scanning process of an Iceberg [`Table`], encapsulating the
 /// necessary details and computed properties required for execution planning.
@@ -102,12 +101,15 @@ impl IcebergDataSource {
     /// Estimates the rows the scan returns before its predicate and fetch,
     /// from the snapshot summary.
     ///
-    /// `total-records` counts rows before deletes. A position delete removes
-    /// at most one row, so position deletes are subtracted. An equality delete
-    /// can remove any number of rows, so equality deletes are ignored. Summary
-    /// fields are optional. A missing or invalid `total-records` leaves the
-    /// estimate unknown, and a missing or invalid `total-position-deletes`
-    /// counts as zero, rather than failing the query.
+    /// `total-records` counts rows before deletes, so the estimate is an upper
+    /// bound. Deletes aren't subtracted, because the spec lets
+    /// `total-position-deletes` count more rows than the deletes remove. A
+    /// position delete file can stay live after the data files it references
+    /// are removed. A deletion vector repeats the deletes of position delete
+    /// files that can stay live beside it. An underestimate can make join
+    /// selection collect a large table as the build side. Summary fields are
+    /// optional, so a missing or invalid `total-records` leaves the estimate
+    /// unknown rather than failing the query.
     fn estimated_num_rows(&self) -> Precision<usize> {
         let metadata = self.table.metadata();
         let snapshot = match self.snapshot_id {
@@ -122,12 +124,13 @@ impl IcebergDataSource {
         let Some(snapshot) = snapshot else {
             return Precision::Absent;
         };
-        let summary = &snapshot.summary().additional_properties;
-        let count = |key| summary.get(key)?.parse::<usize>().ok();
-        match count(TOTAL_RECORDS) {
-            Some(records) => Precision::Inexact(
-                records.saturating_sub(count(TOTAL_POSITION_DELETES).unwrap_or(0)),
-            ),
+        match snapshot
+            .summary()
+            .additional_properties
+            .get(TOTAL_RECORDS)
+            .and_then(|records| records.parse::<usize>().ok())
+        {
+            Some(records) => Precision::Inexact(records),
             None => Precision::Absent,
         }
     }
@@ -466,34 +469,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtracts_position_deletes_but_not_equality_deletes() {
-        let table = table_with_snapshot_summaries(&[&[
-            ("total-records", "100"),
-            ("total-position-deletes", "30"),
-            ("total-equality-deletes", "50"),
-        ]]);
-        let statistics = id_scan_statistics(table, None, None);
-        assert_eq!(statistics.num_rows, Precision::Inexact(70));
-    }
-
-    #[tokio::test]
-    async fn estimates_no_rows_when_position_deletes_exceed_records() {
-        let table = table_with_snapshot_summaries(&[&[
-            ("total-records", "10"),
-            ("total-position-deletes", "20"),
-        ]]);
-        let statistics = id_scan_statistics(table, None, None);
-        assert_eq!(statistics.num_rows, Precision::Inexact(0));
-    }
-
-    #[tokio::test]
-    async fn ignores_an_invalid_position_delete_count() {
-        let table = table_with_snapshot_summaries(&[&[
-            ("total-records", "100"),
-            ("total-position-deletes", "-1"),
-        ]]);
-        let statistics = id_scan_statistics(table, None, None);
-        assert_eq!(statistics.num_rows, Precision::Inexact(100));
+    async fn ignores_deletes() {
+        for (position_deletes, equality_deletes) in [("30", "50"), ("200", "0")] {
+            let table = table_with_snapshot_summaries(&[&[
+                ("total-records", "100"),
+                ("total-position-deletes", position_deletes),
+                ("total-equality-deletes", equality_deletes),
+            ]]);
+            let statistics = id_scan_statistics(table, None, None);
+            assert_eq!(
+                statistics.num_rows,
+                Precision::Inexact(100),
+                "{position_deletes} position deletes"
+            );
+        }
     }
 
     #[tokio::test]
