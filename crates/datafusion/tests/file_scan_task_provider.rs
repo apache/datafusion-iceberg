@@ -18,197 +18,46 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::Result;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, collect};
-use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
+use iceberg::Runtime;
 use iceberg::arrow::ArrowReaderBuilder;
-use iceberg::io::FileIO;
-use iceberg::table::Table;
 use iceberg_datafusion::IcebergDataFusionConfig;
-use iceberg_datafusion::read::{
-    EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderBuilder,
-    FileScanTaskProviderContext, IcebergDataSource, LazyFileScanTaskProvider,
-};
+use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 use iceberg_datafusion::test_utils::IcebergTestHarness;
 
 #[tokio::test]
-async fn lazy_discovery_does_not_read_manifests_until_polled() -> Result<()> {
+async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(SessionConfig::new().with_target_partitions(3))
+        .with_config(|config| config.with_target_partitions(2))
         .build()
         .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
-    let source = iceberg_source(&plan);
-    let lazy = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    assert_eq!(lazy.partitioning().partition_count(), 1);
-    assert_eq!(lazy.projection(), &["pickup_date"]);
 
-    // Keep the loaded metadata but deliberately remove its S3 fixture storage.
-    // LocalFs cannot read these manifest paths. Opening the lazy stream must
-    // still succeed; only polling it should attempt that I/O and fail.
-    let inaccessible_table = Table::builder()
-        .identifier(lazy.table().identifier().clone())
-        .metadata(lazy.table().metadata_ref())
-        .file_io(FileIO::new_with_fs())
-        .runtime(iceberg::Runtime::current())
-        .build()
-        .map_err(iceberg_datafusion::to_datafusion_error)?;
-    let context = harness.context().task_ctx();
-    let (_, discovery) = FileScanTaskProviderBuilder::new(
-        Arc::clone(&context),
-        inaccessible_table,
-        lazy.schema(),
-    )
-    .build()
-    .await?;
-    let mut tasks = discovery.open(
-        0,
-        FileScanTaskProviderContext {
-            task_context: &context,
-        },
-    )?;
-    assert!(tasks.try_next().await.is_err());
-    Ok(())
-}
-
-#[tokio::test]
-async fn lazy_builder_keeps_projected_schema_and_task_columns_in_order() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(SessionConfig::new().with_target_partitions(1))
-        .build()
-        .await?;
-    let plan = harness
-        .plan("SELECT * FROM taxi WHERE pickup_date = DATE '2024-01-10'")
-        .await?;
-    let source = iceberg_source(&plan);
-    let lazy = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    let schema = lazy.schema();
-    // Reverse the fixture's relative order: date (field 13), then vendor (field 1).
-    let projection = vec![
-        schema.index_of("pickup_date")?,
-        schema.index_of("vendor_id")?,
-    ];
-    let (schema, discovery) = FileScanTaskProviderBuilder::new(
-        harness.context().task_ctx(),
-        lazy.table().clone(),
-        schema,
-    )
-    .with_projection(Some(&projection))
-    .with_predicate(lazy.predicate().cloned())
-    .build()
-    .await?;
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect::<Vec<_>>();
-    insta::assert_debug_snapshot!(columns, @r#"
-    [
-        "pickup_date",
-        "vendor_id",
-    ]
-    "#);
-    let projected_lazy = (discovery.as_ref() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    assert_eq!(projected_lazy.projection(), columns);
-    let context = harness.context().task_ctx();
-    let tasks = Arc::clone(&discovery)
-        .open(
-            0,
-            FileScanTaskProviderContext {
-                task_context: &context,
-            },
-        )?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(iceberg_datafusion::to_datafusion_error)?;
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].project_field_ids(), &[13, 1]);
-
-    let projected = IcebergDataSource::builder(
-        &harness.context().copied_config(),
-        schema,
-        source.file_io().clone(),
-        lazy.table().reader_builder(),
-    )
-    .with_reader(source.reader().clone())
-    .with_file_scan_task_provider(discovery)
-    .with_fetch(Some(1))
-    .build()?;
-    let batches = projected.open(0, context)?.try_collect::<Vec<_>>().await?;
-    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
-    +-------------+-----------+
-    | pickup_date | vendor_id |
-    +-------------+-----------+
-    | 2024-01-10  | 2         |
-    +-------------+-----------+
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn lazy_builder_rejects_projection_outside_the_supplied_schema() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(SessionConfig::new().with_target_partitions(1))
-        .build()
-        .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
-    let source = iceberg_source(&plan);
-    let lazy = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    // The supplied schema has only one column, even though the table has thirteen.
-    let error = FileScanTaskProviderBuilder::new(
-        harness.context().task_ctx(),
-        lazy.table().clone(),
-        lazy.schema(),
-    )
-    .with_projection(Some(&vec![1]))
-    .build()
-    .await
-    .unwrap_err();
-    insta::assert_snapshot!(error.to_string(), @"Arrow error: Schema error: project index 1 out of bounds, max field 1");
-    Ok(())
-}
-
-#[tokio::test]
-async fn eager_table_planning_selects_files_before_execution() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_target_partitions(3)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true),
-        )
-        .build()
-        .await?;
-    let plan = harness
-        .plan(
+    let (plan, rows) = harness
+        .query(
             "SELECT pickup_date, COUNT(*) AS trips FROM taxi \
-         WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-11') \
-         GROUP BY pickup_date ORDER BY pickup_date",
+             WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-11') \
+             GROUP BY pickup_date ORDER BY pickup_date",
         )
         .await?;
-    let eager = (iceberg_source(&plan).file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<EagerFileScanTaskProvider>()
-        .unwrap();
-    // Only two selected files, so eager discovery caps the requested three partitions.
-    assert_eq!(
-        eager.groups().iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![1, 1]
-    );
-    let batches = collect(plan, harness.context().task_ctx()).await?;
-    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
+
+    insta::assert_snapshot!(plan, @"
+    SortPreservingMergeExec: [pickup_date@0 ASC NULLS LAST]
+      ProjectionExec: expr=[pickup_date@0 as pickup_date, count(Int64(1))@1 as trips]
+        SortExec: expr=[pickup_date@0 ASC NULLS LAST], preserve_partitioning=[true]
+          AggregateExec: mode=FinalPartitioned, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
+            RepartitionExec: partitioning=Hash([pickup_date@0], 2), input_partitions=2
+              AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
+                FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
+                  RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+                    DataSourceExec: format=iceberg, projection=[pickup_date], predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+    ");
+    insta::assert_snapshot!(rows, @"
     +-------------+-------+
     | pickup_date | trips |
     +-------------+-------+
@@ -220,278 +69,198 @@ async fn eager_table_planning_selects_files_before_execution() -> Result<()> {
 }
 
 #[tokio::test]
-async fn eager_planning_consumes_the_lazy_providers_discovery() -> Result<()> {
+async fn eager_scan_plans_only_the_matching_taxi_files() -> Result<()> {
+    // Taxi has seven daily files; this query needs only two of them.
     let harness = IcebergTestHarness::builder()
-        .with_config(SessionConfig::new().with_target_partitions(3))
+        .with_config(|config| {
+            config
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true)
+        })
         .build()
         .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
-    let lazy = (iceberg_source(&plan).file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap()
-        .clone();
-    let eager = lazy.into_eager(harness.context().task_ctx()).await?;
-    assert_eq!(
-        eager.groups().iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![3, 2, 2]
-    );
-    assert_eq!(eager.tasks().count(), 7);
+
+    let (plan, rows) = harness
+        .query(
+            "SELECT pickup_date, COUNT(*) AS trips FROM taxi \
+             WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-11') \
+             GROUP BY pickup_date ORDER BY pickup_date",
+        )
+        .await?;
+
+    insta::assert_snapshot!(plan, @"
+    SortPreservingMergeExec: [pickup_date@0 ASC NULLS LAST]
+      ProjectionExec: expr=[pickup_date@0 as pickup_date, count(Int64(1))@1 as trips]
+        SortExec: expr=[pickup_date@0 ASC NULLS LAST], preserve_partitioning=[true]
+          AggregateExec: mode=FinalPartitioned, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
+            RepartitionExec: partitioning=Hash([pickup_date@0], 2), input_partitions=2
+              AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
+                FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
+                  DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=2
+    ");
+    insta::assert_snapshot!(rows, @"
+    +-------------+-------+
+    | pickup_date | trips |
+    +-------------+-------+
+    | 2024-01-10  | 25000 |
+    | 2024-01-11  | 25000 |
+    +-------------+-------+
+    ");
     Ok(())
 }
 
 #[tokio::test]
-async fn reconstruction_needs_no_table_or_current_runtime() -> Result<()> {
+async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_target_partitions(3)
-                .with_batch_size(1)
+        .with_config(|config| {
+            config
+                .with_target_partitions(2)
                 .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true),
-        )
+                .set_bool("iceberg.execution.eager_file_planning", true)
+        })
+        .build()
+        .await?;
+
+    let (plan, rows) = harness
+        .query("SELECT COUNT(*) AS trips FROM taxi WHERE pickup_date = DATE '2025-01-01'")
+        .await?;
+
+    insta::assert_snapshot!(plan, @"
+    ProjectionExec: expr=[count(Int64(1))@0 as trips]
+      AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+        CoalescePartitionsExec
+          AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+            FilterExec: pickup_date@0 = 2025-01-01, projection=[]
+              RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+                DataSourceExec: format=iceberg, projection=[pickup_date], planned_files=0
+    ");
+    insta::assert_snapshot!(rows, @"
+    +-------+
+    | trips |
+    +-------+
+    | 0     |
+    +-------+
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn assigned_tasks_can_be_reconstructed_without_a_table() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(|config| {
+            config
+                .with_target_partitions(1)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true)
+        })
         .build()
         .await?;
     let plan = harness
         .plan("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10'")
         .await?;
-    let source = iceberg_source(&plan);
-    let eager = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<EagerFileScanTaskProvider>()
-        .unwrap();
-    let file = eager.tasks().next().unwrap().clone();
-    // Explicit assignment: preserve an empty partition and a repeated file.
-    let groups = vec![vec![file.clone()], vec![], vec![file.clone(), file]];
-    let (schema, file_io, reader) = (
-        source.schema(),
-        source.file_io().clone(),
-        source.reader().clone(),
-    );
-    let reader_builder =
-        ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current());
-    // An explicit reader must override the constructor's session defaults.
-    let config = harness.context().copied_config().with_batch_size(7);
+    let source = iceberg_source(&plan).unwrap();
+    let schema = source.schema();
+    let groups = eager_files(source).groups().to_vec();
+    let file_io = source.file_io().clone();
+    let reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current());
+    let config = harness.context().copied_config();
     drop(plan);
     drop(harness);
 
+    // A worker decoder receives assigned tasks and local reader resources, not
+    // a table or catalog. Construction also works outside a Tokio runtime.
     let source = std::thread::spawn(move || {
         assert!(tokio::runtime::Handle::try_current().is_err());
-        IcebergDataSource::builder(&config, schema, file_io, reader_builder)
-            .with_reader(reader)
+        IcebergDataSource::builder(&config, schema, file_io, reader)
             .with_file_scan_task_provider(Arc::new(EagerFileScanTaskProvider::try_new(
                 groups,
             )?))
-            .with_fetch(Some(2))
             .build()
     })
     .join()
     .unwrap()?;
-    let groups = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<EagerFileScanTaskProvider>()
-        .unwrap()
-        .groups();
-    assert_eq!(
-        groups.iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![1, 0, 2]
-    );
-    assert_eq!(source.output_partitioning().partition_count(), 3);
-
-    // This execution context has a different batch size. It must not replace
-    // the supplied reader's size of one. Streams also outlive the source.
-    let context = Arc::new(TaskContext::default());
-    let streams = (0..3)
-        .map(|p| source.open(p, Arc::clone(&context)))
-        .collect::<Result<Vec<_>>>()?;
-    drop(source);
-    let mut batches = Vec::new();
-    for stream in streams {
-        batches.extend(stream.try_collect::<Vec<_>>().await?);
-    }
-    assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
-    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
-    +-------------+
-    | pickup_date |
-    +-------------+
-    | 2024-01-10  |
-    | 2024-01-10  |
-    | 2024-01-10  |
-    | 2024-01-10  |
-    +-------------+
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn replacing_assignments_preserves_reader_schema_and_fetch() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_batch_size(1)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true),
-        )
-        .build()
-        .await?;
-    let plan = harness
-        .plan("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-11'")
-        .await?;
-    let source = iceberg_source(&plan);
-    let eager = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<EagerFileScanTaskProvider>()
-        .unwrap();
-    let file = eager.tasks().next().unwrap().clone();
-    let original = source.with_fetch(Some(2)).unwrap();
-    let original = original.downcast_ref::<IcebergDataSource>().unwrap();
-    let replacement = original.with_file_scan_task_provider(Arc::new(
-        EagerFileScanTaskProvider::try_new(vec![vec![], vec![file]])?,
-    ))?;
-    assert_eq!(original.output_partitioning().partition_count(), 1);
-    assert_eq!(replacement.output_partitioning().partition_count(), 2);
-    assert_eq!(replacement.schema(), original.schema());
-    assert_eq!(replacement.fetch(), Some(2));
-    let context = harness.context().task_ctx();
-    assert!(
-        replacement
-            .open(0, Arc::clone(&context))?
-            .try_collect::<Vec<_>>()
-            .await?
-            .is_empty()
-    );
-    let batches = replacement
-        .open(1, context)?
-        .try_collect::<Vec<_>>()
-        .await?;
-    assert!(batches.iter().all(|batch| batch.num_rows() <= 1));
-    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
-    +-------------+
-    | pickup_date |
-    +-------------+
-    | 2024-01-11  |
-    | 2024-01-11  |
-    +-------------+
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn empty_eager_discovery_keeps_one_partition() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_target_partitions(3)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true),
-        )
-        .build()
-        .await?;
-    let plan = harness
-        .plan("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '1900-01-01'")
-        .await?;
-    let source = iceberg_source(&plan);
-    let eager = (source.file_scan_task_provider() as &dyn Any)
-        .downcast_ref::<EagerFileScanTaskProvider>()
-        .unwrap();
-    assert_eq!(
-        eager.groups().iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![0]
-    );
-    assert!(
-        collect(plan, harness.context().task_ctx())
-            .await?
-            .is_empty()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn lazy_scan_uses_constructor_reader_settings() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_target_partitions(1)
-                .with_batch_size(1),
-        )
-        .build()
-        .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 3").await?;
-    let source = iceberg_source(&plan);
-    assert!(
-        (source.file_scan_task_provider() as &dyn Any).is::<LazyFileScanTaskProvider>()
-    );
-
-    // Execution uses different defaults; the source retains construction settings.
-    let batches = source
-        .open(0, Arc::new(TaskContext::default()))?
-        .try_collect::<Vec<_>>()
-        .await?;
-    insta::assert_debug_snapshot!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), @"
-    [
-        1,
-        1,
-        1,
-    ]
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn eager_scan_uses_constructor_reader_settings() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_config(
-            SessionConfig::new()
-                .with_target_partitions(1)
-                .with_batch_size(2)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true),
-        )
-        .build()
-        .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 3").await?;
-    let source = iceberg_source(&plan);
-    assert!(
-        (source.file_scan_task_provider() as &dyn Any).is::<EagerFileScanTaskProvider>()
-    );
-
-    let batches = source
-        .open(0, Arc::new(TaskContext::default()))?
-        .try_collect::<Vec<_>>()
-        .await?;
-    insta::assert_debug_snapshot!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), @"
-    [
-        2,
-        1,
-    ]
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn reconstruction_requires_a_task_provider() -> Result<()> {
-    let file_io = FileIO::new_with_fs();
-    let reader = ArrowReaderBuilder::new(file_io.clone(), iceberg::Runtime::current());
-    let error = IcebergDataSource::builder(
-        &SessionConfig::new(),
-        Arc::new(Schema::empty()),
-        file_io,
-        reader,
+    let batches = collect(
+        DataSourceExec::from_data_source(source),
+        Arc::new(TaskContext::default()),
     )
-    .build()
-    .unwrap_err();
-    insta::assert_snapshot!(error.to_string(), @"Execution error: An Iceberg source requires a file task provider");
+    .await?;
+
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        25_000
+    );
     Ok(())
 }
 
-#[test]
-fn eager_provider_rejects_zero_groups() {
-    let error = EagerFileScanTaskProvider::try_new(vec![]).unwrap_err();
-    insta::assert_snapshot!(error.to_string(), @"Execution error: An Iceberg task provider requires at least one file group");
+#[tokio::test]
+async fn replacing_the_provider_reads_the_assignment_with_the_existing_limit()
+-> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(|config| {
+            config
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true)
+        })
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 2").await?;
+    let source = iceberg_source(&plan).unwrap();
+    let assigned_file = eager_files(source)
+        .tasks()
+        .find(|task| task.data_file_path().contains("pickup_date=2024-01-12/"))
+        .unwrap()
+        .clone();
+
+    let assigned = source.with_file_scan_task_provider(Arc::new(
+        EagerFileScanTaskProvider::try_new(vec![vec![assigned_file]])?,
+    ))?;
+    let batches = collect(
+        DataSourceExec::from_data_source(assigned),
+        harness.context().task_ctx(),
+    )
+    .await?;
+
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
+    +-------------+
+    | pickup_date |
+    +-------------+
+    | 2024-01-12  |
+    | 2024-01-12  |
+    +-------------+
+    ");
+    Ok(())
 }
 
-fn iceberg_source(plan: &Arc<dyn ExecutionPlan>) -> &IcebergDataSource {
-    find_source(plan).expect("query reads the Iceberg fixture")
+#[tokio::test]
+async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(|config| config.with_batch_size(2000))
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
+    let source = iceberg_source(&plan).unwrap();
+
+    // Open with default settings, not the settings used to construct the scan.
+    let batches = source
+        .open(0, Arc::new(TaskContext::default()))?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).max(), Some(2000));
+    Ok(())
 }
 
-fn find_source(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergDataSource> {
+// Only the public source-composition tests need to inspect the scan below SQL.
+fn iceberg_source(plan: &Arc<dyn ExecutionPlan>) -> Option<&IcebergDataSource> {
     plan.downcast_ref::<DataSourceExec>()
         .and_then(|exec| exec.data_source().downcast_ref::<IcebergDataSource>())
-        .or_else(|| plan.children().into_iter().find_map(find_source))
+        .or_else(|| plan.children().into_iter().find_map(iceberg_source))
+}
+
+fn eager_files(source: &IcebergDataSource) -> &EagerFileScanTaskProvider {
+    (source.file_scan_task_provider() as &dyn Any)
+        .downcast_ref::<EagerFileScanTaskProvider>()
+        .unwrap()
 }

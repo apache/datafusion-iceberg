@@ -23,10 +23,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::dataframe::DataFrame;
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -66,8 +65,12 @@ impl Default for IcebergTestHarnessBuilder {
 }
 
 impl IcebergTestHarnessBuilder {
-    pub fn with_config(mut self, config: SessionConfig) -> Self {
-        self.config = config;
+    /// Customize the existing configuration without replacing unrelated defaults.
+    pub fn with_config(
+        mut self,
+        configure: impl FnOnce(SessionConfig) -> SessionConfig,
+    ) -> Self {
+        self.config = configure(self.config);
         self
     }
 
@@ -131,7 +134,7 @@ impl IcebergTestHarness {
         &self.ctx
     }
 
-    /// Plans without executing, for inspecting providers and discovery timing.
+    /// Plans without executing, for tests of the public scan APIs.
     pub async fn plan(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
         self.ctx.sql(sql).await?.create_physical_plan().await
     }
@@ -144,11 +147,12 @@ impl IcebergTestHarness {
     /// Like [`Self::query`], but returns the batches unformatted, for tests
     /// that inspect batch boundaries.
     pub async fn query_batches(&self, sql: &str) -> Result<(String, Vec<RecordBatch>)> {
-        let dataframe: DataFrame = self.ctx.sql(sql).await?;
-        let plan = dataframe.create_physical_plan().await?;
-        let batches = dataframe.collect().await?;
+        let plan = self.plan(sql).await?;
+        let display = displayable(plan.as_ref()).indent(true).to_string();
+        // Execute the plan shown in the snapshot, rather than planning again.
+        let batches = collect(plan, self.ctx.task_ctx()).await?;
 
-        Ok((displayable(plan.as_ref()).indent(true).to_string(), batches))
+        Ok((display, batches))
     }
 }
 
