@@ -127,7 +127,7 @@ impl TableProvider for IcebergCatalogTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -457,7 +457,7 @@ mod tests {
 
         // Columns come back in the projection's order, not the table's.
         let source = IcebergDataSource::builder(table.clone(), schema.clone())
-            .with_projection(Some(&vec![1, 0]))
+            .with_projection(Some(&[1, 0]))
             .build()
             .unwrap();
         let projected = source.schema();
@@ -470,7 +470,7 @@ mod tests {
         "#);
 
         let err = IcebergDataSource::builder(table, schema)
-            .with_projection(Some(&vec![0, out_of_range]))
+            .with_projection(Some(&[0, out_of_range]))
             .build()
             .unwrap_err();
         assert_eq!(

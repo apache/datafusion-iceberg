@@ -735,27 +735,23 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     // Identity-partition on category and both floating-point values
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
-        .add_partition_field(
+        .add_partition_fields([
             UnboundPartitionField::builder()
                 .source_ids(vec![2])
                 .name("category")
                 .transform(Transform::Identity)
                 .build()?,
-        )?
-        .add_partition_field(
             UnboundPartitionField::builder()
                 .source_ids(vec![4])
                 .name("float_partition")
                 .transform(Transform::Identity)
                 .build()?,
-        )?
-        .add_partition_field(
             UnboundPartitionField::builder()
                 .source_ids(vec![5])
                 .name("double_partition")
                 .transform(Transform::Identity)
                 .build()?,
-        )?
+        ])?
         .build();
 
     // Create the partitioned table

@@ -253,12 +253,12 @@ EXPLAIN SELECT id FROM default.default.test_timestamptz WHERE ts_naive > '2023-0
 ----
 logical_plan
 01)Projection: default.default.test_timestamptz.id
-02)--Filter: default.default.test_timestamptz.ts_naive > TimestampNanosecond(1672876800000000000, None)
-03)----TableScan: default.default.test_timestamptz projection=[id, ts_naive], partial_filters=[default.default.test_timestamptz.ts_naive > TimestampNanosecond(1672876800000000000, None)]
+02)--Filter: CAST(default.default.test_timestamptz.ts_naive AS Timestamp(ns, "UTC")) > TimestampNanosecond(1672876800000000000, Some("UTC"))
+03)----TableScan: default.default.test_timestamptz projection=[id, ts_naive], partial_filters=[CAST(default.default.test_timestamptz.ts_naive AS Timestamp(ns, "UTC")) > TimestampNanosecond(1672876800000000000, Some("UTC"))]
 physical_plan
-01)FilterExec: ts_naive@1 > 1672876800000000000, projection=[id@0]
+01)FilterExec: CAST(ts_naive@1 AS Timestamp(ns, "UTC")) > 1672876800000000000, projection=[id@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-03)----DataSourceExec: format=iceberg, projection=[id, ts_naive], predicate=ts_naive > 2023-01-05 00:00:00
+03)----DataSourceExec: format=iceberg, projection=[id, ts_naive]
 
 query I
 SELECT id FROM default.default.test_timestamptz WHERE ts_naive > '2023-01-05T00:00:00+00:00'::TIMESTAMPTZ

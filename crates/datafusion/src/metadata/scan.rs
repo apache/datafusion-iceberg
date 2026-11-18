@@ -44,7 +44,7 @@ impl IcebergMetadataDataSource {
     /// Creates a source with the requested output columns.
     pub fn try_new(
         provider: IcebergMetadataTableProvider,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
     ) -> Result<Self> {
         let schema = match projection {
             Some(indices) => Arc::new(provider.schema().project(indices)?),
@@ -53,7 +53,7 @@ impl IcebergMetadataDataSource {
         Ok(Self {
             provider,
             schema,
-            projection: projection.cloned(),
+            projection: projection.map(<[usize]>::to_vec),
         })
     }
 
