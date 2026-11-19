@@ -17,9 +17,13 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::error::Result;
     use iceberg_datafusion::IcebergTableProviderFactory;
-    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
+    use iceberg_datafusion_test_tools::{
+        IcebergTestHarness, ReadCountingStorageFactory, create_taxi_table,
+    };
 
     #[tokio::test]
     async fn applies_sql_limit_to_the_iceberg_scan_output() -> Result<()> {
@@ -109,12 +113,11 @@ mod tests {
 
     #[tokio::test]
     async fn reports_the_rows_returned_by_a_limited_iceberg_scan() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        // Only row counts, so the output doesn't vary between runs.
-        harness
-            .query("SET datafusion.explain.analyze_categories = 'rows'")
-            .await?;
-        let (_, explain) = harness
+        let (_, explain) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            // Only row counts, so the output doesn't vary between runs.
+            .with_config_option("datafusion.explain.analyze_categories", "rows")
             .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
@@ -133,11 +136,20 @@ mod tests {
 
     #[tokio::test]
     async fn stops_reading_the_iceberg_scan_once_the_limit_is_reached() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
+        let storage = ReadCountingStorageFactory::default();
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(
+                IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
+                    storage.clone(),
+                )),
+            )
+            .with_table(create_taxi_table().await?)
+            .build()
+            .await?;
         harness.query_batches("SELECT * FROM taxi").await?;
-        let full_scan_reads = harness.take_parquet_reads();
+        let full_scan_reads = storage.take_reads();
         harness.query_batches("SELECT * FROM taxi LIMIT 3").await?;
-        let limited_scan_reads = harness.take_parquet_reads();
+        let limited_scan_reads = storage.take_reads();
 
         // The exact counts depend on how many data files iceberg opens at
         // once, which follows the runner's CPU count, so compare the two scans.

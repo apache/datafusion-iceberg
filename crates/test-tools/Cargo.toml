@@ -26,16 +26,20 @@ repository = { workspace = true }
 version = { workspace = true }
 
 [dependencies]
+async-trait = { workspace = true }
+bytes = "1"
 # Only for its Arrow and Parquet re-exports, which keep this crate on the
 # versions the rest of the workspace resolves to.
 datafusion = { workspace = true }
+futures = "0.3"
 iceberg = { workspace = true }
 rand = { version = "0.10", default-features = false, features = ["alloc"] }
 rand_pcg = "0.10"
+serde = { version = "1", features = ["derive"] }
 tempfile = "3.18"
+typetag = "0.2"
 
 [dev-dependencies]
-futures = "0.3"
 tokio = { workspace = true, features = ["macros"] }
 
 [lints]
