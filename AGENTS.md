@@ -47,7 +47,7 @@ cargo test --workspace --locked
 
 ```sh
 cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
-cargo test -p iceberg-datafusion --test <file> <name>                           # integration tests, e.g. --test filter_pushdown
+cargo test -p iceberg-datafusion --test integration <module>::<name>            # integration tests, e.g. filter_pushdown::
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
 cargo insta test -p iceberg-datafusion --review                                  # review inline snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
