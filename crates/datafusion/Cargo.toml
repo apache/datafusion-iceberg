@@ -27,6 +27,7 @@ description = "Apache Iceberg DataFusion Integration"
 keywords = ["iceberg", "integrations", "datafusion"]
 license = { workspace = true }
 repository = { workspace = true }
+autotests = false
 
 [dependencies]
 async-trait = { workspace = true }
@@ -38,13 +39,18 @@ iceberg = { workspace = true }
 parquet = "59.2"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
-serde = { version = "1", features = ["derive"] }
-typetag = "0.2"
 
 [dev-dependencies]
+iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"
 tempfile = "3.18"
+
+# Every integration test is a module of `tests/main.rs`, so they all link into one binary
+# instead of one binary per file.
+[[test]]
+name = "integration"
+path = "tests/main.rs"
 
 [lints]
 workspace = true

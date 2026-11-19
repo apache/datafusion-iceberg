@@ -29,6 +29,9 @@ use iceberg::spec::{Datum, PrimitiveLiteral};
 // A datafusion expression could be an Iceberg predicate, column, or literal.
 enum TransformedResult {
     Predicate(Predicate),
+    // Implied by the expression but not equivalent to it, because an unconvertible
+    // AND operand was dropped. Sound to push down, unsound to negate.
+    PartialPredicate(Predicate),
     Column(Reference),
     Literal(Datum),
     NotTransformed,
@@ -53,7 +56,8 @@ pub fn convert_filters_to_predicate(filters: &[Expr]) -> Option<Predicate> {
 
 fn convert_filter_to_predicate(expr: &Expr) -> Option<Predicate> {
     match to_iceberg_predicate(expr) {
-        TransformedResult::Predicate(predicate) => Some(predicate),
+        TransformedResult::Predicate(predicate)
+        | TransformedResult::PartialPredicate(predicate) => Some(predicate),
         TransformedResult::Column(column) => {
             // A bare column in a filter context represents a boolean column check
             // Convert it to: column = true
@@ -253,8 +257,7 @@ fn scalar_function_to_iceberg_predicate(
 /// [`Reference`] such that `isnan(arg)` is logically equivalent to
 /// `isnan(reference)`.
 ///
-/// Filter pushdown is reported as `Inexact` (see
-/// [`IcebergTableProvider::supports_filters_pushdown`]), so DataFusion
+/// Both table providers report filter pushdown as `Inexact`, so DataFusion
 /// re-applies the original predicate after scanning. We therefore only need the
 /// pushed-down predicate to be implied by the original filter (it may match
 /// extra rows, but must never drop a matching one). Every transformation handled
@@ -268,8 +271,6 @@ fn scalar_function_to_iceberg_predicate(
 ///
 /// Multiplication/division by zero and `c / x` are intentionally rejected: e.g.
 /// `x * 0` is NaN when `x` is `±inf`, so it does not imply `x` is NaN.
-///
-/// [`IcebergTableProvider::supports_filters_pushdown`]: crate::table_provider::IcebergCatalogTableProvider
 fn resolve_nan_preserving_reference(expr: &Expr) -> Option<Reference> {
     match expr {
         Expr::Column(column) => Some(Reference::new(column.name())),
@@ -367,8 +368,22 @@ fn to_iceberg_and_predicate(
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.and(right))
         }
-        (TransformedResult::Predicate(left), _) => TransformedResult::Predicate(left),
-        (_, TransformedResult::Predicate(right)) => TransformedResult::Predicate(right),
+        (
+            TransformedResult::Predicate(left)
+            | TransformedResult::PartialPredicate(left),
+            TransformedResult::Predicate(right)
+            | TransformedResult::PartialPredicate(right),
+        ) => TransformedResult::PartialPredicate(left.and(right)),
+        (
+            TransformedResult::Predicate(kept)
+            | TransformedResult::PartialPredicate(kept),
+            _,
+        )
+        | (
+            _,
+            TransformedResult::Predicate(kept)
+            | TransformedResult::PartialPredicate(kept),
+        ) => TransformedResult::PartialPredicate(kept),
         _ => TransformedResult::NotTransformed,
     }
 }
@@ -381,6 +396,12 @@ fn to_iceberg_or_predicate(
         (TransformedResult::Predicate(left), TransformedResult::Predicate(right)) => {
             TransformedResult::Predicate(left.or(right))
         }
+        (
+            TransformedResult::Predicate(left)
+            | TransformedResult::PartialPredicate(left),
+            TransformedResult::Predicate(right)
+            | TransformedResult::PartialPredicate(right),
+        ) => TransformedResult::PartialPredicate(left.or(right)),
         _ => TransformedResult::NotTransformed,
     }
 }
@@ -658,6 +679,24 @@ mod tests {
         let sql = "(foo > 1 or length(bar) = 1 ) and foo < 0 ";
         let predicate = convert_to_iceberg_predicate(sql).unwrap();
         let expected_predicate = Reference::new("foo").less_than(Datum::long(0));
+        assert_eq!(predicate, expected_predicate);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_not_of_partial_and() {
+        for sql in [
+            "not (foo > 1 and length(bar) = 1)",
+            "not ((foo > 1 and length(bar) = 1) or foo < 0)",
+        ] {
+            assert_eq!(convert_to_iceberg_predicate(sql), None, "sql: {sql}");
+        }
+
+        let predicate =
+            convert_to_iceberg_predicate("not (foo > 1 and bar = 'test')").unwrap();
+        let expected_predicate = !Predicate::and(
+            Reference::new("foo").greater_than(Datum::long(1)),
+            Reference::new("bar").equal_to(Datum::string("test")),
+        );
         assert_eq!(predicate, expected_predicate);
     }
 

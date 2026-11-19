@@ -15,6 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod harness;
-
-pub use harness::*;
+mod batch_size;
+mod catalog_provider;
+mod external_table;
+mod filter_pushdown;
+mod insert_into;
+mod limit_pushdown;
+mod metadata_tables;
+mod page_index;
+mod plan_nodes;
+mod projection_pushdown;
+mod schema_evolution;
+mod statistics;
