@@ -31,6 +31,3 @@ pub use table_provider::{
     IcebergCatalogTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory,
 };
 pub mod write;
-
-#[doc(hidden)]
-pub mod test_utils;

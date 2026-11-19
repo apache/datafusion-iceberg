@@ -25,14 +25,16 @@ use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
-use iceberg_datafusion::IcebergDataFusionConfig;
 use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
-use iceberg_datafusion::test_utils::IcebergTestHarness;
+use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
+use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
 #[tokio::test]
 async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| config.with_target_partitions(2))
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_config_option("datafusion.execution.target_partitions", 2)
         .build()
         .await?;
 
@@ -70,12 +72,19 @@ async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
 async fn eager_scan_plans_only_the_matching_taxi_files() -> Result<()> {
     // Taxi has seven daily files; this query needs only two of them.
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| {
-            config
-                .with_target_partitions(2)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true)
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_session_extension(|mut state| {
+            state
+                .config()
+                .get_or_insert_default()
+                .options_mut()
+                .extensions
+                .insert(IcebergDataFusionConfig::default());
+            state
         })
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .with_config_option("iceberg.execution.eager_file_planning", true)
         .build()
         .await?;
 
@@ -111,12 +120,19 @@ async fn eager_scan_plans_only_the_matching_taxi_files() -> Result<()> {
 #[tokio::test]
 async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| {
-            config
-                .with_target_partitions(2)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true)
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_session_extension(|mut state| {
+            state
+                .config()
+                .get_or_insert_default()
+                .options_mut()
+                .extensions
+                .insert(IcebergDataFusionConfig::default());
+            state
         })
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .with_config_option("iceberg.execution.eager_file_planning", true)
         .build()
         .await?;
 
@@ -146,15 +162,24 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
 #[tokio::test]
 async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| {
-            config
-                .with_target_partitions(2)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true)
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_session_extension(|mut state| {
+            state
+                .config()
+                .get_or_insert_default()
+                .options_mut()
+                .extensions
+                .insert(IcebergDataFusionConfig::default());
+            state
         })
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .with_config_option("iceberg.execution.eager_file_planning", true)
         .build()
         .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 2").await?;
+    let plan = harness
+        .physical_plan("SELECT pickup_date FROM taxi LIMIT 2")
+        .await?;
     let source = iceberg_source(&plan).unwrap();
     let assigned_file = eager_files(source).tasks().next().unwrap().clone();
 
@@ -170,15 +195,24 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
 #[tokio::test]
 async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| {
-            config
-                .with_target_partitions(2)
-                .with_option_extension(IcebergDataFusionConfig::default())
-                .set_bool("iceberg.execution.eager_file_planning", true)
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_session_extension(|mut state| {
+            state
+                .config()
+                .get_or_insert_default()
+                .options_mut()
+                .extensions
+                .insert(IcebergDataFusionConfig::default());
+            state
         })
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .with_config_option("iceberg.execution.eager_file_planning", true)
         .build()
         .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 2").await?;
+    let plan = harness
+        .physical_plan("SELECT pickup_date FROM taxi LIMIT 2")
+        .await?;
     let source = iceberg_source(&plan).unwrap();
 
     // Eager conversion retains the snapshot estimate. Fetch bounds each
@@ -206,10 +240,14 @@ async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
 #[tokio::test]
 async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
     let harness = IcebergTestHarness::builder()
-        .with_config(|config| config.with_batch_size(2000))
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .with_config_option("datafusion.execution.batch_size", 2000)
         .build()
         .await?;
-    let plan = harness.plan("SELECT pickup_date FROM taxi").await?;
+    let plan = harness
+        .physical_plan("SELECT pickup_date FROM taxi")
+        .await?;
     let source = iceberg_source(&plan).unwrap();
 
     // Open with default settings, not the settings used to construct the scan.

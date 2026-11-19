@@ -18,15 +18,17 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::IcebergTestHarness;
+    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
     async fn reports_the_snapshot_row_count_to_datafusion() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        harness
-            .query("SET datafusion.explain.show_statistics = true")
+        let (_, explain) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            .with_config_option("datafusion.explain.show_statistics", true)
+            .query("EXPLAIN SELECT vendor_id FROM taxi")
             .await?;
-        let (_, explain) = harness.query("EXPLAIN SELECT vendor_id FROM taxi").await?;
 
         insta::assert_snapshot!(explain, @r"
         +---------------+------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -17,13 +17,19 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::IcebergTestHarness;
+    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion_test_tools::{
+        IcebergTestHarness, ReadCountingStorageFactory, create_taxi_table,
+    };
 
     #[tokio::test]
     async fn applies_sql_limit_to_the_iceberg_scan_output() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT vendor_id, pickup_at, passenger_count, trip_distance, pickup_date
                FROM taxi
@@ -41,22 +47,23 @@ mod tests {
                 DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
-    +-----------+---------------------+-----------------+---------------+-------------+
-    | vendor_id | pickup_at           | passenger_count | trip_distance | pickup_date |
-    +-----------+---------------------+-----------------+---------------+-------------+
-    | 2         | 2024-01-10T00:00:09 |                 | 0.78          | 2024-01-10  |
-    | 2         | 2024-01-10T00:00:10 | 1               | 0.88          | 2024-01-10  |
-    | 1         | 2024-01-10T00:00:10 | 1               | 3.4           | 2024-01-10  |
-    +-----------+---------------------+-----------------+---------------+-------------+
-    ");
+        +-----------+---------------------+-----------------+---------------+-------------+
+        | vendor_id | pickup_at           | passenger_count | trip_distance | pickup_date |
+        +-----------+---------------------+-----------------+---------------+-------------+
+        | 1         | 2024-01-10T00:00:04 | 1               | 0.68          | 2024-01-10  |
+        | 2         | 2024-01-10T00:00:08 | 1               | 6.18          | 2024-01-10  |
+        | 2         | 2024-01-10T00:00:11 |                 | 3.61          | 2024-01-10  |
+        +-----------+---------------------+-----------------+---------------+-------------+
+        ");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn keeps_unordered_limits_above_the_iceberg_source() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT pickup_date FROM taxi WHERE pickup_date = DATE '2024-01-10' LIMIT 3")
             .await?;
 
@@ -81,8 +88,9 @@ mod tests {
 
     #[tokio::test]
     async fn passes_the_scan_limit_to_the_iceberg_source() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
@@ -105,12 +113,11 @@ mod tests {
 
     #[tokio::test]
     async fn reports_the_rows_returned_by_a_limited_iceberg_scan() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        // Only row counts, so the output doesn't vary between runs.
-        harness
-            .query("SET datafusion.explain.analyze_categories = 'rows'")
-            .await?;
-        let (_, explain) = harness
+        let (_, explain) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            // Only row counts, so the output doesn't vary between runs.
+            .with_config_option("datafusion.explain.analyze_categories", "rows")
             .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
@@ -129,11 +136,20 @@ mod tests {
 
     #[tokio::test]
     async fn stops_reading_the_iceberg_scan_once_the_limit_is_reached() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
+        let storage = ReadCountingStorageFactory::default();
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(
+                IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
+                    storage.clone(),
+                )),
+            )
+            .with_table(create_taxi_table().await?)
+            .build()
+            .await?;
         harness.query_batches("SELECT * FROM taxi").await?;
-        let full_scan_reads = harness.take_parquet_reads();
+        let full_scan_reads = storage.take_reads();
         harness.query_batches("SELECT * FROM taxi LIMIT 3").await?;
-        let limited_scan_reads = harness.take_parquet_reads();
+        let limited_scan_reads = storage.take_reads();
 
         // The exact counts depend on how many data files iceberg opens at
         // once, which follows the runner's CPU count, so compare the two scans.
@@ -148,8 +164,9 @@ mod tests {
 
     #[tokio::test]
     async fn avoids_scanning_for_limit_zero() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT vendor_id FROM taxi WHERE pickup_date = DATE '2024-01-10' LIMIT 0")
             .await?;
 
@@ -166,8 +183,9 @@ mod tests {
 
     #[tokio::test]
     async fn applies_offset_before_limit() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT vendor_id, pickup_at
                    FROM taxi
@@ -187,13 +205,13 @@ mod tests {
                     DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
-    +-----------+---------------------+
-    | vendor_id | pickup_at           |
-    +-----------+---------------------+
-    | 2         | 2024-01-10T00:00:12 |
-    | 2         | 2024-01-10T00:00:14 |
-    +-----------+---------------------+
-    ");
+        +-----------+---------------------+
+        | vendor_id | pickup_at           |
+        +-----------+---------------------+
+        | 1         | 2024-01-10T00:00:15 |
+        | 2         | 2024-01-10T00:00:18 |
+        +-----------+---------------------+
+        ");
 
         Ok(())
     }
