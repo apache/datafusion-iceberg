@@ -17,10 +17,18 @@
 
 #[cfg(test)]
 mod tests {
-    use datafusion::error::Result;
-    use iceberg_datafusion::IcebergTableProviderFactory;
-    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
+    use std::error::Error;
+    use std::sync::Arc;
 
+    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::error::Result;
+    use datafusion::prelude::SessionContext;
+    use iceberg::TableIdent;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Type};
+    use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProviderFactory};
+    use iceberg_datafusion_test_tools::{
+        FixtureCatalog, IcebergTestHarness, create_taxi_table,
+    };
     #[tokio::test]
     async fn projects_only_columns_required_by_the_query() -> Result<()> {
         let (plan, batches) = IcebergTestHarness::builder()
@@ -156,6 +164,86 @@ mod tests {
         | 1         | 2024-01-10T00:00:04 | 2024-01-10T00:03:44 | 1               | 0.68          | 93                 | 237                 | 1            | 6.17        | 1.05       | 0.0          | 10.72        | 2024-01-10  |
         +-----------+---------------------+---------------------+-----------------+---------------+--------------------+---------------------+--------------+-------------+------------+--------------+--------------+-------------+
         ");
+
+        Ok(())
+    }
+
+    fn get_struct_type() -> StructType {
+        StructType::new(vec![
+            NestedField::required(4, "s_foo1", Type::Primitive(PrimitiveType::Int))
+                .into(),
+            NestedField::required(5, "s_foo2", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_table_projection() -> Result<(), Box<dyn Error>> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "foo1", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "foo2", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::optional(3, "foo3", Type::Struct(get_struct_type())).into(),
+            ])
+            .build()?;
+        fixtures
+            .table(TableIdent::from_strs(["ns", "t1"])?, schema)
+            .create()
+            .await?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "catalog",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        );
+        let table_df = ctx.table("catalog.ns.t1").await.unwrap();
+
+        let records = table_df
+            .clone()
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(1, records.len());
+        let record = &records[0];
+        // the first column is plan_type, the second column plan string.
+        let s = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(2, s.len());
+        // the first row is logical_plan, the second row is physical_plan
+        assert!(
+            s.value(1).contains(
+                "DataSourceExec: format=iceberg, projection=[foo1, foo2, foo3]"
+            )
+        );
+
+        // datafusion doesn't support query foo3.s_foo1, use foo3 instead
+        let records = table_df
+            .select_columns(&["foo1", "foo3"])
+            .unwrap()
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(1, records.len());
+        let record = &records[0];
+        let s = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(2, s.len());
+        assert!(
+            s.value(1)
+                .contains("DataSourceExec: format=iceberg, projection=[foo1, foo3]")
+        );
 
         Ok(())
     }
