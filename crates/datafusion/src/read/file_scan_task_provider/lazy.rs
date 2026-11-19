@@ -18,6 +18,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::stats::Precision;
 use datafusion::common::{Result, exec_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
@@ -31,6 +32,9 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 use crate::IcebergDataFusionConfig;
 use crate::read::convert_filters_to_predicate;
 use crate::to_datafusion_error;
+
+/// Snapshot summary field from the spec's "Optional Snapshot Summary Fields".
+const TOTAL_RECORDS: &str = "total-records";
 
 /// Discovers files while executing, in a single partition: the files of a
 /// snapshot that may match a predicate.
@@ -58,6 +62,7 @@ impl LazyFileScanTaskProvider {
                 "Iceberg eager planning requires at least one target partition"
             );
         }
+        let estimated_num_rows = self.estimated_num_rows();
         let mut tasks = Arc::new(self).open(
             0,
             FileScanTaskProviderContext {
@@ -76,7 +81,9 @@ impl LazyFileScanTaskProvider {
         if groups.is_empty() {
             groups.push(Vec::new());
         }
-        EagerFileScanTaskProvider::try_new(groups)
+        let mut provider = EagerFileScanTaskProvider::try_new(groups)?;
+        provider.estimated_num_rows = estimated_num_rows;
+        Ok(provider)
     }
 
     /// Table retained for discovery, including its metadata and storage access.
@@ -248,6 +255,43 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         Ok(Box::pin(
             futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
         ))
+    }
+
+    /// Estimates the rows the scan returns before its predicate and fetch,
+    /// from the snapshot summary.
+    ///
+    /// `total-records` counts rows before deletes, so the estimate is an upper
+    /// bound. Deletes aren't subtracted, because the spec lets
+    /// `total-position-deletes` count more rows than the deletes remove. A
+    /// position delete file can stay live after the data files it references
+    /// are removed. A deletion vector repeats the deletes of position delete
+    /// files that can stay live beside it. An underestimate can make join
+    /// selection collect a large table as the build side. Summary fields are
+    /// optional, so a missing or invalid `total-records` leaves the estimate
+    /// unknown rather than failing the query.
+    fn estimated_num_rows(&self) -> Precision<usize> {
+        let metadata = self.table.metadata();
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
+            None => match metadata.current_snapshot() {
+                Some(snapshot) => Some(snapshot),
+                // The scan of a table with no current snapshot reads nothing.
+                None => return Precision::Exact(0),
+            },
+        };
+        // The scan fails on a snapshot id that doesn't exist.
+        let Some(snapshot) = snapshot else {
+            return Precision::Absent;
+        };
+        match snapshot
+            .summary()
+            .additional_properties
+            .get(TOTAL_RECORDS)
+            .and_then(|records| records.parse::<usize>().ok())
+        {
+            Some(records) => Precision::Inexact(records),
+            None => Precision::Absent,
+        }
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {

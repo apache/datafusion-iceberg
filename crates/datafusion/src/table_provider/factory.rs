@@ -31,7 +31,7 @@ use iceberg::table::StaticTable;
 use super::IcebergStaticTableProvider;
 use crate::to_datafusion_error;
 
-/// A factory that implements DataFusion's `TableProviderFactory` to create `IcebergTableProvider` instances.
+/// A factory that implements DataFusion's `TableProviderFactory` to create [`IcebergStaticTableProvider`] instances.
 ///
 /// # Example
 ///
@@ -144,7 +144,7 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         .await?
         .into_table();
 
-        let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table)?;
 
         Ok(Arc::new(provider))
     }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::Result;
+use datafusion::common::stats::Precision;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
@@ -163,6 +164,42 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
     let assigned_plan = DataSourceExec::from_data_source(assigned);
 
     insta::assert_snapshot!(displayable(assigned_plan.as_ref()).indent(true).to_string(), @"DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=1, fetch=2");
+    Ok(())
+}
+
+#[tokio::test]
+async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_config(|config| {
+            config
+                .with_target_partitions(2)
+                .with_option_extension(IcebergDataFusionConfig::default())
+                .set_bool("iceberg.execution.eager_file_planning", true)
+        })
+        .build()
+        .await?;
+    let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 2").await?;
+    let source = iceberg_source(&plan).unwrap();
+
+    // Eager conversion retains the snapshot estimate. Fetch bounds each
+    // partition separately; a short partition may still return fewer rows.
+    assert_eq!(
+        source
+            .with_fetch(None)
+            .unwrap()
+            .partition_statistics(None)?
+            .num_rows,
+        Precision::Inexact(175000)
+    );
+    assert_eq!(source.output_partitioning().partition_count(), 2);
+    assert_eq!(
+        source.partition_statistics(None)?.num_rows,
+        Precision::Inexact(4)
+    );
+    assert_eq!(
+        source.partition_statistics(Some(0))?.num_rows,
+        Precision::Inexact(2)
+    );
     Ok(())
 }
 

@@ -100,7 +100,7 @@ impl IcebergCatalogTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
-        Ok(IcebergMetadataTableProvider::new(table, r#type))
+        IcebergMetadataTableProvider::try_new(table, r#type)
     }
 
     /// The catalog this provider loads its table from and commits through.
@@ -172,11 +172,12 @@ impl TableProvider for IcebergCatalogTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if _insert_op != InsertOp::Append {
+        if insert_op != InsertOp::Append {
             return not_impl_err!(
-                "IcebergTableProvider supports only append inserts, got {_insert_op}"
+                "IcebergCatalogTableProvider supports only append inserts, \
+                 got {insert_op}"
             );
         }
 
@@ -397,11 +398,11 @@ mod tests {
         for (insert_op, expected_message) in [
             (
                 InsertOp::Overwrite,
-                "IcebergTableProvider supports only append inserts, got Insert Overwrite",
+                "IcebergCatalogTableProvider supports only append inserts, got Insert Overwrite",
             ),
             (
                 InsertOp::Replace,
-                "IcebergTableProvider supports only append inserts, got Replace Into",
+                "IcebergCatalogTableProvider supports only append inserts, got Replace Into",
             ),
         ] {
             let input =

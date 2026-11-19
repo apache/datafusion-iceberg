@@ -19,6 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use datafusion::common::Result;
+use datafusion::common::stats::Precision;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 
@@ -51,6 +52,13 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
         partition: usize,
         context: FileScanTaskProviderContext,
     ) -> Result<iceberg::scan::FileScanTaskStream>;
+
+    /// Estimated rows across all partitions before the source's fetch, without
+    /// discovering or reading files. Use an inexact estimate when predicates or
+    /// deletes may remove rows. Unknown by default for externally supplied tasks.
+    fn estimated_num_rows(&self) -> Precision<usize> {
+        Precision::Absent
+    }
 
     /// Appends details to the data source's `EXPLAIN` line, each starting
     /// with `", "`. Writes nothing by default.

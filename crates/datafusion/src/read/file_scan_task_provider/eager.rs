@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::common::stats::Precision;
 use datafusion::common::{Result, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
@@ -30,6 +31,9 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
+    /// Snapshot estimate retained when converting lazy discovery; external
+    /// assignments have no snapshot estimate.
+    pub(super) estimated_num_rows: Precision<usize>,
 }
 
 impl EagerFileScanTaskProvider {
@@ -44,7 +48,10 @@ impl EagerFileScanTaskProvider {
                 "An Iceberg task provider requires at least one file group"
             );
         }
-        Ok(Self { file_scan_tasks })
+        Ok(Self {
+            file_scan_tasks,
+            estimated_num_rows: Precision::Absent,
+        })
     }
 
     /// All file tasks, in partition order and then group order.
@@ -76,6 +83,10 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
         Ok(futures::stream::iter(0..count)
             .map(move |offset| Ok(self.groups()[partition][offset].clone()))
             .boxed())
+    }
+
+    fn estimated_num_rows(&self) -> Precision<usize> {
+        self.estimated_num_rows
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
