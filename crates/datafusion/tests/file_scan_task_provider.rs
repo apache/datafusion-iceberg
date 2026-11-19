@@ -18,16 +18,19 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::common::Result;
-use datafusion::common::stats::Precision;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
+use iceberg::TableIdent;
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
-use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
+use iceberg_datafusion_test_tools::{
+    FixtureCatalog, IcebergTestHarness, create_taxi_table,
+};
 
 #[tokio::test]
 async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
@@ -194,9 +197,26 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
 
 #[tokio::test]
 async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .unwrap();
+    let mut table = fixtures
+        .table(TableIdent::from_strs(["default", "items"]).unwrap(), schema)
+        .create()
+        .await?;
+    table
+        .append()
+        .file(id_batch(vec![1, 2, 3])?)
+        .file(id_batch(vec![4, 5, 6])?)
+        .commit()
+        .await?;
     let harness = IcebergTestHarness::builder()
         .with_iceberg_table_factory(IcebergTableProviderFactory::new())
-        .with_table(create_taxi_table().await?)
+        .with_table(table)
         .with_session_extension(|mut state| {
             state
                 .config()
@@ -210,30 +230,24 @@ async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
         .with_config_option("iceberg.execution.eager_file_planning", true)
         .build()
         .await?;
-    let plan = harness
-        .physical_plan("SELECT pickup_date FROM taxi LIMIT 2")
-        .await?;
-    let source = iceberg_source(&plan).unwrap();
 
-    // Eager conversion retains the snapshot estimate. Fetch bounds each
-    // partition separately; a short partition may still return fewer rows.
-    assert_eq!(
-        source
-            .with_fetch(None)
-            .unwrap()
-            .partition_statistics(None)?
-            .num_rows,
-        Precision::Inexact(175000)
-    );
-    assert_eq!(source.output_partitioning().partition_count(), 2);
-    assert_eq!(
-        source.partition_statistics(None)?.num_rows,
-        Precision::Inexact(4)
-    );
-    assert_eq!(
-        source.partition_statistics(Some(0))?.num_rows,
-        Precision::Inexact(2)
-    );
+    // Eager conversion retains the six-row snapshot estimate for the assignment.
+    let plan = harness.physical_plan("SELECT id FROM items").await?;
+    insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
+    all partitions (2): Rows=Inexact(6), Bytes=Inexact(48), [(Col[0]:)]
+    partition 0: Rows=Absent, Bytes=Absent, [(Col[0]:)]
+    partition 1: Rows=Absent, Bytes=Absent, [(Col[0]:)]
+    ");
+
+    // Fetch caps each source partition at two rows, not the whole assignment.
+    let plan = harness
+        .physical_plan("SELECT id FROM items LIMIT 2")
+        .await?;
+    insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
+    all partitions (2): Rows=Inexact(4), Bytes=Inexact(32), [(Col[0]:)]
+    partition 0: Rows=Inexact(2), Bytes=Inexact(16), [(Col[0]:)]
+    partition 1: Rows=Inexact(2), Bytes=Inexact(16), [(Col[0]:)]
+    ");
     Ok(())
 }
 
@@ -258,6 +272,13 @@ async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
 
     assert_eq!(batches.iter().map(RecordBatch::num_rows).max(), Some(2000));
     Ok(())
+}
+
+fn id_batch(values: Vec<i64>) -> Result<RecordBatch> {
+    Ok(RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int64Array::from(values)) as ArrayRef,
+    )])?)
 }
 
 // Only the public source-composition tests need to inspect the scan below SQL.

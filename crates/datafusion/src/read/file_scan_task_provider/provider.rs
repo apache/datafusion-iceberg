@@ -18,8 +18,8 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion::common::Result;
-use datafusion::common::stats::Precision;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::common::{Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 
@@ -53,11 +53,25 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
         context: FileScanTaskProviderContext,
     ) -> Result<iceberg::scan::FileScanTaskStream>;
 
-    /// Estimated rows across all partitions before the source's fetch, without
-    /// discovering or reading files. Use an inexact estimate when predicates or
-    /// deletes may remove rows. Unknown by default for externally supplied tasks.
-    fn estimated_num_rows(&self) -> Precision<usize> {
-        Precision::Absent
+    /// Statistics before the source's fetch, without discovering or reading files.
+    /// `None` requests the whole assignment; `Some(i)` requests partition `i`,
+    /// which must be below the partition count. Whole-assignment estimates must
+    /// not be repeated as estimates of individual partitions.
+    ///
+    /// `schema` is the source's projected output schema. Return one column statistic
+    /// per field, in that order, leaving unknown values as `Precision::Absent`.
+    /// Byte sizes describe output data, not compressed files. Use inexact estimates
+    /// when predicates or deletes may remove rows. The source fills missing byte
+    /// estimates where possible and applies its fetch limit.
+    ///
+    /// The default provides no estimates. Errors from providers are propagated by
+    /// the source.
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+        schema: &Schema,
+    ) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(schema))
     }
 
     /// Appends details to the data source's `EXPLAIN` line, each starting

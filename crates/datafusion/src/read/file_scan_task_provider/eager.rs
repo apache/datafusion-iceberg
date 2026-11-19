@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::common::stats::Precision;
-use datafusion::common::{Result, exec_err};
+use datafusion::arrow::datatypes::Schema;
+use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
 use iceberg::scan::FileScanTask;
@@ -31,9 +31,9 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
-    /// Snapshot estimate retained when converting lazy discovery; external
-    /// assignments have no snapshot estimate.
-    pub(super) estimated_num_rows: Precision<usize>,
+    /// Whole-assignment statistics retained when converting lazy discovery;
+    /// external assignments have no retained estimates.
+    pub(super) statistics: Option<Statistics>,
 }
 
 impl EagerFileScanTaskProvider {
@@ -50,7 +50,7 @@ impl EagerFileScanTaskProvider {
         }
         Ok(Self {
             file_scan_tasks,
-            estimated_num_rows: Precision::Absent,
+            statistics: None,
         })
     }
 
@@ -85,8 +85,20 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             .boxed())
     }
 
-    fn estimated_num_rows(&self) -> Precision<usize> {
-        self.estimated_num_rows
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+        schema: &Schema,
+    ) -> Result<Statistics> {
+        if partition.is_some_and(|partition| partition >= self.groups().len()) {
+            return exec_err!("Invalid Iceberg scan partition {partition:?}");
+        }
+        if (partition.is_none() || self.groups().len() == 1)
+            && let Some(statistics) = &self.statistics
+        {
+            return Ok(statistics.clone());
+        }
+        Ok(Statistics::new_unknown(schema))
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {

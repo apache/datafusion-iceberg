@@ -22,6 +22,7 @@ use super::file_scan_task_provider::{FileScanTaskProvider, FileScanTaskProviderC
 use crate::to_datafusion_error;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Statistics, exec_err};
 use datafusion::datasource::source::DataSource;
@@ -286,25 +287,34 @@ impl DataSource for IcebergDataSource {
         if partition.is_some_and(|partition| partition >= partitions) {
             return exec_err!("Invalid Iceberg scan partition {partition:?}");
         }
-        let mut statistics = Statistics::new_unknown(&self.schema);
-        // A provider's estimate covers its entire assignment, not each partition.
-        if partition.is_none() || partitions == 1 {
-            statistics.num_rows = self.file_scan_task_provider.estimated_num_rows();
+        let mut statistics = self
+            .file_scan_task_provider
+            .partition_statistics(partition, &self.schema)?;
+        if statistics.column_statistics.len() != self.schema.fields().len() {
+            return exec_err!(
+                "Iceberg task provider returned statistics for {} columns, expected {}",
+                statistics.column_statistics.len(),
+                self.schema.fields().len()
+            );
         }
         let fetch = if partition.is_none() && partitions > 1 {
             // Fetch is enforced independently in each partition. Without its row
             // distribution we can only bound the sum, even for an exact input.
             if self.fetch.is_some() {
-                statistics.num_rows = statistics.num_rows.to_inexact();
+                statistics = statistics.to_inexact();
             }
             self.fetch.and_then(|fetch| fetch.checked_mul(partitions))
         } else {
             self.fetch
         };
-        // Iceberg's total-files-size is compressed and includes unselected
-        // columns and delete files. Estimate projected in-memory widths instead.
-        statistics.calculate_total_byte_size(&self.schema);
-        Ok(Arc::new(statistics.with_fetch(fetch, 0, 1)?))
+        statistics = statistics.with_fetch(fetch, 0, 1)?;
+        // Keep provider-supplied byte estimates. For unknown sizes, estimate
+        // projected in-memory widths, not compressed Iceberg file sizes. Do this
+        // after fetch so its row bound can also supply a missing byte estimate.
+        if statistics.total_byte_size == Precision::Absent {
+            statistics.calculate_total_byte_size(&self.schema);
+        }
+        Ok(Arc::new(statistics))
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
