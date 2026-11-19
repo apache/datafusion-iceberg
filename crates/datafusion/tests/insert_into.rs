@@ -28,15 +28,12 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use iceberg::TableIdent;
 use iceberg::spec::{
-    DataFile, Literal, NestedField, PartitionKey, PrimitiveType, Schema, Struct,
-    StructType, TableProperties, Transform, Type,
-};
-use iceberg::table::Table;
-use iceberg::writer::file_writer::location_generator::{
-    LocationGenerator, ObjectStorageLocationGenerator,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, TableProperties,
+    Transform, Type,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use iceberg_datafusion_test_tools::{FixtureCatalog, data_file_name, display_schema};
+use regex::Regex;
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -496,10 +493,36 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn test_insert_into_object_storage_layout_with_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let ctx = create_category_table(
+        &fixtures,
+        &[(
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            "true",
+        )],
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(
+        redacted_data_file_paths(&fixtures).await?,
+        ["<hash>/category=a/<file>"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_insert_into_object_storage_layout_without_partition_paths()
 -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureCatalog::try_new().await?;
-    let (table, data_files) = insert_into_partitioned_table(
+    let ctx = create_category_table(
         &fixtures,
         &[
             (
@@ -514,95 +537,101 @@ async fn test_insert_into_object_storage_layout_without_partition_paths()
     )
     .await?;
 
-    let location_generator = ObjectStorageLocationGenerator::new(table.metadata())?;
-    assert_eq!(data_files.len(), 2);
-    for data_file in data_files {
-        let path = data_file.file_path();
-        // Without partition paths, the last entropy directory and the file name are
-        // joined with `-`, and the location doesn't depend on the partition.
-        let (_, file_name) = path.rsplit_once('/').unwrap().1.split_once('-').unwrap();
-        assert_eq!(path, location_generator.generate_location(None, file_name));
-        assert!(!path.contains("category="), "{path}");
-    }
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(
+        redacted_data_file_paths(&fixtures).await?,
+        ["<hash>-<file>"]
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_insert_into_object_storage_layout_with_partition_paths()
--> Result<(), Box<dyn Error>> {
+async fn test_insert_into_invalid_object_storage_enabled() -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureCatalog::try_new().await?;
-    let (table, data_files) = insert_into_partitioned_table(
+    let ctx = create_category_table(
         &fixtures,
         &[(
             TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
-            "true",
+            "yes",
         )],
     )
     .await?;
 
-    let metadata = table.metadata();
-    let location_generator = ObjectStorageLocationGenerator::new(metadata)?;
-    assert_eq!(data_files.len(), 2);
-    for data_file in data_files {
-        let path = data_file.file_path();
-        let (_, file_name) = path.rsplit_once('/').unwrap();
-        let partition_key = PartitionKey::new(
-            metadata.default_partition_spec().as_ref().clone(),
-            metadata.current_schema().clone(),
-            data_file.partition().clone(),
-        );
-        assert_eq!(
-            path,
-            location_generator.generate_location(Some(&partition_key), file_name)
-        );
-    }
+    let error = ctx
+        .sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await
+        .unwrap_err();
+
+    insta::assert_snapshot!(error, @r"
+    IcebergError(DataInvalid)
+    caused by
+    Execution error: DataInvalid => Invalid value for write.object-storage.enabled: provided string was not `true` or `false`
+    ");
 
     Ok(())
 }
 
-/// Creates a table with `properties`, identity-partitioned on `category`, inserts a row
-/// into each of two partitions, and returns the table and the data files it committed.
-async fn insert_into_partitioned_table(
+/// Creates `ns.t (id int, category string)`, identity-partitioned on `category`, with
+/// table `properties`, and returns a session with its catalog registered as `catalog`.
+async fn create_category_table(
     fixtures: &FixtureCatalog,
     properties: &[(&str, &str)],
-) -> Result<(Table, Vec<DataFile>), Box<dyn Error>> {
-    let ident = TableIdent::from_strs(["ns", "t"])?;
+) -> Result<SessionContext, Box<dyn Error>> {
     let schema = Schema::builder()
-        .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
             NestedField::required(2, "category", Type::Primitive(PrimitiveType::String))
                 .into(),
         ])
         .build()?;
-    let mut builder = fixtures
-        .table(ident.clone(), schema)
+    let mut table = fixtures
+        .table(TableIdent::from_strs(["ns", "t"])?, schema)
         .partition_by("category", Transform::Identity);
     for (key, value) in properties {
-        builder = builder.property(*key, *value);
+        table = table.property(*key, *value);
     }
-    builder.create().await?;
+    table.create().await?;
 
-    let client = fixtures.catalog();
-    let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
     let ctx = SessionContext::new();
-    ctx.register_catalog("catalog", catalog);
-    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a'), (2, 'b')")
-        .await?
-        .collect()
-        .await?;
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+    );
+    Ok(ctx)
+}
 
-    let table = client.load_table(&ident).await?;
+/// Returns the paths of `ns.t`'s data files relative to its data directory, sorted, with
+/// leading object-storage hash directories such as `0101/1100/0011/01010101` shown as
+/// `<hash>` and generated file names as `<file>`.
+async fn redacted_data_file_paths(
+    fixtures: &FixtureCatalog,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let hash = Regex::new("^[01]{4}/[01]{4}/[01]{4}/[01]{8}")?;
+    let file_name = Regex::new(r"[0-9a-f-]{36}-[0-9]{5}\.parquet$")?;
+
+    let table = fixtures
+        .catalog()
+        .load_table(&TableIdent::from_strs(["ns", "t"])?)
+        .await?;
     let snapshot = table.metadata().current_snapshot().unwrap();
     let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-    let mut data_files = Vec::new();
+    let mut paths = Vec::new();
     for entry in manifest_list.entries() {
         let manifest = table.manifest_reader().read(entry).await?;
         for entry in manifest.entries() {
-            data_files.push(entry.data_file().clone());
+            let path = data_file_name(entry.data_file().file_path());
+            let path = hash.replace(path, "<hash>");
+            paths.push(file_name.replace(&path, "<file>").into_owned());
         }
     }
+    paths.sort();
 
-    Ok((table, data_files))
+    Ok(paths)
 }

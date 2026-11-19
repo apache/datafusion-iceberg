@@ -3248,6 +3248,7 @@ dependencies = [
  "iceberg-datafusion-test-tools",
  "insta",
  "parquet",
+ "regex",
  "tempfile",
  "tokio",
  "uuid",
