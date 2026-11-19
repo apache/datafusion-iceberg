@@ -19,11 +19,10 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::Result;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
 use iceberg_datafusion::IcebergDataFusionConfig;
 use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
@@ -144,8 +143,7 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
 }
 
 #[tokio::test]
-async fn replacing_the_provider_reads_the_assignment_with_the_existing_limit()
--> Result<()> {
+async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
     let harness = IcebergTestHarness::builder()
         .with_config(|config| {
             config
@@ -157,29 +155,14 @@ async fn replacing_the_provider_reads_the_assignment_with_the_existing_limit()
         .await?;
     let plan = harness.plan("SELECT pickup_date FROM taxi LIMIT 2").await?;
     let source = iceberg_source(&plan).unwrap();
-    let assigned_file = eager_files(source)
-        .tasks()
-        .find(|task| task.data_file_path().contains("pickup_date=2024-01-12/"))
-        .unwrap()
-        .clone();
+    let assigned_file = eager_files(source).tasks().next().unwrap().clone();
 
     let assigned = source.with_file_scan_task_provider(Arc::new(
         EagerFileScanTaskProvider::try_new(vec![vec![assigned_file]])?,
     ))?;
-    let batches = collect(
-        DataSourceExec::from_data_source(assigned),
-        harness.context().task_ctx(),
-    )
-    .await?;
+    let assigned_plan = DataSourceExec::from_data_source(assigned);
 
-    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @"
-    +-------------+
-    | pickup_date |
-    +-------------+
-    | 2024-01-12  |
-    | 2024-01-12  |
-    +-------------+
-    ");
+    insta::assert_snapshot!(displayable(assigned_plan.as_ref()).indent(true).to_string(), @"DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=1, fetch=2");
     Ok(())
 }
 

@@ -153,8 +153,8 @@ impl TableProvider for IcebergCatalogTableProvider {
             schema,
             table.file_io().clone(),
             table.reader_builder(),
+            tasks,
         )
-        .with_file_scan_task_provider(tasks)
         .with_fetch(limit)
         .build()?;
         Ok(DataSourceExec::from_data_source(source))

@@ -944,9 +944,9 @@ async fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
         schema,
         scan.file_io().clone(),
         files.table().reader_builder(),
+        provider,
     )
     .with_reader(scan.reader().clone())
-    .with_file_scan_task_provider(provider)
     .with_fetch(scan.fetch())
     .build()
     .unwrap()
@@ -1121,8 +1121,8 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         schema,
         pinned.table().file_io().clone(),
         pinned.table().reader_builder(),
+        files,
     )
-    .with_file_scan_task_provider(files)
     .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
         +--------+

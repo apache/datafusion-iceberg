@@ -23,7 +23,7 @@ use crate::to_datafusion_error;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Statistics, exec_datafusion_err, exec_err};
+use datafusion::common::{Statistics, exec_err};
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -70,12 +70,23 @@ impl IcebergDataSource {
     /// defaults to one because DataFusion runs partitions concurrently.
     /// A later [`IcebergDataSourceBuilder::with_reader`] overrides these defaults.
     /// No discovery or current-runtime lookup is performed, even with eager
-    /// planning enabled: the caller supplies the task provider explicitly.
+    /// planning enabled: the caller supplies the task provider at construction.
+    /// Omitting the provider is a compile-time error:
+    ///
+    /// ```compile_fail,E0061
+    /// # use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionConfig};
+    /// # use iceberg::{arrow::ArrowReaderBuilder, io::FileIO};
+    /// # use iceberg_datafusion::read::IcebergDataSource;
+    /// # fn missing_provider(config: &SessionConfig, schema: SchemaRef, file_io: FileIO, reader: ArrowReaderBuilder) {
+    /// IcebergDataSource::builder(config, schema, file_io, reader);
+    /// # }
+    /// ```
     pub fn builder(
         config: &SessionConfig,
         schema: ArrowSchemaRef,
         file_io: FileIO,
         reader: ArrowReaderBuilder,
+        file_scan_task_provider: Arc<dyn FileScanTaskProvider>,
     ) -> IcebergDataSourceBuilder {
         IcebergDataSourceBuilder {
             schema,
@@ -88,7 +99,7 @@ impl IcebergDataSource {
                 .with_data_file_concurrency_limit(1)
                 .build(),
             fetch: None,
-            file_scan_task_provider: None,
+            file_scan_task_provider,
         }
     }
 
@@ -154,8 +165,7 @@ impl IcebergDataSource {
 ///     groups: Vec<Vec<FileScanTask>>,
 /// ) -> Result<IcebergDataSource> {
 ///     let provider = EagerFileScanTaskProvider::try_new(groups)?;
-///     IcebergDataSource::builder(config, schema, file_io, reader)
-///         .with_file_scan_task_provider(Arc::new(provider))
+///     IcebergDataSource::builder(config, schema, file_io, reader, Arc::new(provider))
 ///         .build()
 /// }
 /// ```
@@ -165,7 +175,7 @@ pub struct IcebergDataSourceBuilder {
     file_io: FileIO,
     reader: ArrowReader,
     fetch: Option<usize>,
-    file_scan_task_provider: Option<Arc<dyn FileScanTaskProvider>>,
+    file_scan_task_provider: Arc<dyn FileScanTaskProvider>,
 }
 
 impl IcebergDataSourceBuilder {
@@ -177,34 +187,22 @@ impl IcebergDataSourceBuilder {
         self
     }
 
-    /// Supplies task delivery. Required before calling [`Self::build`].
-    pub fn with_file_scan_task_provider(
-        mut self,
-        provider: Arc<dyn FileScanTaskProvider>,
-    ) -> Self {
-        self.file_scan_task_provider = Some(provider);
-        self
-    }
-
     /// Stops each partition after `fetch` rows, or reads every row for `None`.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
     }
 
-    /// Builds a source without discovering files. Returns an error if no provider
-    /// was supplied or the provider advertises no output partitions.
+    /// Builds a source without discovering files. Returns an error if the
+    /// provider advertises no output partitions.
     pub fn build(self) -> Result<IcebergDataSource> {
-        let provider = self.file_scan_task_provider.ok_or_else(|| {
-            exec_datafusion_err!("An Iceberg source requires a file task provider")
-        })?;
-        validate_provider(provider.as_ref())?;
+        validate_provider(self.file_scan_task_provider.as_ref())?;
         Ok(IcebergDataSource {
             schema: self.schema,
             file_io: self.file_io,
             reader: self.reader,
             fetch: self.fetch,
-            file_scan_task_provider: provider,
+            file_scan_task_provider: self.file_scan_task_provider,
             metrics: Default::default(),
         })
     }
