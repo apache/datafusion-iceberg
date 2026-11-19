@@ -18,6 +18,7 @@
 mod batch_size;
 mod catalog_provider;
 mod external_table;
+mod file_scan_task_provider;
 mod filter_pushdown;
 mod insert_into;
 mod limit_pushdown;

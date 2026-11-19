@@ -18,6 +18,7 @@
 //! The plan nodes and providers can be inspected from outside this crate and
 //! rebuilt from their parts, as a codec that serializes them does.
 
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::Arc;
@@ -39,7 +40,9 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg_datafusion::metadata::{
     IcebergMetadataDataSource, IcebergMetadataTableProvider,
 };
-use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::read::{
+    FileScanTaskProviderBuilder, IcebergDataSource, LazyFileScanTaskProvider,
+};
 use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
 use iceberg_datafusion::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
@@ -65,14 +68,38 @@ async fn run(
     Ok(pretty_format_batches(&run_batches(plan, ctx).await?)?.to_string())
 }
 
-/// Rebuilds `scan` from its accessors alone, as a codec would.
-fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
-    IcebergDataSource::builder(scan.table().clone(), scan.schema())
-        .with_snapshot_id(scan.snapshot_id())
-        .with_predicate(scan.predicate().cloned())
-        .with_fetch(scan.fetch())
-        .build()
-        .unwrap()
+/// The lazy file discovery retained by a source.
+fn lazy_files(scan: &IcebergDataSource) -> &LazyFileScanTaskProvider {
+    (scan.file_scan_task_provider() as &dyn Any)
+        .downcast_ref::<LazyFileScanTaskProvider>()
+        .expect("lazy file discovery")
+}
+
+/// Rebuilds the same table scan from its public accessors.
+async fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
+    let files = lazy_files(scan);
+    let context = SessionContext::new();
+    let (schema, provider) = FileScanTaskProviderBuilder::new(
+        context.task_ctx(),
+        files.table().clone(),
+        files.schema(),
+    )
+    .with_snapshot_id(files.snapshot_id())
+    .with_predicate(files.predicate().cloned())
+    .build()
+    .await
+    .unwrap();
+    IcebergDataSource::builder(
+        &context.copied_config(),
+        schema,
+        scan.file_io().clone(),
+        files.table().reader_builder(),
+        provider,
+    )
+    .with_reader(scan.reader().clone())
+    .with_fetch(scan.fetch())
+    .build()
+    .unwrap()
 }
 
 async fn run_source(
@@ -191,10 +218,13 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(
-        scan.predicate().map(ToString::to_string).as_deref(),
+        lazy_files(scan)
+            .predicate()
+            .map(ToString::to_string)
+            .as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan).await;
     assert_eq!(rebuilt.schema(), scan.schema());
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
@@ -216,7 +246,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .downcast_ref::<IcebergDataSource>()
         .expect("an Iceberg data source");
     assert_eq!(scan.schema(), pinned.schema());
-    let rebuilt = rebuild_scan(scan);
+    let rebuilt = rebuild_scan(scan).await;
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
     insta::assert_snapshot!(&expected, @r#"
@@ -230,9 +260,22 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
-        .with_snapshot_id(Some(snapshot_id))
-        .build()?;
+    let (schema, files) = FileScanTaskProviderBuilder::new(
+        ctx.task_ctx(),
+        pinned.table().clone(),
+        foo2_only,
+    )
+    .with_snapshot_id(Some(snapshot_id))
+    .build()
+    .await?;
+    let partial = IcebergDataSource::builder(
+        &ctx.copied_config(),
+        schema,
+        pinned.table().file_io().clone(),
+        pinned.table().reader_builder(),
+        files,
+    )
+    .build()?;
     insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
         +--------+
         | foo2   |

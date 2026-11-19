@@ -44,7 +44,7 @@ mod tests {
           SortExec: TopK(fetch=3), expr=[pickup_at@1 ASC NULLS LAST], preserve_partitioning=[true]
             FilterExec: pickup_date@4 = 2024-01-10
               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], predicate=pickup_date = 2024-01-10
+                DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
         +-----------+---------------------+-----------------+---------------+-------------+
@@ -71,7 +71,7 @@ mod tests {
         CoalescePartitionsExec: fetch=3
           FilterExec: pickup_date@0 = 2024-01-10, fetch=3
             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-              DataSourceExec: format=iceberg, projection=[pickup_date], predicate=pickup_date = 2024-01-10
+              DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
     +-------------+
@@ -96,7 +96,7 @@ mod tests {
 
         insta::assert_snapshot!(plan, @r"
         CooperativeExec
-          DataSourceExec: format=iceberg, projection=[pickup_date], fetch=3
+          DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3
         ");
         insta::assert_snapshot!(batches, @r"
     +-------------+
@@ -122,13 +122,13 @@ mod tests {
             .await?;
 
         insta::assert_snapshot!(explain, @r"
-    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type         | plan                                                                                                                            |
-    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
-    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                     |
-    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
-    |                   |                                                                                                                                 |
-    +-------------------+---------------------------------------------------------------------------------------------------------------------------------+
+    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+    | plan_type         | plan                                                                                                                                           |
+    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                    |
+    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
+    |                   |                                                                                                                                                |
+    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
     ");
 
         Ok(())
@@ -202,7 +202,7 @@ mod tests {
               SortExec: TopK(fetch=5), expr=[pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], preserve_partitioning=[true]
                 FilterExec: pickup_date@3 = 2024-01-10, projection=[vendor_id@0, pickup_at@1, pickup_location_id@2]
                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], predicate=pickup_date = 2024-01-10
+                    DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
         +-----------+---------------------+

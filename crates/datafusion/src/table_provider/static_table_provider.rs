@@ -31,7 +31,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
 
 use crate::error::to_datafusion_error;
-use crate::read::IcebergDataSource;
+use crate::read::{FileScanTaskProviderBuilder, IcebergDataSource};
 
 /// Static table provider for read-only snapshot access.
 ///
@@ -117,18 +117,31 @@ impl TableProvider for IcebergStaticTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Use cached table (no refresh)
-        let source = IcebergDataSource::builder(self.table.clone(), self.schema.clone())
-            .with_snapshot_id(self.snapshot_id)
-            .with_projection(projection)
-            .with_filters(filters)
-            .with_fetch(limit)
-            .build()?;
+        // Use cached table (no refresh).
+        let (schema, tasks) = FileScanTaskProviderBuilder::new(
+            state.task_ctx(),
+            self.table.clone(),
+            self.schema.clone(),
+        )
+        .with_projection(projection)
+        .with_snapshot_id(self.snapshot_id)
+        .with_filters(filters)
+        .build()
+        .await?;
+        let source = IcebergDataSource::builder(
+            state.config(),
+            schema,
+            self.table.file_io().clone(),
+            self.table.reader_builder(),
+            tasks,
+        )
+        .with_fetch(limit)
+        .build()?;
         Ok(DataSourceExec::from_data_source(source))
     }
 
@@ -164,6 +177,7 @@ mod tests {
     use iceberg::table::{StaticTable, Table};
 
     use super::*;
+    use crate::read::IcebergDataSource;
 
     #[tokio::test]
     async fn test_static_provider_from_table() {

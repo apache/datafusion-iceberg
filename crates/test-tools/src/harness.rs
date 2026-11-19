@@ -24,7 +24,8 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::{CatalogProvider, TableProviderFactory};
-use datafusion::common::exec_err;
+use datafusion::common::{exec_datafusion_err, exec_err};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
@@ -81,6 +82,38 @@ impl IcebergTestHarness {
 
     pub async fn physical_plan(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
         self.ctx.sql(sql).await?.create_physical_plan().await
+    }
+
+    /// Renders the single data source's full statistics, followed by each partition's,
+    /// ready for an inline snapshot. Inspects `plan` without planning or executing it.
+    /// Returns an error if the plan has no data source or more than one.
+    pub fn source_statistics(&self, plan: &Arc<dyn ExecutionPlan>) -> Result<String> {
+        let mut pending = vec![plan];
+        let mut source = None;
+        while let Some(node) = pending.pop() {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>() {
+                if source.is_some() {
+                    return exec_err!("expected exactly one data source, found multiple");
+                }
+                source = Some(exec.data_source());
+            }
+            pending.extend(node.children());
+        }
+        let source = source.ok_or_else(|| {
+            exec_datafusion_err!("expected exactly one data source, found none")
+        })?;
+        let partitions = source.output_partitioning().partition_count();
+        let mut lines = vec![format!(
+            "all partitions ({partitions}): {}",
+            source.partition_statistics(None)?
+        )];
+        for partition in 0..partitions {
+            lines.push(format!(
+                "partition {partition}: {}",
+                source.partition_statistics(Some(partition))?
+            ));
+        }
+        Ok(lines.join("\n"))
     }
 
     /// Returns the registered table's scan without SQL optimization, including for an
