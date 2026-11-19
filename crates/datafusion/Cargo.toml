@@ -38,10 +38,9 @@ iceberg = { workspace = true }
 parquet = "59.2"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
-serde = { version = "1", features = ["derive"] }
-typetag = "0.2"
 
 [dev-dependencies]
+iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"
 tempfile = "3.18"
