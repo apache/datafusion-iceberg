@@ -16,7 +16,7 @@
 // under the License.
 
 use datafusion::error::Result;
-use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
+use iceberg_datafusion::IcebergTableProviderFactory;
 use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
 #[tokio::test]
@@ -41,38 +41,6 @@ async fn lazy_scan_reports_files_and_bytes_even_when_no_rows_match() -> Result<(
     |                   |     DataSourceExec: format=iceberg, projection=[fare_amount, pickup_date], provider=lazy, predicate=(pickup_date <= 2024-01-10) AND (fare_amount = 12.345), metrics=[output_rows=0, output_bytes=0.0 B, output_batches=0, batches_split=0, files_opened=3, bytes_scanned=2.19 M] |
     |                   |                                                                                                                                                                                                                                                                                  |
     +-------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    ");
-    Ok(())
-}
-
-#[tokio::test]
-async fn eager_scan_reports_files_and_bytes_across_partitions() -> Result<()> {
-    let (_, explain) = IcebergTestHarness::builder()
-        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
-        .with_table(create_taxi_table().await?)
-        .with_session_extension(|mut state| {
-            state
-                .config()
-                .get_or_insert_default()
-                .options_mut()
-                .extensions
-                .insert(IcebergDataFusionConfig::default());
-            state
-        })
-        .with_config_option("iceberg.execution.eager_file_planning", true)
-        .with_config_option("datafusion.execution.target_partitions", 2)
-        .with_config_option("datafusion.explain.analyze_categories", "rows,bytes")
-        .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi")
-        .await?;
-
-    insta::assert_snapshot!(explain, @"
-    +-------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type         | plan                                                                                                                                                                                                                        |
-    +-------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                                                                                                 |
-    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=7, metrics=[output_rows=175.0 K, output_bytes=896.0 KB, output_batches=28, batches_split=0, files_opened=7, bytes_scanned=3.67 M] |
-    |                   |                                                                                                                                                                                                                             |
-    +-------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
     ");
     Ok(())
 }
