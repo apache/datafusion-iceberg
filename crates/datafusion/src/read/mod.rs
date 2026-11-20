@@ -17,6 +17,7 @@
 
 mod file_scan_task_provider;
 pub(crate) mod predicate;
+mod reader_config;
 pub(crate) mod scan;
 
 pub use file_scan_task_provider::{

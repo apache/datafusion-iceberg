@@ -19,6 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use super::file_scan_task_provider::{FileScanTaskProvider, FileScanTaskProviderContext};
+use super::reader_config::build_reader;
 use crate::to_datafusion_error;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -67,8 +68,9 @@ impl Debug for IcebergDataSource {
 impl IcebergDataSource {
     /// Starts source construction with session reader settings and explicit local
     /// storage/runtime resources. `reader` must use the supplied `file_io`.
-    /// Batch size and page-index settings come from `config`; file concurrency
-    /// defaults to one because DataFusion runs partitions concurrently.
+    /// Batch size, row-group pruning and page-index settings come from DataFusion's
+    /// session options. File concurrency uses `iceberg.execution.data_file_concurrency_limit`
+    /// and defaults to one because DataFusion runs partitions concurrently.
     /// A later [`IcebergDataSourceBuilder::with_reader`] overrides these defaults.
     /// No discovery or current-runtime lookup is performed, even with eager
     /// planning enabled: the caller supplies the task provider at construction.
@@ -92,13 +94,7 @@ impl IcebergDataSource {
         IcebergDataSourceBuilder {
             schema,
             file_io,
-            reader: reader
-                .with_batch_size(config.batch_size())
-                .with_row_selection_enabled(
-                    config.options().execution.parquet.enable_page_index,
-                )
-                .with_data_file_concurrency_limit(1)
-                .build(),
+            reader: build_reader(reader, config),
             fetch: None,
             file_scan_task_provider,
         }
