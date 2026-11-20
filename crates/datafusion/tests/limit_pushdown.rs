@@ -43,8 +43,7 @@ mod tests {
         SortPreservingMergeExec: [pickup_at@1 ASC NULLS LAST], fetch=3
           SortExec: TopK(fetch=3), expr=[pickup_at@1 ASC NULLS LAST], preserve_partitioning=[true]
             FilterExec: pickup_date@4 = 2024-01-10
-              RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
+              DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, passenger_count, trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
         +-----------+---------------------+-----------------+---------------+-------------+
@@ -70,8 +69,7 @@ mod tests {
         insta::assert_snapshot!(plan, @r"
         CoalescePartitionsExec: fetch=3
           FilterExec: pickup_date@0 = 2024-01-10, fetch=3
-            RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-              DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
+            DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
     +-------------+
@@ -91,22 +89,21 @@ mod tests {
         let (plan, batches) = IcebergTestHarness::builder()
             .with_iceberg_table_factory(IcebergTableProviderFactory::new())
             .with_table(create_taxi_table().await?)
-            .query("SELECT pickup_date FROM taxi LIMIT 3")
+            .build()
+            .await?
+            .query_batches("SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
         insta::assert_snapshot!(plan, @r"
-        CooperativeExec
+        CoalescePartitionsExec: fetch=3
           DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3
         ");
-        insta::assert_snapshot!(batches, @r"
-    +-------------+
-    | pickup_date |
-    +-------------+
-    | 2024-01-08  |
-    | 2024-01-08  |
-    | 2024-01-08  |
-    +-------------+
-    ");
+        // No ORDER BY, so with several partitions any day's file can supply
+        // the rows; only their count is deterministic.
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            3
+        );
 
         Ok(())
     }
@@ -116,20 +113,24 @@ mod tests {
         let (_, explain) = IcebergTestHarness::builder()
             .with_iceberg_table_factory(IcebergTableProviderFactory::new())
             .with_table(create_taxi_table().await?)
+            // With several partitions, how many open a file before the limit
+            // cancels the scan depends on scheduling. One partition stops after
+            // the first file, so the source's row count is deterministic.
+            .with_config_option("datafusion.execution.target_partitions", 1)
             // Only row counts, so the output doesn't vary between runs.
             .with_config_option("datafusion.explain.analyze_categories", "rows")
             .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
         insta::assert_snapshot!(explain, @r"
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type         | plan                                                                                                                                           |
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
-    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                    |
-    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
-    |                   |                                                                                                                                                |
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
-    ");
+        +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+        | plan_type         | plan                                                                                                                                           |
+        +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+        | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                    |
+        |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
+        |                   |                                                                                                                                                |
+        +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+        ");
 
         Ok(())
     }
@@ -144,6 +145,7 @@ mod tests {
                 )),
             )
             .with_table(create_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 2)
             .build()
             .await?;
         harness.query_batches("SELECT * FROM taxi").await?;
@@ -151,8 +153,8 @@ mod tests {
         harness.query_batches("SELECT * FROM taxi LIMIT 3").await?;
         let limited_scan_reads = storage.take_reads();
 
-        // The exact counts depend on how many data files iceberg opens at
-        // once, which follows the runner's CPU count, so compare the two scans.
+        // Two partitions can open fewer than the seven files before LIMIT
+        // cancels the scan. Compare totals, not scheduler-dependent exact counts.
         assert!(
             limited_scan_reads < full_scan_reads,
             "a scan with LIMIT 3 read {limited_scan_reads} Parquet ranges, \
@@ -201,8 +203,7 @@ mod tests {
             SortPreservingMergeExec: [pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], fetch=5
               SortExec: TopK(fetch=5), expr=[pickup_at@1 ASC NULLS LAST, vendor_id@0 ASC NULLS LAST, pickup_location_id@2 ASC NULLS LAST], preserve_partitioning=[true]
                 FilterExec: pickup_date@3 = 2024-01-10, projection=[vendor_id@0, pickup_at@1, pickup_location_id@2]
-                  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
+                  DataSourceExec: format=iceberg, projection=[vendor_id, pickup_at, pickup_location_id, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
         +-----------+---------------------+

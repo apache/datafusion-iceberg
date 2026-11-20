@@ -363,7 +363,7 @@ mod tests {
     use datafusion::common::Statistics;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::source::DataSource;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use iceberg::io::FileIO;
     use iceberg::spec::{
         FormatVersion, MAIN_BRANCH, NestedField, Operation, PartitionSpec, PrimitiveType,
@@ -439,7 +439,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        let context = SessionContext::new();
+        // One partition, so the fetch caps the whole scan rather than each of
+        // a machine-dependent number of partitions.
+        let context = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(1),
+        );
         let (schema, provider) =
             FileScanTaskProviderBuilder::new(context.task_ctx(), table.clone(), schema)
                 .with_projection(Some(&vec![0]))

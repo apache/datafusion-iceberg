@@ -106,8 +106,10 @@ async fn run_source(
     source: &IcebergDataSource,
     ctx: &SessionContext,
 ) -> Result<String, Box<dyn Error>> {
-    let exec = DataSourceExec::from_data_source(source.clone());
-    run(exec.as_ref(), ctx).await
+    // The lazy provider reads in one partition per target partition.
+    let exec =
+        CoalescePartitionsExec::new(DataSourceExec::from_data_source(source.clone()));
+    run(&exec, ctx).await
 }
 
 /// Returns the first node of type `T` in `plan`, depth first.

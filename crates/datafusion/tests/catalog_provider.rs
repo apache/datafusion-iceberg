@@ -24,6 +24,8 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
@@ -77,8 +79,7 @@ async fn test_provider_plan_stream_schema() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let task_ctx = Arc::new(df.task_ctx());
-    let plan = df.create_physical_plan().await.unwrap();
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    let plan = CoalescePartitionsExec::new(df.create_physical_plan().await.unwrap());
     let stream = plan.execute(0, task_ctx).unwrap();
 
     // Ensure both the plan and the stream conform to the same schema

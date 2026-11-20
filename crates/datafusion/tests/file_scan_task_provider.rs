@@ -20,8 +20,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::common::Result;
-use datafusion::datasource::source::{DataSource, DataSourceExec};
-use datafusion::execution::TaskContext;
+use datafusion::datasource::source::{DataSource, DataSourceExec, OpenArgs};
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
@@ -49,7 +48,7 @@ async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
         )
         .await?;
 
-    insta::assert_snapshot!(plan, @"
+    insta::assert_snapshot!(plan, @r"
     SortPreservingMergeExec: [pickup_date@0 ASC NULLS LAST]
       ProjectionExec: expr=[pickup_date@0 as pickup_date, count(Int64(1))@1 as trips]
         SortExec: expr=[pickup_date@0 ASC NULLS LAST], preserve_partitioning=[true]
@@ -57,8 +56,7 @@ async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
             RepartitionExec: partitioning=Hash([pickup_date@0], 2), input_partitions=2
               AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
-                  RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+                  DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
     ");
     insta::assert_snapshot!(rows, @"
     +-------------+-------+
@@ -260,8 +258,13 @@ async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
     let source = iceberg_source(&plan).unwrap();
 
     // Open with default settings, not the settings used to construct the scan.
+    let sibling_state = source.create_sibling_state(harness.state().config_options());
     let batches = source
-        .open(0, Arc::new(TaskContext::default()))?
+        .open_with_args(OpenArgs {
+            partition: 0,
+            context: Arc::new(Default::default()),
+            sibling_state,
+        })?
         .try_collect::<Vec<_>>()
         .await?;
 
