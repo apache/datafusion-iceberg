@@ -44,6 +44,7 @@ uuid = { version = "1.18", features = ["v7"] }
 iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"
+regex = "1"
 tempfile = "3.18"
 
 # Every integration test is a module of `tests/main.rs`, so they all link into one binary
