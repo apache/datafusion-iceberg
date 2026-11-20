@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion::arrow::datatypes::Schema;
+use datafusion::common::stats::Precision;
 use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
@@ -28,12 +29,11 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 
 /// Files discovered before execution, in groups that each become one output
 /// partition. Group order and empty groups are retained.
+/// Row estimates use the retained file record counts before predicates and
+/// deletes. Only an empty assignment reports an exact row count.
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
-    /// Whole-assignment statistics retained when converting lazy discovery;
-    /// external assignments have no retained estimates.
-    pub(super) statistics: Option<Statistics>,
 }
 
 impl EagerFileScanTaskProvider {
@@ -48,10 +48,7 @@ impl EagerFileScanTaskProvider {
                 "An Iceberg task provider requires at least one file group"
             );
         }
-        Ok(Self {
-            file_scan_tasks,
-            statistics: None,
-        })
+        Ok(Self { file_scan_tasks })
     }
 
     /// All file tasks, in partition order and then group order.
@@ -93,12 +90,28 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
         if partition.is_some_and(|partition| partition >= self.groups().len()) {
             return exec_err!("Invalid Iceberg scan partition {partition:?}");
         }
-        if (partition.is_none() || self.groups().len() == 1)
-            && let Some(statistics) = &self.statistics
-        {
-            return Ok(statistics.clone());
+        let groups = match partition {
+            Some(partition) => &self.groups()[partition..=partition],
+            None => self.groups(),
+        };
+        let mut statistics = Statistics::new_unknown(schema);
+        if groups.iter().all(Vec::is_empty) {
+            statistics.num_rows = Precision::Exact(0);
+            statistics.total_byte_size = Precision::Exact(0);
+        } else {
+            // Record counts precede predicates and deletes. Keep them inexact even
+            // for unfiltered scans, so metadata cannot answer COUNT(*) directly.
+            statistics.num_rows = groups
+                .iter()
+                .flatten()
+                .try_fold(0_usize, |rows, task| {
+                    rows.checked_add(usize::try_from(task.record_count()?).ok()?)
+                })
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent);
         }
-        Ok(Statistics::new_unknown(schema))
+        // The source estimates projected output bytes, not compressed file sizes.
+        Ok(statistics)
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
@@ -122,5 +135,59 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataFileFormat, Schema as IcebergSchema};
+
+    use super::*;
+
+    #[test]
+    fn leaves_rows_unknown_when_a_task_has_no_record_count() -> Result<()> {
+        let provider = EagerFileScanTaskProvider::try_new(vec![vec![
+            file_task(Some(10)),
+            file_task(None),
+        ]])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn leaves_rows_unknown_when_record_counts_overflow() -> Result<()> {
+        let provider = EagerFileScanTaskProvider::try_new(vec![
+            vec![file_task(Some(u64::MAX))],
+            vec![file_task(Some(1))],
+        ])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_zero_file_record_counts_inexact() -> Result<()> {
+        let provider =
+            EagerFileScanTaskProvider::try_new(vec![vec![file_task(Some(0))]])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Inexact(0));
+        Ok(())
+    }
+
+    // Only metadata is inspected; these files are never opened.
+    fn file_task(record_count: Option<u64>) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(1)
+            .with_record_count(record_count)
+            .with_data_file_path("data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(IcebergSchema::builder().build().unwrap()))
+            .with_project_field_ids(vec![])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 }

@@ -144,13 +144,8 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
         .await?;
 
     insta::assert_snapshot!(plan, @"
-    ProjectionExec: expr=[count(Int64(1))@0 as trips]
-      AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
-        CoalescePartitionsExec
-          AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
-            FilterExec: pickup_date@0 = 2025-01-01, projection=[]
-              RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-                DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=0
+    ProjectionExec: expr=[0 as trips]
+      PlaceholderRowExec
     ");
     insta::assert_snapshot!(rows, @"
     +-------+
@@ -196,7 +191,7 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
 }
 
 #[tokio::test]
-async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
+async fn eager_file_statistics_apply_fetch_per_partition() -> Result<()> {
     let fixtures = FixtureCatalog::try_new().await?;
     let schema = Schema::builder()
         .with_fields(vec![
@@ -231,12 +226,12 @@ async fn eager_snapshot_statistics_apply_fetch_per_partition() -> Result<()> {
         .build()
         .await?;
 
-    // Eager conversion retains the six-row snapshot estimate for the assignment.
+    // Each of the two file groups contributes three rows to the assignment.
     let plan = harness.physical_plan("SELECT id FROM items").await?;
     insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
     all partitions (2): Rows=Inexact(6), Bytes=Inexact(48), [(Col[0]:)]
-    partition 0: Rows=Absent, Bytes=Absent, [(Col[0]:)]
-    partition 1: Rows=Absent, Bytes=Absent, [(Col[0]:)]
+    partition 0: Rows=Inexact(3), Bytes=Inexact(24), [(Col[0]:)]
+    partition 1: Rows=Inexact(3), Bytes=Inexact(24), [(Col[0]:)]
     ");
 
     // Fetch caps each source partition at two rows, not the whole assignment.
