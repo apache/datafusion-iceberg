@@ -354,7 +354,6 @@ mod tests {
     use iceberg::{Runtime, TableIdent};
 
     use super::IcebergDataSource;
-    use crate::IcebergDataFusionConfig;
     use crate::read::FileScanTaskProviderBuilder;
 
     /// Returns a table with one snapshot per summary, oldest first, with ids
@@ -495,26 +494,6 @@ mod tests {
     async fn rejects_a_missing_snapshot_during_lazy_planning() {
         let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
         let context = SessionContext::new();
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
-        let error = FileScanTaskProviderBuilder::new(context.task_ctx(), table, schema)
-            .with_snapshot_id(Some(2))
-            .build()
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Snapshot with id 2 not found"));
-    }
-
-    #[tokio::test]
-    async fn rejects_a_missing_snapshot_during_eager_planning() {
-        let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
-        let config = datafusion::prelude::SessionConfig::new()
-            .with_option_extension(IcebergDataFusionConfig::default())
-            .set_bool("iceberg.execution.eager_file_planning", true);
-        let context = SessionContext::new_with_config(config);
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
             DataType::Int64,

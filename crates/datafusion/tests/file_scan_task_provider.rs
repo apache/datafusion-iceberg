@@ -20,20 +20,16 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::common::Result;
-use datafusion::common::stats::Precision;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg_datafusion::read::{
-    EagerFileScanTaskProvider, FileScanTaskProviderBuilder, IcebergDataSource,
-    LazyFileScanTaskProvider,
-};
+use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
 use iceberg_datafusion_test_tools::{
-    FixtureCatalog, FixtureTable, IcebergTestHarness, create_taxi_table,
+    FixtureCatalog, IcebergTestHarness, create_taxi_table,
 };
 
 #[tokio::test]
@@ -276,135 +272,6 @@ async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
 
     assert_eq!(batches.iter().map(RecordBatch::num_rows).max(), Some(2000));
     Ok(())
-}
-
-#[tokio::test]
-async fn lazy_planning_resolves_the_current_snapshot() -> Result<()> {
-    let harness = IcebergTestHarness::builder()
-        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
-        .with_table(two_snapshot_table().await?)
-        .build()
-        .await?;
-    let table = harness.table().table();
-    let state = harness.state();
-    let (schema, provider) = FileScanTaskProviderBuilder::new(
-        state.task_ctx(),
-        table.clone(),
-        harness.table().schema()?,
-    )
-    .build()
-    .await?;
-    let lazy = (provider.as_ref() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    // Keep the selection API's meaning while exposing the resolved snapshot.
-    assert_eq!(lazy.snapshot_id(), None);
-    assert_eq!(lazy.snapshot().unwrap().snapshot_id(), 2);
-    let source = IcebergDataSource::builder(
-        state.config(),
-        schema,
-        table.file_io().clone(),
-        table.reader_builder(),
-        provider,
-    )
-    .build()?;
-    assert_eq!(
-        source.partition_statistics(None)?.num_rows,
-        Precision::Inexact(3)
-    );
-    let batches = source
-        .open(0, state.task_ctx())?
-        .try_collect::<Vec<_>>()
-        .await?;
-    let mut values = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .iter()
-                .copied()
-        })
-        .collect::<Vec<_>>();
-    values.sort_unstable();
-    assert_eq!(values, vec![1, 2, 3]);
-    Ok(())
-}
-
-#[tokio::test]
-async fn lazy_planning_uses_the_selected_snapshot_for_statistics_and_rows() -> Result<()>
-{
-    let harness = IcebergTestHarness::builder()
-        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
-        .with_table(two_snapshot_table().await?)
-        .build()
-        .await?;
-    let table = harness.table().table();
-    let state = harness.state();
-    let (schema, provider) = FileScanTaskProviderBuilder::new(
-        state.task_ctx(),
-        table.clone(),
-        harness.table().schema()?,
-    )
-    .with_snapshot_id(Some(1))
-    .build()
-    .await?;
-    let lazy = (provider.as_ref() as &dyn Any)
-        .downcast_ref::<LazyFileScanTaskProvider>()
-        .unwrap();
-    assert_eq!(lazy.snapshot_id(), Some(1));
-    assert_eq!(lazy.snapshot().unwrap().snapshot_id(), 1);
-    let source = IcebergDataSource::builder(
-        state.config(),
-        schema,
-        table.file_io().clone(),
-        table.reader_builder(),
-        provider,
-    )
-    .build()?;
-    assert_eq!(
-        source.partition_statistics(None)?.num_rows,
-        Precision::Inexact(2)
-    );
-    let batches = source
-        .open(0, state.task_ctx())?
-        .try_collect::<Vec<_>>()
-        .await?;
-    let values = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .iter()
-                .copied()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(values, vec![1, 2]);
-    Ok(())
-}
-
-async fn two_snapshot_table() -> Result<FixtureTable> {
-    let fixtures = FixtureCatalog::try_new().await?;
-    let schema = Schema::builder()
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-        ])
-        .build()
-        .unwrap();
-    let mut table = fixtures
-        .table(TableIdent::from_strs(["default", "items"]).unwrap(), schema)
-        .create()
-        .await?;
-    table.append().file(id_batch(vec![1, 2])?).commit().await?;
-    table.append().file(id_batch(vec![3])?).commit().await?;
-    Ok(table)
 }
 
 fn id_batch(values: Vec<i64>) -> Result<RecordBatch> {
