@@ -15,272 +15,141 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compare two release builds on one immutable, taxi-derived Iceberg snapshot.
+//! End-to-end SQL lookup on a taxi table with a high-cardinality string key.
+//! Set TAXI_DATA_DIR to use the seven daily NYC taxi Parquet files in place of
+//! the built-in taxi fixture.
 
 use std::env;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::error::Error;
+use std::fs::File;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
-use datafusion::arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
-use datafusion::arrow::compute::{cast, concat_batches};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::{collect, display::DisplayableExecutionPlan};
+use criterion::{BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, RecordBatchReader, StringArray};
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::util::display::array_value_to_string;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::TableIdent;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Transform, Type};
-use iceberg_datafusion::IcebergTableProviderFactory;
-use iceberg_datafusion_test_tools::{FixtureCatalog, FixtureTable, taxi_schema};
+use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_datafusion_test_tools::{
+    FixtureCatalog, FixtureTable, TAXI_DAYS, TAXI_TRIPS_PER_DAY, taxi_schema, taxi_trips,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use rustix::time::{ClockId, clock_gettime};
-use tempfile::tempdir;
-
-const KEY: &str = "dd_resource_key";
-const SIZES: [usize; 8] = [1, 16, 31, 32, 100, 369, 400, 1000];
-const RUNS_PER_BLOCK: usize = 5;
+use tokio::runtime::Builder;
 
 fn resource_key(row: usize) -> String {
-    // Mirror the lengths and predominantly shared prefix in the reported query.
     let region = match row % 369 {
         0..14 => "ap-southeast-2",
         14..16 => "eu-central-1",
         16..18 => "eu-south-1",
         _ => "us-east-1",
     };
-    // An odd multiplier permutes the row IDs uniquely over u64.
+    // An odd multiplier scatters adjacent row IDs while keeping the keys unique.
     let volume = (row as u64).wrapping_mul(0x9e3779b97f4a7c15);
     format!("arn:aws:ec2:{region}:000000000000:volume/vol-{volume:017x}")
 }
 
-async fn make_fixture(data_dir: &Path) -> Result<(FixtureTable, usize)> {
-    let fixtures = FixtureCatalog::try_new().await?;
+async fn taxi_table(data_dir: Option<&Path>) -> Result<FixtureTable, Box<dyn Error>> {
+    let catalog = FixtureCatalog::try_new().await?;
     let mut fields = taxi_schema().as_struct().fields().to_vec();
     fields.push(
-        NestedField::required(14, KEY, Type::Primitive(PrimitiveType::String)).into(),
+        NestedField::required(14, "resource_key", Type::Primitive(PrimitiveType::String))
+            .into(),
     );
-    let schema = Schema::builder().with_fields(fields).build()?;
-    let mut table = fixtures
-        .table(TableIdent::from_strs(["bench", "taxi_keys"])?, schema)
+    let mut table = catalog
+        .table(
+            TableIdent::from_strs(["default", "taxi"])?,
+            Schema::builder().with_fields(fields).build()?,
+        )
         .partition_by("pickup_date", Transform::Identity)
         .create()
         .await?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_row_count(Some(25_000))
-        .build();
-    let mut append = table.append().writer_properties(props);
-    let mut rows = 0;
-    for day in 8..=14 {
-        let path = data_dir.join(format!("pickup_date=2024-01-{day:02}/data_0.parquet"));
-        let reader = ParquetRecordBatchReaderBuilder::try_new(
-            File::open(&path).with_context(|| format!("opening {}", path.display()))?,
-        )?
-        .build()?;
-        let batches = reader.collect::<Result<Vec<_>, _>>()?;
-        let source = concat_batches(
-            &batches.first().context("empty taxi file")?.schema(),
-            &batches,
-        )?;
-        ensure!(
-            source.num_rows() == 25_000,
-            "unexpected row count in {}",
-            path.display()
-        );
+    let mut append = table.append().writer_properties(
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build(),
+    );
+    for day in 0..TAXI_DAYS {
+        let trips = if let Some(dir) = data_dir {
+            let path =
+                dir.join(format!("pickup_date=2024-01-{:02}/data_0.parquet", 8 + day));
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
+            concat_batches(&reader.schema(), &reader.collect::<Result<Vec<_>, _>>()?)?
+        } else {
+            taxi_trips(day)?
+        };
+        assert_eq!(trips.num_rows(), TAXI_TRIPS_PER_DAY);
+        let first = day * TAXI_TRIPS_PER_DAY;
         let keys = StringArray::from_iter_values(
-            (rows..rows + source.num_rows()).map(resource_key),
+            (first..first + trips.num_rows()).map(resource_key),
         );
-        rows += source.num_rows();
-        let original = source.schema();
-        let mut columns = original
+        let columns = trips
+            .schema_ref()
             .fields()
             .iter()
             .map(|f| f.name().as_str())
-            .zip(source.columns().iter().cloned())
-            .collect::<Vec<_>>();
-        if source.column_by_name("pickup_date").is_none() {
-            columns.push((
-                "pickup_date",
-                cast(
-                    source
-                        .column_by_name("pickup_at")
-                        .context("missing pickup_at")?,
-                    &DataType::Date32,
-                )?,
-            ));
-        }
-        columns.push((KEY, Arc::new(keys) as ArrayRef));
+            .zip(trips.columns().iter().cloned())
+            .chain([("resource_key", Arc::new(keys) as ArrayRef)]);
         append = append.file(RecordBatch::try_from_iter(columns)?);
     }
-    ensure!(
-        append.commit().await?.len() == 7,
-        "expected seven daily files"
-    );
-    Ok((table, rows))
+    append.commit().await?;
+    Ok(table)
 }
 
-async fn compare(taxi: &str, before: &str, after: &str, out: &str) -> Result<()> {
-    let (table, rows) = make_fixture(Path::new(taxi)).await?;
-    let dir = tempdir()?;
-    let key_path = dir.path().join("keys.txt");
-    // A coprime stride samples unique trips across all seven files. Smaller lists
-    // are prefixes of the same pool, so a list of length N must yield exactly N keys.
-    let pool = (0..*SIZES.last().unwrap())
-        .map(|n| resource_key((37_417 + n * 104_729) % rows))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&key_path, pool)?;
-    fs::create_dir_all(out)?;
-    let mut csv = BufWriter::new(File::create(Path::new(out).join("samples.csv"))?);
-    writeln!(
-        csv,
-        "variant,block,sample,keys,rows,wall_ms,cpu_ms,plan_wall_ms,plan_cpu_ms"
-    )?;
-    for (variant, binary, block) in [
-        ("before", before, "1"),
-        ("after", after, "1"),
-        ("after", after, "2"),
-        ("before", before, "2"),
-    ] {
-        eprintln!("Benchmarking {variant}, block {block}");
-        let output = Command::new(binary)
-            .arg("measure")
-            .arg(table.metadata_location()?)
-            .arg(&key_path)
-            .args([out, variant, block])
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        csv.write_all(&output.stdout)?;
-        csv.flush()?;
-    }
-    Ok(())
-}
+fn bench_taxi_in_list(c: &mut Criterion) {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let data_dir = env::var_os("TAXI_DATA_DIR");
+    let table = runtime
+        .block_on(taxi_table(data_dir.as_deref().map(Path::new)))
+        .unwrap();
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    let provider =
+        IcebergStaticTableProvider::try_new_from_table(table.table().clone()).unwrap();
+    ctx.register_table("taxi", Arc::new(provider)).unwrap();
 
-fn cpu() -> Duration {
-    Duration::try_from(clock_gettime(ClockId::ProcessCPUTime))
-        .expect("positive process CPU time")
-}
-
-fn ms(time: Duration) -> f64 {
-    time.as_secs_f64() * 1000.0
-}
-
-async fn measure(
-    metadata: &str,
-    keys: &str,
-    out: &str,
-    variant: &str,
-    block: &str,
-) -> Result<()> {
-    let state = SessionStateBuilder::new()
-        .with_default_features()
-        .with_config(SessionConfig::new().with_target_partitions(4))
-        .with_table_factory(
-            "ICEBERG".to_owned(),
-            Arc::new(IcebergTableProviderFactory::new()),
-        )
-        .build();
-    let ctx = SessionContext::new_with_state(state);
-    let metadata = metadata.replace('\'', "''");
-    ctx.sql(&format!(
-        "CREATE EXTERNAL TABLE taxi_keys STORED AS ICEBERG LOCATION '{metadata}'"
-    ))
-    .await?
-    .collect()
-    .await?;
-    let pool = fs::read_to_string(keys)?;
-    let pool = pool.lines().collect::<Vec<_>>();
-    let mut sizes = SIZES;
-    if block == "2" {
-        sizes.reverse();
-    }
-    for size in sizes {
-        let input = &pool[..size];
-        let literals = input
+    let mut group = c.benchmark_group("taxi_string_in_list");
+    group.sample_size(20).sampling_mode(SamplingMode::Flat);
+    let rows = TAXI_DAYS * TAXI_TRIPS_PER_DAY;
+    for size in [1, 16, 31, 32, 100, 369, 400, 1000] {
+        // This stride is coprime to the row count, so the keys span the daily files.
+        let mut expected: Vec<_> = (0..size)
+            .map(|i| resource_key((37_417 + i * 104_729) % rows))
+            .collect();
+        let literals = expected
             .iter()
             .map(|key| format!("'{key}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("SELECT {KEY} FROM taxi_keys WHERE {KEY} IN ({literals})");
-        let mut expected = input.to_vec();
-        expected.sort_unstable();
-        for run in 0..=RUNS_PER_BLOCK {
-            let start = Instant::now();
-            let start_cpu = cpu();
-            let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
-            let plan_wall = start.elapsed();
-            let plan_cpu = cpu() - start_cpu;
-            let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
-            let elapsed = start.elapsed();
-            let cpu_time = cpu() - start_cpu;
+        let sql =
+            format!("SELECT resource_key FROM taxi WHERE resource_key IN ({literals})");
+        let query = || async { ctx.sql(&sql).await.unwrap().collect().await.unwrap() };
 
-            let strings = batches
-                .iter()
-                .map(|batch| cast(batch.column(0), &DataType::Utf8))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut actual = strings
-                .iter()
-                .flat_map(|a| a.as_string::<i32>().iter())
-                .collect::<Option<Vec<_>>>()
-                .context("unexpected null key")?;
-            actual.sort_unstable();
-            ensure!(
-                actual == expected,
-                "wrong result for {size} keys on {variant}, run {run}"
-            );
-            if run == 0 {
-                if size == 400 && block == "1" {
-                    let explain = DisplayableExecutionPlan::with_metrics(plan.as_ref())
-                        .indent(false)
-                        .to_string();
-                    ensure!(
-                        explain.contains("FilterExec")
-                            && explain.contains("provider=lazy")
-                            && explain.contains("predicate=dd_resource_key IN"),
-                        "unexpected 400-key plan: {explain:.500}"
-                    );
-                    fs::write(
-                        Path::new(out).join(format!("{variant}-400-plan.txt")),
-                        explain,
-                    )?;
-                }
-            } else {
-                println!(
-                    "{variant},{block},{run},{size},{},{:.3},{:.3},{:.3},{:.3}",
-                    actual.len(),
-                    ms(elapsed),
-                    ms(cpu_time),
-                    ms(plan_wall),
-                    ms(plan_cpu)
-                );
+        let mut actual = Vec::new();
+        for batch in runtime.block_on(query()) {
+            for row in 0..batch.num_rows() {
+                actual.push(array_value_to_string(batch.column(0), row).unwrap());
             }
         }
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+
+        group.bench_function(BenchmarkId::from_parameter(size), |b| {
+            b.to_async(&runtime).iter(query);
+        });
     }
-    Ok(())
+    group.finish();
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
-    let args: Vec<_> = env::args().skip(1).collect();
-    match args.as_slice() {
-        [cmd, taxi, before, after, out] if cmd == "compare" => {
-            compare(taxi, before, after, out).await
-        }
-        [cmd, metadata, keys, out, variant, block] if cmd == "measure" => {
-            measure(metadata, keys, out, variant, block).await
-        }
-        _ => bail!(
-            "usage: taxi_in_list compare TAXI_DATA_DIR BASE_BINARY PATCHED_BINARY OUTPUT_DIR"
-        ),
-    }
-}
+criterion_group!(benches, bench_taxi_in_list);
+criterion_main!(benches);
