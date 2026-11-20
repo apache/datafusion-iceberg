@@ -15,17 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use super::file_scan_task_provider::{FileScanTaskProvider, FileScanTaskProviderContext};
-use crate::to_datafusion_error;
+use crate::{from_datafusion_error, to_datafusion_error};
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Statistics, exec_err};
-use datafusion::datasource::source::DataSource;
+use datafusion::config::ConfigOptions;
+use datafusion::datasource::source::{DataSource, OpenArgs};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
@@ -35,7 +37,7 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::SessionConfig;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 
@@ -231,6 +233,22 @@ impl DataSource for IcebergDataSource {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        self.open_with_args(OpenArgs::new(partition, context))
+    }
+
+    fn create_sibling_state(
+        &self,
+        _config: &ConfigOptions,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.file_scan_task_provider.create_sibling_state()
+    }
+
+    fn open_with_args(&self, args: OpenArgs) -> Result<SendableRecordBatchStream> {
+        let OpenArgs {
+            partition,
+            context,
+            sibling_state,
+        } = args;
         if partition >= self.output_partitioning().partition_count() {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
@@ -238,12 +256,13 @@ impl DataSource for IcebergDataSource {
             partition,
             FileScanTaskProviderContext {
                 task_context: &context,
+                sibling_state,
             },
         )?;
         let stream = self
             .reader
             .clone()
-            .read(tasks)
+            .read(tasks.map_err(from_datafusion_error).boxed())
             .map_err(to_datafusion_error)?
             .stream()
             .map_err(to_datafusion_error);
@@ -344,7 +363,7 @@ mod tests {
     use datafusion::common::Statistics;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::source::DataSource;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use iceberg::io::FileIO;
     use iceberg::spec::{
         FormatVersion, MAIN_BRANCH, NestedField, Operation, PartitionSpec, PrimitiveType,
@@ -420,7 +439,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        let context = SessionContext::new();
+        // One partition, so the fetch caps the whole scan rather than each of
+        // a machine-dependent number of partitions.
+        let context = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(1),
+        );
         let (schema, provider) =
             FileScanTaskProviderBuilder::new(context.task_ctx(), table.clone(), schema)
                 .with_projection(Some(&vec![0]))

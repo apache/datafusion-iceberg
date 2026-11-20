@@ -14,18 +14,24 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::any::Any;
 use std::fmt::Formatter;
+use std::ops::DerefMut;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
-use datafusion::common::{Result, Statistics, exec_err};
+use datafusion::common::{
+    DataFusionError, Result, Statistics, exec_datafusion_err, exec_err,
+};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
 use iceberg::spec::SnapshotRef;
 use iceberg::table::Table;
 
@@ -48,6 +54,51 @@ pub struct LazyFileScanTaskProvider {
     snapshot_id: Option<i64>,
     projection: Vec<String>,
     predicate: Option<Predicate>,
+    partitions: usize,
+}
+
+#[derive(Debug, Default)]
+enum StreamState {
+    #[default]
+    NotStarted,
+    Errored(Arc<DataFusionError>),
+    PartitionedFanout(PartitionedFanout),
+}
+
+#[derive(Debug)]
+struct PartitionedFanout {
+    task: Arc<SpawnedTask<()>>,
+    per_partition_feed: Vec<flume::Receiver<Result<FileScanTask>>>,
+}
+
+impl PartitionedFanout {
+    fn new(partitions: usize, mut stream: FileScanTaskStream) -> Self {
+        let (tx, rx) = flume::unbounded();
+        let task = SpawnedTask::spawn(async move {
+            while let Some(result) = stream.next().await {
+                // Every partition dropped its feed, e.g. under LIMIT or when the
+                // query was cancelled, so stop discovering files.
+                if tx.send(result.map_err(to_datafusion_error)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            task: Arc::new(task),
+            per_partition_feed: vec![rx; partitions],
+        }
+    }
+
+    fn pop_stream(&mut self) -> Result<impl Stream<Item = Result<FileScanTask>> + use<>> {
+        let Some(feed) = self.per_partition_feed.pop() else {
+            return exec_err!("Requested more FileScanTask streams than available");
+        };
+        let task = Arc::clone(&self.task);
+        Ok(feed.into_stream().inspect(move |_| {
+            // Keep the task alive as long as the stream is in scope.
+            let _ = &task;
+        }))
+    }
 }
 
 impl LazyFileScanTaskProvider {
@@ -65,12 +116,8 @@ impl LazyFileScanTaskProvider {
                 "Iceberg eager planning requires at least one target partition"
             );
         }
-        let mut tasks = Arc::new(self).open(
-            0,
-            FileScanTaskProviderContext {
-                task_context: &context,
-            },
-        )?;
+        let mut tasks = self.scan.plan_files().await.map_err(to_datafusion_error)?;
+
         let mut groups = Vec::new();
         let mut partition = 0;
         while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
@@ -232,6 +279,7 @@ impl FileScanTaskProviderBuilder {
             projection,
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
+            partitions: self.context.session_config().target_partitions(),
         };
         let provider: Arc<dyn FileScanTaskProvider> =
             if IcebergDataFusionConfig::from_config_or_default(
@@ -250,22 +298,53 @@ impl FileScanTaskProviderBuilder {
 
 impl FileScanTaskProvider for LazyFileScanTaskProvider {
     fn partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        Partitioning::UnknownPartitioning(self.partitions)
+    }
+
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(Arc::new(tokio::sync::Mutex::<StreamState>::default()))
     }
 
     fn open(
         self: Arc<Self>,
-        partition: usize,
-        _ctx: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream> {
-        if partition != 0 {
-            return exec_err!("Invalid Iceberg scan partition {partition}");
-        }
+        _partition: usize,
+        ctx: FileScanTaskProviderContext,
+    ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
         let scan = Arc::clone(&self.scan);
-        // Files are discovered when the stream is first polled, not here.
-        Ok(Box::pin(
-            futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
-        ))
+        let partitions = self.partitions;
+        let state = ctx
+            .sibling_state
+            .and_then(|state| state.downcast::<tokio::sync::Mutex<StreamState>>().ok())
+            .ok_or_else(|| {
+                exec_datafusion_err!("Missing sibling state for LazyFileScanTaskProvider")
+            })?;
+
+        // Files are discovered when the first stream is first polled, not here.
+        let stream = async move {
+            let mut state = state.lock().await;
+            match state.deref_mut() {
+                StreamState::NotStarted => {
+                    let file_scan_task_stream = match scan.plan_files().await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            let err = Arc::new(to_datafusion_error(err));
+                            *state = StreamState::Errored(Arc::clone(&err));
+                            return Err(DataFusionError::Shared(err));
+                        }
+                    };
+                    let mut partitioned_fanout =
+                        PartitionedFanout::new(partitions, file_scan_task_stream);
+                    let file_scan_task_stream = partitioned_fanout.pop_stream()?;
+                    *state = StreamState::PartitionedFanout(partitioned_fanout);
+                    Ok(file_scan_task_stream)
+                }
+                StreamState::Errored(err) => {
+                    Err(DataFusionError::Shared(Arc::clone(err)))
+                }
+                StreamState::PartitionedFanout(fanout) => fanout.pop_stream(),
+            }
+        };
+        Ok(futures::stream::once(stream).try_flatten().boxed())
     }
 
     /// Estimates the rows the scan returns before its predicate and fetch,

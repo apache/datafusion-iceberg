@@ -30,6 +30,7 @@ repository = { workspace = true }
 autotests = false
 
 [dependencies]
+flume = "0.12"
 async-trait = { workspace = true }
 bytes = "1"
 dashmap = "6"
