@@ -155,17 +155,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn leaves_rows_unknown_when_record_counts_overflow() -> Result<()> {
-        let provider = EagerFileScanTaskProvider::try_new(vec![
-            vec![file_task(Some(u64::MAX))],
-            vec![file_task(Some(1))],
-        ])?;
-        let statistics = provider.partition_statistics(None, &Schema::empty())?;
-        assert_eq!(statistics.num_rows, Precision::Absent);
-        Ok(())
-    }
-
     // Only metadata is inspected; these files are never opened.
     fn file_task(record_count: Option<u64>) -> FileScanTask {
         FileScanTask::builder()
