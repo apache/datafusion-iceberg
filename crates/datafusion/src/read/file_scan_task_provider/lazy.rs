@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::any::Any;
 use std::fmt::Formatter;
 use std::ops::DerefMut;
 use std::sync::Arc;
@@ -21,7 +22,9 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
-use datafusion::common::{DataFusionError, Result, Statistics, exec_err};
+use datafusion::common::{
+    DataFusionError, Result, Statistics, exec_datafusion_err, exec_err,
+};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
@@ -43,7 +46,7 @@ const TOTAL_RECORDS: &str = "total-records";
 
 /// Discovers files while executing, in a single partition: the files of a
 /// snapshot that may match a predicate.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
     table: Table,
     scan: Arc<TableScan>,
@@ -52,23 +55,6 @@ pub struct LazyFileScanTaskProvider {
     projection: Vec<String>,
     predicate: Option<Predicate>,
     partitions: usize,
-    state: Arc<tokio::sync::Mutex<StreamState>>,
-}
-
-impl Clone for LazyFileScanTaskProvider {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table.clone(),
-            scan: Arc::clone(&self.scan),
-            schema: Arc::clone(&self.schema),
-            snapshot_id: self.snapshot_id,
-            projection: self.projection.clone(),
-            predicate: self.predicate.clone(),
-            partitions: self.partitions,
-            // A clone starts its own discovery rather than sharing this one's.
-            state: Default::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -294,7 +280,6 @@ impl FileScanTaskProviderBuilder {
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
             partitions: self.context.session_config().target_partitions(),
-            state: Default::default(),
         };
         let provider: Arc<dyn FileScanTaskProvider> =
             if IcebergDataFusionConfig::from_config_or_default(
@@ -316,14 +301,23 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         Partitioning::UnknownPartitioning(self.partitions)
     }
 
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(Arc::new(tokio::sync::Mutex::<StreamState>::default()))
+    }
+
     fn open(
         self: Arc<Self>,
         _partition: usize,
-        _ctx: FileScanTaskProviderContext,
+        ctx: FileScanTaskProviderContext,
     ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
         let scan = Arc::clone(&self.scan);
         let partitions = self.partitions;
-        let state = Arc::clone(&self.state);
+        let state = ctx
+            .sibling_state
+            .and_then(|state| state.downcast::<tokio::sync::Mutex<StreamState>>().ok())
+            .ok_or_else(|| {
+                exec_datafusion_err!("Missing sibling state for LazyFileScanTaskProvider")
+            })?;
 
         // Files are discovered when the first stream is first polled, not here.
         let stream = async move {
