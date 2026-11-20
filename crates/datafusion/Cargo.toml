@@ -41,6 +41,8 @@ tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 
 [dev-dependencies]
+anyhow = { workspace = true }
+rustix = { version = "1", features = ["time"] }
 iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"
@@ -51,6 +53,10 @@ tempfile = "3.18"
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+[[bench]]
+name = "taxi_in_list"
+harness = false
 
 [lints]
 workspace = true
