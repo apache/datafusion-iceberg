@@ -112,23 +112,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_the_rows_returned_by_a_limited_iceberg_scan() -> Result<()> {
+    async fn reports_metrics_for_a_limited_iceberg_scan() -> Result<()> {
         let (_, explain) = IcebergTestHarness::builder()
             .with_iceberg_table_factory(IcebergTableProviderFactory::new())
             .with_table(create_taxi_table().await?)
-            // Only row counts, so the output doesn't vary between runs.
-            .with_config_option("datafusion.explain.analyze_categories", "rows")
+            // Exclude timing metrics, which vary between runs.
+            .with_config_option("datafusion.explain.analyze_categories", "rows,bytes")
             .query("EXPLAIN ANALYZE SELECT pickup_date FROM taxi LIMIT 3")
             .await?;
 
         insta::assert_snapshot!(explain, @r"
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type         | plan                                                                                                                                           |
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
-    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                    |
-    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3, metrics=[output_rows=3, output_batches=1, batches_split=0] |
-    |                   |                                                                                                                                                |
-    +-------------------+------------------------------------------------------------------------------------------------------------------------------------------------+
+    +-------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | plan_type         | plan                                                                                                                                                                                                        |
+    +-------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | Plan with Metrics | CooperativeExec, metrics=[]                                                                                                                                                                                 |
+    |                   |   DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, fetch=3, metrics=[output_rows=3, output_bytes=32.0 KB, output_batches=1, batches_split=0, files_opened=1, bytes_scanned=524.4 K] |
+    |                   |                                                                                                                                                                                                             |
+    +-------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
     ");
 
         Ok(())

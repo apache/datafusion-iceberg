@@ -31,11 +31,14 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::limit::LimitStream;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory, MetricType,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::SessionConfig;
-use futures::TryStreamExt;
+use futures::stream::poll_fn;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 
@@ -240,13 +243,31 @@ impl DataSource for IcebergDataSource {
                 task_context: &context,
             },
         )?;
-        let stream = self
+        let files_opened = MetricBuilder::new(&self.metrics)
+            .with_category(MetricCategory::Rows)
+            .counter("files_opened", partition);
+        let bytes_scanned = MetricBuilder::new(&self.metrics)
+            .with_type(MetricType::Summary)
+            .with_category(MetricCategory::Bytes)
+            .gauge("bytes_scanned", partition);
+
+        // Count files when the reader pulls their tasks, including read-ahead for LIMIT.
+        let tasks = tasks.inspect_ok(move |_| files_opened.add(1)).boxed();
+        let result = self
             .reader
             .clone()
             .read(tasks)
-            .map_err(to_datafusion_error)?
-            .stream()
-            .map_err(to_datafusion_error);
+            .map_err(to_datafusion_error)?;
+        // Reader bytes include data and delete files, but not manifest discovery.
+        let reader_metrics = result.metrics().clone();
+        let mut batches = result.stream().map_err(to_datafusion_error);
+        let stream = poll_fn(move |cx| {
+            let poll = batches.poll_next_unpin(cx);
+            if poll.is_ready() {
+                bytes_scanned.set(reader_metrics.bytes_read() as usize);
+            }
+            poll
+        });
         Ok(Box::pin(LimitStream::new(
             Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream)),
             0,
