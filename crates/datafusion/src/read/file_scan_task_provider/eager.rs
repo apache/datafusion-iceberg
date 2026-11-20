@@ -29,8 +29,7 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 
 /// Files discovered before execution, in groups that each become one output
 /// partition. Group order and empty groups are retained.
-/// Row estimates use the retained file record counts before predicates and
-/// deletes. Only an empty assignment reports an exact row count.
+/// Row estimates sum the retained file record counts before predicates and deletes.
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
@@ -94,24 +93,16 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             Some(partition) => &self.groups()[partition..=partition],
             None => self.groups(),
         };
-        let mut statistics = Statistics::new_unknown(schema);
-        if groups.iter().all(Vec::is_empty) {
-            statistics.num_rows = Precision::Exact(0);
-            statistics.total_byte_size = Precision::Exact(0);
-        } else {
-            // Record counts precede predicates and deletes. Keep them inexact even
-            // for unfiltered scans, so metadata cannot answer COUNT(*) directly.
-            statistics.num_rows = groups
-                .iter()
-                .flatten()
-                .try_fold(0_usize, |rows, task| {
-                    rows.checked_add(usize::try_from(task.record_count()?).ok()?)
-                })
-                .map(Precision::Inexact)
-                .unwrap_or(Precision::Absent);
-        }
-        // The source estimates projected output bytes, not compressed file sizes.
-        Ok(statistics)
+        let rows = groups.iter().flatten().try_fold(0_usize, |rows, task| {
+            rows.checked_add(usize::try_from(task.record_count()?).ok()?)
+        });
+        // Predicates and deletes may reduce a positive count, but cannot add rows.
+        let num_rows = match rows {
+            Some(0) => Precision::Exact(0),
+            Some(rows) => Precision::Inexact(rows),
+            None => Precision::Absent,
+        };
+        Ok(Statistics::new_unknown(schema).with_num_rows(num_rows))
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
@@ -145,6 +136,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_file_with_zero_records_has_exactly_zero_rows() -> Result<()> {
+        let provider =
+            EagerFileScanTaskProvider::try_new(vec![vec![file_task(Some(0))]])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Exact(0));
+        Ok(())
+    }
+
+    #[test]
     fn leaves_rows_unknown_when_a_task_has_no_record_count() -> Result<()> {
         let provider = EagerFileScanTaskProvider::try_new(vec![vec![
             file_task(Some(10)),
@@ -163,15 +163,6 @@ mod tests {
         ])?;
         let statistics = provider.partition_statistics(None, &Schema::empty())?;
         assert_eq!(statistics.num_rows, Precision::Absent);
-        Ok(())
-    }
-
-    #[test]
-    fn keeps_zero_file_record_counts_inexact() -> Result<()> {
-        let provider =
-            EagerFileScanTaskProvider::try_new(vec![vec![file_task(Some(0))]])?;
-        let statistics = provider.partition_statistics(None, &Schema::empty())?;
-        assert_eq!(statistics.num_rows, Precision::Inexact(0));
         Ok(())
     }
 

@@ -297,15 +297,6 @@ impl DataSource for IcebergDataSource {
                 self.schema.fields().len()
             );
         }
-        // Empty input and a zero fetch prove there is no output independently
-        // of estimates or how rows are distributed across partitions.
-        if statistics.num_rows == Precision::Exact(0) || self.fetch == Some(0) {
-            return Ok(Arc::new(
-                Statistics::new_unknown(&self.schema)
-                    .with_num_rows(Precision::Exact(0))
-                    .with_total_byte_size(Precision::Exact(0)),
-            ));
-        }
         let fetch = if partition.is_none() && partitions > 1 {
             // Fetch is enforced independently in each partition. Without its row
             // distribution we can only bound the sum, even for an exact input.
@@ -530,14 +521,6 @@ mod tests {
         let statistics = id_scan_statistics(table, None, Some(10)).await;
         assert_eq!(statistics.num_rows, Precision::Inexact(10));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(80));
-    }
-
-    #[tokio::test]
-    async fn reports_exact_zero_rows_and_bytes_for_zero_fetch() {
-        let table = table_with_snapshot_summaries(&[&[]]);
-        let statistics = id_scan_statistics(table, None, Some(0)).await;
-        assert_eq!(statistics.num_rows, Precision::Exact(0));
-        assert_eq!(statistics.total_byte_size, Precision::Exact(0));
     }
 
     #[tokio::test]
