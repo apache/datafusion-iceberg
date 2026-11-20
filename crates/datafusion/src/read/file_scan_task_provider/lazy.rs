@@ -25,6 +25,8 @@ use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use iceberg::expr::Predicate;
+use iceberg::scan::TableScan;
+use iceberg::spec::SnapshotRef;
 use iceberg::table::Table;
 
 use super::eager::EagerFileScanTaskProvider;
@@ -41,6 +43,7 @@ const TOTAL_RECORDS: &str = "total-records";
 #[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
     table: Table,
+    scan: Arc<TableScan>,
     schema: SchemaRef,
     snapshot_id: Option<i64>,
     projection: Vec<String>,
@@ -101,9 +104,16 @@ impl LazyFileScanTaskProvider {
         &self.projection
     }
 
-    /// Snapshot to scan, or the table's current one if `None`.
+    /// Explicit snapshot selection, or `None` if the current snapshot was requested.
+    /// Use [`Self::snapshot`] to inspect the snapshot resolved during planning.
     pub fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
+    }
+
+    /// Snapshot resolved during planning, shared by discovery and statistics.
+    /// Returns `None` only if the table has no current snapshot.
+    pub fn snapshot(&self) -> Option<&SnapshotRef> {
+        self.scan.snapshot()
     }
 
     /// Filter used to skip files, if any.
@@ -190,25 +200,37 @@ impl FileScanTaskProviderBuilder {
         self.with_predicate(convert_filters_to_predicate(filters))
     }
 
-    /// Validates projection and builds the configured eager or lazy provider.
+    /// Resolves the snapshot, validates projection and builds the configured provider.
     /// Lazy mode performs no file discovery; eager mode awaits [`LazyFileScanTaskProvider::into_eager`].
     /// The returned schema matches the columns selected by both implementations.
     ///
     /// # Errors
     ///
-    /// Returns projection errors, or discovery errors when eager planning is enabled.
+    /// Returns an error if the snapshot does not exist, projection or predicate
+    /// binding fails, or eager file discovery fails.
     pub async fn build(self) -> Result<(SchemaRef, Arc<dyn FileScanTaskProvider>)> {
         let schema = match self.projection {
             Some(projection) => Arc::new(self.schema.project(&projection)?),
             None => self.schema,
         };
-        let projection = schema
+        let projection: Vec<String> = schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        // TableScan resolves and retains the snapshot without discovering files.
+        // Keep that same scan for execution and its snapshot for statistics.
+        let mut scan = self.table.scan().select(&projection);
+        if let Some(snapshot_id) = self.snapshot_id {
+            scan = scan.snapshot_id(snapshot_id);
+        }
+        if let Some(predicate) = &self.predicate {
+            scan = scan.with_filter(predicate.clone());
+        }
+        let scan = Arc::new(scan.build().map_err(to_datafusion_error)?);
         let discovery = LazyFileScanTaskProvider {
             table: self.table,
+            scan,
             schema: Arc::clone(&schema),
             projection,
             snapshot_id: self.snapshot_id,
@@ -242,15 +264,7 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         if partition != 0 {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
-        let scan = match self.snapshot_id {
-            Some(snapshot_id) => self.table.scan().snapshot_id(snapshot_id),
-            None => self.table.scan(),
-        };
-        let mut scan = scan.select(&self.projection);
-        if let Some(predicate) = &self.predicate {
-            scan = scan.with_filter(predicate.clone());
-        }
-        let scan = scan.build().map_err(to_datafusion_error)?;
+        let scan = Arc::clone(&self.scan);
         // Files are discovered when the stream is first polled, not here.
         Ok(Box::pin(
             futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
@@ -278,18 +292,8 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
             return exec_err!("Invalid Iceberg scan partition {partition:?}");
         }
         let statistics = Statistics::new_unknown(schema);
-        let metadata = self.table.metadata();
-        let snapshot = match self.snapshot_id {
-            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
-            None => match metadata.current_snapshot() {
-                Some(snapshot) => Some(snapshot),
-                // The scan of a table with no current snapshot reads nothing.
-                None => return Ok(statistics.with_num_rows(Precision::Exact(0))),
-            },
-        };
-        // The scan fails on a snapshot id that doesn't exist.
-        let Some(snapshot) = snapshot else {
-            return Ok(statistics);
+        let Some(snapshot) = self.snapshot() else {
+            return Ok(statistics.with_num_rows(Precision::Exact(0)));
         };
         let num_rows = match snapshot
             .summary()
