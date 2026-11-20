@@ -47,6 +47,14 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
     /// projected schema.
     fn partitioning(&self) -> Partitioning;
 
+    /// Creates state shared by the partitions of one execution, passed to
+    /// [`Self::open`] through [`FileScanTaskProviderContext::sibling_state`].
+    /// The data source creates it once per execution, so re-executing a plan
+    /// after resetting its state starts afresh. Returns `None` by default.
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
     /// Streams the file tasks of `partition`, which is below the
     /// [`Self::partitioning`] partition count.
     fn open(
@@ -87,4 +95,7 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
 /// table, belong to the provider rather than the data source.
 pub struct FileScanTaskProviderContext<'a> {
     pub task_context: &'a Arc<TaskContext>,
+    /// The state from [`FileScanTaskProvider::create_sibling_state`] for this
+    /// execution, or `None` when the caller opens partitions on their own.
+    pub sibling_state: Option<Arc<dyn Any + Send + Sync>>,
 }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -25,7 +26,8 @@ use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Statistics, exec_err};
-use datafusion::datasource::source::DataSource;
+use datafusion::config::ConfigOptions;
+use datafusion::datasource::source::{DataSource, OpenArgs};
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionExprs;
@@ -231,6 +233,22 @@ impl DataSource for IcebergDataSource {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        self.open_with_args(OpenArgs::new(partition, context))
+    }
+
+    fn create_sibling_state(
+        &self,
+        _config: &ConfigOptions,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.file_scan_task_provider.create_sibling_state()
+    }
+
+    fn open_with_args(&self, args: OpenArgs) -> Result<SendableRecordBatchStream> {
+        let OpenArgs {
+            partition,
+            context,
+            sibling_state,
+        } = args;
         if partition >= self.output_partitioning().partition_count() {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
@@ -238,6 +256,7 @@ impl DataSource for IcebergDataSource {
             partition,
             FileScanTaskProviderContext {
                 task_context: &context,
+                sibling_state,
             },
         )?;
         let stream = self

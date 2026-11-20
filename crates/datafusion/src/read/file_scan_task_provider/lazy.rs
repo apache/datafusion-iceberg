@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
@@ -43,7 +44,9 @@ use crate::to_datafusion_error;
 const TOTAL_RECORDS: &str = "total-records";
 
 /// Plans file tasks during execution. A single partition reads the planning
-/// stream directly. Parallel readers take unclaimed files from one Flume queue.
+/// stream directly. Parallel scans use DataFusion sibling state: each reader
+/// takes unclaimed files from the same Flume queue, even if it opens late.
+/// Use `reset_plan_states` before executing the same parallel plan again.
 #[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
     table: Table,
@@ -53,18 +56,15 @@ pub struct LazyFileScanTaskProvider {
     projection: Vec<String>,
     predicate: Option<Predicate>,
     target_partitions: usize,
-    state: Arc<tokio::sync::Mutex<StreamState>>,
 }
 
-/// Shared discovery, initialized when the first reader is polled.
-#[derive(Debug)]
+/// Sibling state for one execution, initialized when its first reader is polled.
 enum StreamState {
     NotStarted,
     Errored(Arc<DataFusionError>),
     Ready(PartitionedFanout),
 }
 
-#[derive(Debug)]
 struct PartitionedFanout {
     producer: Arc<SpawnedTask<()>>,
     feeds: Vec<flume::Receiver<Result<FileScanTask>>>,
@@ -270,7 +270,6 @@ impl FileScanTaskProviderBuilder {
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
             target_partitions,
-            state: Arc::new(tokio::sync::Mutex::new(StreamState::NotStarted)),
         };
         if IcebergDataFusionConfig::from_config_or_default(self.context.session_config())
             .execution
@@ -288,10 +287,17 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         Partitioning::UnknownPartitioning(self.target_partitions)
     }
 
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        if self.target_partitions == 1 {
+            return None;
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(StreamState::NotStarted)))
+    }
+
     fn open(
         self: Arc<Self>,
         partition: usize,
-        _context: FileScanTaskProviderContext,
+        context: FileScanTaskProviderContext,
     ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
         if partition >= self.target_partitions {
             return exec_err!("Invalid Iceberg scan partition {partition}");
@@ -302,8 +308,16 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
                 .map_err(to_datafusion_error)
                 .boxed());
         }
+        let state = context
+            .sibling_state
+            .and_then(|state| state.downcast::<tokio::sync::Mutex<StreamState>>().ok())
+            .ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Parallel lazy scans require sibling state from DataSourceExec"
+                )
+            })?;
         let feed = async move {
-            let mut state = self.state.lock().await;
+            let mut state = state.lock().await;
             match &mut *state {
                 StreamState::Ready(fanout) => return fanout.open(),
                 StreamState::Errored(error) => {
