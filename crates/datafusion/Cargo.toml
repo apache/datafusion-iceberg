@@ -40,7 +40,12 @@ parquet = "59.2"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 
+[[bench]]
+name = "lazy_scan"
+harness = false
+
 [dev-dependencies]
+criterion = "0.8"
 iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"
