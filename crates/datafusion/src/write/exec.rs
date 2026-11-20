@@ -43,9 +43,7 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, TableLocationGenerator,
-};
+use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use uuid::Uuid;
 
@@ -276,7 +274,9 @@ impl ExecutionPlan for IcebergWriteExec {
             .map_err(to_datafusion_error)?;
 
         let file_io = self.table.file_io().clone();
-        let location_generator = TableLocationGenerator::new(self.table.metadata())
+        let location_generator = self
+            .table
+            .location_generator()
             .map_err(to_datafusion_error)?;
         // todo filename prefix/suffix should be configurable
         let file_name_generator =
