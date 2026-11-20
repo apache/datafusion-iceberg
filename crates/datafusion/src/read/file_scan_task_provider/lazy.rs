@@ -16,6 +16,7 @@
 // under the License.
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::task::Poll;
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::stats::Precision;
@@ -23,11 +24,12 @@ use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream};
 use iceberg::expr::Predicate;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTaskStream, TableScan};
 use iceberg::spec::SnapshotRef;
 use iceberg::table::Table;
+use tracing::{Instrument, field, info_span};
 
 use super::eager::EagerFileScanTaskProvider;
 use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
@@ -65,12 +67,7 @@ impl LazyFileScanTaskProvider {
                 "Iceberg eager planning requires at least one target partition"
             );
         }
-        let mut tasks = Arc::new(self).open(
-            0,
-            FileScanTaskProviderContext {
-                task_context: &context,
-            },
-        )?;
+        let mut tasks = discover_files(self.scan, true);
         let mut groups = Vec::new();
         let mut partition = 0;
         while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
@@ -194,6 +191,16 @@ impl FileScanTaskProviderBuilder {
     /// Returns an error if the snapshot does not exist, projection or predicate
     /// binding fails, or eager file discovery fails.
     pub async fn build(self) -> Result<Arc<dyn FileScanTaskProvider>> {
+        let eager = IcebergDataFusionConfig::from_config_or_default(
+            self.context.session_config(),
+        )
+        .execution
+        .eager_file_planning;
+        self.build_provider(eager).await
+    }
+
+    #[tracing::instrument(name = "iceberg.plan_scan", skip(self))]
+    async fn build_provider(self, eager: bool) -> Result<Arc<dyn FileScanTaskProvider>> {
         let projection: Vec<String> = self
             .projected_schema
             .fields()
@@ -218,15 +225,38 @@ impl FileScanTaskProviderBuilder {
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
         };
-        if IcebergDataFusionConfig::from_config_or_default(self.context.session_config())
-            .execution
-            .eager_file_planning
-        {
+        if eager {
             Ok(Arc::new(discovery.into_eager(self.context).await?))
         } else {
             Ok(Arc::new(discovery))
         }
     }
+}
+
+/// Capture the caller's span before handing the stream to the reader. File discovery
+/// remains deferred until the first poll.
+fn discover_files(scan: Arc<TableScan>, eager: bool) -> FileScanTaskStream {
+    let span = info_span!("iceberg.plan_files", eager, file_tasks = field::Empty);
+    Box::pin(
+        stream::once(async move {
+            let mut tasks = scan.plan_files().instrument(span.clone()).await?;
+            let mut file_tasks = 0usize;
+            Ok(stream::poll_fn(move |cx| {
+                span.in_scope(|| {
+                    let next = tasks.as_mut().poll_next(cx);
+                    match &next {
+                        Poll::Ready(Some(Ok(_))) => file_tasks += 1,
+                        Poll::Ready(None) => {
+                            span.record("file_tasks", file_tasks);
+                        }
+                        _ => {}
+                    }
+                    next
+                })
+            }))
+        })
+        .try_flatten(),
+    )
 }
 
 impl FileScanTaskProvider for LazyFileScanTaskProvider {
@@ -238,15 +268,11 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         self: Arc<Self>,
         partition: usize,
         _ctx: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream> {
+    ) -> Result<FileScanTaskStream> {
         if partition != 0 {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
-        let scan = Arc::clone(&self.scan);
-        // Files are discovered when the stream is first polled, not here.
-        Ok(Box::pin(
-            futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
-        ))
+        Ok(discover_files(Arc::clone(&self.scan), false))
     }
 
     /// Estimates the rows the scan returns before its predicate and fetch,
