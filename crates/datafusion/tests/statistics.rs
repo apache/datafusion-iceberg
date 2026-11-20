@@ -22,6 +22,23 @@ mod tests {
     use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
+    async fn lazy_snapshot_count_belongs_to_the_scan_not_either_reader() -> Result<()> {
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            .with_config_option("datafusion.execution.target_partitions", 2)
+            .build()
+            .await?;
+        let plan = harness.physical_plan("SELECT vendor_id FROM taxi").await?;
+        insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
+        all partitions (2): Rows=Inexact(175000), Bytes=Inexact(700000), [(Col[0]:)]
+        partition 0: Rows=Absent, Bytes=Absent, [(Col[0]:)]
+        partition 1: Rows=Absent, Bytes=Absent, [(Col[0]:)]
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reports_the_snapshot_row_count_to_datafusion() -> Result<()> {
         let (_, explain) = IcebergTestHarness::builder()
             .with_iceberg_table_factory(IcebergTableProviderFactory::new())

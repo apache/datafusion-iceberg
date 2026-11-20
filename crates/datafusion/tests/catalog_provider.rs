@@ -78,7 +78,10 @@ async fn test_provider_plan_stream_schema() -> Result<(), Box<dyn Error>> {
 
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await.unwrap();
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    assert_eq!(
+        plan.properties().partitioning.partition_count(),
+        ctx.copied_config().target_partitions()
+    );
     let stream = plan.execute(0, task_ctx).unwrap();
 
     // Ensure both the plan and the stream conform to the same schema

@@ -24,7 +24,7 @@ use datafusion::arrow::compute::{concat_batches, sort_to_indices, take_record_ba
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::collect;
 use iceberg::TableIdent;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
@@ -100,8 +100,11 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
     // The rows come from two data files, which may be read in either order.
     // They are joined under their own schema, not the plan's, so that a column
     // the plan does not report would show.
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    let batches = collect(plan.execute(0, ctx.task_ctx())?).await?;
+    assert_eq!(
+        plan.properties().partitioning.partition_count(),
+        ctx.copied_config().target_partitions()
+    );
+    let batches = collect(plan, ctx.task_ctx()).await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
     let sorted = take_record_batch(&batch, &order)?;

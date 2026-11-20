@@ -51,7 +51,7 @@ logical_plan
 01)Limit: skip=0, fetch=3
 02)--TableScan: default.default.query_test_table projection=[id, name, score, category], fetch=3
 physical_plan
-01)CooperativeExec
+01)CoalescePartitionsExec: fetch=3
 02)--DataSourceExec: format=iceberg, projection=[id, name, score, category], provider=lazy, fetch=3
 
 # Test SELECT * with ORDER BY and LIMIT

@@ -363,7 +363,7 @@ mod tests {
     use datafusion::common::Statistics;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::source::DataSource;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use iceberg::io::FileIO;
     use iceberg::spec::{
         FormatVersion, MAIN_BRANCH, NestedField, Operation, PartitionSpec, PrimitiveType,
@@ -440,7 +440,9 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let context = SessionContext::new();
+        let context = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(1),
+        );
         let provider = FileScanTaskProviderBuilder::new(
             context.task_ctx(),
             table.clone(),

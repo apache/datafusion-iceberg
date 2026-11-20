@@ -38,7 +38,7 @@ logical_plan
 02)--TableScan: default.default.test_boolean_table projection=[id, is_active, description], partial_filters=[default.default.test_boolean_table.is_active]
 physical_plan
 01)FilterExec: is_active@1
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, is_active, description], provider=lazy, predicate=is_active = true
 
 # Query with is_active = true
@@ -58,7 +58,7 @@ logical_plan
 02)--TableScan: default.default.test_boolean_table projection=[id, is_active, description], partial_filters=[NOT default.default.test_boolean_table.is_active]
 physical_plan
 01)FilterExec: NOT is_active@1
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, is_active, description], provider=lazy, predicate=is_active = false
 
 # Query with is_active = false
@@ -77,7 +77,7 @@ logical_plan
 02)--TableScan: default.default.test_boolean_table projection=[id, is_active, description], partial_filters=[NOT default.default.test_boolean_table.is_active]
 physical_plan
 01)FilterExec: NOT is_active@1
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, is_active, description], provider=lazy, predicate=is_active = false
 
 # Query with is_active != true (includes false and NULL)
