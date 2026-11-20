@@ -22,6 +22,8 @@ use datafusion::arrow::datatypes::Schema;
 use datafusion::common::{Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
+use futures::stream::BoxStream;
+use iceberg::scan::FileScanTask;
 
 /// Supplies the file tasks an [`IcebergDataSource`](crate::read::IcebergDataSource)
 /// reads, split into output partitions.
@@ -51,7 +53,7 @@ pub trait FileScanTaskProvider: Any + Debug + Send + Sync {
         self: Arc<Self>,
         partition: usize,
         context: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream>;
+    ) -> Result<BoxStream<'static, Result<FileScanTask>>>;
 
     /// Statistics before the source's fetch, without discovering or reading files.
     /// `None` requests the whole assignment; `Some(i)` requests partition `i`,

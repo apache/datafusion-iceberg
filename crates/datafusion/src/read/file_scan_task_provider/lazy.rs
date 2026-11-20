@@ -23,9 +23,10 @@ use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::expr::Predicate;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::spec::SnapshotRef;
 use iceberg::table::Table;
 
@@ -73,7 +74,7 @@ impl LazyFileScanTaskProvider {
         )?;
         let mut groups = Vec::new();
         let mut partition = 0;
-        while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
+        while let Some(task) = tasks.try_next().await? {
             if partition == groups.len() {
                 groups.push(Vec::new());
             }
@@ -238,15 +239,16 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         self: Arc<Self>,
         partition: usize,
         _ctx: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream> {
+    ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
         if partition != 0 {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
         let scan = Arc::clone(&self.scan);
         // Files are discovered when the stream is first polled, not here.
-        Ok(Box::pin(
-            futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
-        ))
+        Ok(stream::once(async move { scan.plan_files().await })
+            .try_flatten()
+            .map_err(to_datafusion_error)
+            .boxed())
     }
 
     /// Estimates the rows the scan returns before its predicate and fetch,
