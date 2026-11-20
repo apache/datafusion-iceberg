@@ -158,7 +158,7 @@ async fn eager_scan_with_no_matching_files_is_executable() -> Result<()> {
 }
 
 #[tokio::test]
-async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
+async fn replacing_the_provider_preserves_fetch_and_updates_statistics() -> Result<()> {
     let harness = IcebergTestHarness::builder()
         .with_iceberg_table_factory(IcebergTableProviderFactory::new())
         .with_table(create_taxi_table().await?)
@@ -187,6 +187,18 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
     let assigned_plan = DataSourceExec::from_data_source(assigned);
 
     insta::assert_snapshot!(displayable(assigned_plan.as_ref()).indent(true).to_string(), @"DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=1, fetch=2");
+
+    // Reassigning no files keeps the fetch, but proves every partition is empty.
+    let empty = source.with_file_scan_task_provider(Arc::new(
+        EagerFileScanTaskProvider::try_new(vec![vec![], vec![]])?,
+    ))?;
+    assert_eq!(empty.fetch(), Some(2));
+    let empty_plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(empty);
+    insta::assert_snapshot!(harness.source_statistics(&empty_plan)?, @"
+    all partitions (2): Rows=Exact(0), Bytes=Exact(0), [(Col[0]:)]
+    partition 0: Rows=Exact(0), Bytes=Exact(0), [(Col[0]:)]
+    partition 1: Rows=Exact(0), Bytes=Exact(0), [(Col[0]:)]
+    ");
     Ok(())
 }
 
