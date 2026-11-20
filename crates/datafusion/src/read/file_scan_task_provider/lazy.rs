@@ -119,13 +119,11 @@ impl LazyFileScanTaskProvider {
     }
 }
 
-/// Builds a task provider and its projected schema from a table scan request.
+/// Builds a task provider for the columns of a projected Arrow schema.
 ///
 /// Configuration is supplied at construction. `iceberg.execution.eager_file_planning`
 /// selects eager collection; otherwise discovery remains deferred until execution.
-/// The projected schema is returned alongside the provider so callers never need
-/// to recover it by downcasting an eager or lazy implementation. Reader settings
-/// and fetch belong to the data-source builder.
+/// Pass the same projected schema to [`crate::read::IcebergDataSource::builder`].
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -135,12 +133,10 @@ impl LazyFileScanTaskProvider {
 /// async fn plan_tasks(
 ///     context: Arc<TaskContext>,
 ///     table: Table,
-///     schema: SchemaRef,
-///     projection: Option<&Vec<usize>>,
+///     projected_schema: SchemaRef,
 ///     filters: &[Expr],
-/// ) -> Result<(SchemaRef, Arc<dyn FileScanTaskProvider>)> {
-///     FileScanTaskProviderBuilder::new(context, table, schema)
-///         .with_projection(projection)
+/// ) -> Result<Arc<dyn FileScanTaskProvider>> {
+///     FileScanTaskProviderBuilder::new(context, table, projected_schema)
 ///         .with_filters(filters)
 ///         .build()
 ///         .await
@@ -150,32 +146,25 @@ impl LazyFileScanTaskProvider {
 pub struct FileScanTaskProviderBuilder {
     context: Arc<TaskContext>,
     table: Table,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
+    projected_schema: SchemaRef,
     snapshot_id: Option<i64>,
     predicate: Option<Predicate>,
 }
 
 impl FileScanTaskProviderBuilder {
-    /// Starts with the planning context and the schema advertised by the table
-    /// provider. Projection indices refer to this schema, not the table's current
-    /// schema. Pass an already-projected schema and omit projection to retain it.
-    pub fn new(context: Arc<TaskContext>, table: Table, schema: SchemaRef) -> Self {
+    /// Selects the columns named in `projected_schema`, in schema order.
+    pub fn new(
+        context: Arc<TaskContext>,
+        table: Table,
+        projected_schema: SchemaRef,
+    ) -> Self {
         Self {
             context,
             table,
-            schema,
-            projection: None,
+            projected_schema,
             snapshot_id: None,
             predicate: None,
         }
-    }
-
-    /// Selects columns from the supplied schema in this order, or all its columns
-    /// for `None`. Indices are validated when [`Self::build`] is called.
-    pub fn with_projection(mut self, projection: Option<&Vec<usize>>) -> Self {
-        self.projection = projection.cloned();
-        self
     }
 
     /// Selects a snapshot, or the retained table's current snapshot for `None`.
@@ -199,18 +188,14 @@ impl FileScanTaskProviderBuilder {
 
     /// Resolves the snapshot, validates projection and builds the configured provider.
     /// Lazy mode performs no file discovery; eager mode awaits [`LazyFileScanTaskProvider::into_eager`].
-    /// The returned schema matches the columns selected by both implementations.
     ///
     /// # Errors
     ///
     /// Returns an error if the snapshot does not exist, projection or predicate
     /// binding fails, or eager file discovery fails.
-    pub async fn build(self) -> Result<(SchemaRef, Arc<dyn FileScanTaskProvider>)> {
-        let schema = match self.projection {
-            Some(projection) => Arc::new(self.schema.project(&projection)?),
-            None => self.schema,
-        };
-        let projection: Vec<String> = schema
+    pub async fn build(self) -> Result<Arc<dyn FileScanTaskProvider>> {
+        let projection: Vec<String> = self
+            .projected_schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
@@ -228,23 +213,19 @@ impl FileScanTaskProviderBuilder {
         let discovery = LazyFileScanTaskProvider {
             table: self.table,
             scan,
-            schema: Arc::clone(&schema),
+            schema: self.projected_schema,
             projection,
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
         };
-        let provider: Arc<dyn FileScanTaskProvider> =
-            if IcebergDataFusionConfig::from_config_or_default(
-                self.context.session_config(),
-            )
+        if IcebergDataFusionConfig::from_config_or_default(self.context.session_config())
             .execution
             .eager_file_planning
-            {
-                Arc::new(discovery.into_eager(self.context).await?)
-            } else {
-                Arc::new(discovery)
-            };
-        Ok((schema, provider))
+        {
+            Ok(Arc::new(discovery.into_eager(self.context).await?))
+        } else {
+            Ok(Arc::new(discovery))
+        }
     }
 }
 
