@@ -107,7 +107,7 @@ async fn run_source(
     ctx: &SessionContext,
 ) -> Result<String, Box<dyn Error>> {
     let exec = DataSourceExec::from_data_source(source.clone());
-    run(exec.as_ref(), ctx).await
+    run(&CoalescePartitionsExec::new(exec), ctx).await
 }
 
 /// Returns the first node of type `T` in `plan`, depth first.

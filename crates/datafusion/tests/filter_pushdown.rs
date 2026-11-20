@@ -49,8 +49,7 @@ mod tests {
             CoalescePartitionsExec
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@2 = 2024-01-10 AND (payment_type@1 = 1 OR payment_type@1 = 2) AND trip_distance@0 >= 2, projection=[]
-                  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance, payment_type, pickup_date], provider=lazy, predicate=((pickup_date = 2024-01-10) AND ((payment_type = 1) OR (payment_type = 2))) AND (trip_distance >= 2)
+                  DataSourceExec: format=iceberg, projection=[trip_distance, payment_type, pickup_date], provider=lazy, predicate=((pickup_date = 2024-01-10) AND ((payment_type = 1) OR (payment_type = 2))) AND (trip_distance >= 2)
         ");
         insta::assert_snapshot!(batches, @r"
         +-------+
@@ -86,8 +85,7 @@ mod tests {
                 RepartitionExec: partitioning=Hash([pickup_date@0], 16), input_partitions=16
                   AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                     FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
-                      RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                        DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+                      DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
         ");
         insta::assert_snapshot!(batches, @r"
     +-------------+-------+
@@ -115,8 +113,7 @@ mod tests {
             CoalescePartitionsExec
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: passenger_count@0 IS NULL, projection=[]
-                  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[passenger_count], provider=lazy, predicate=passenger_count IS NULL
+                  DataSourceExec: format=iceberg, projection=[passenger_count], provider=lazy, predicate=passenger_count IS NULL
         ");
         insta::assert_snapshot!(batches, @r"
         +-------+
@@ -148,8 +145,7 @@ mod tests {
             CoalescePartitionsExec
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@1 = 2024-01-10 AND trip_distance@0 + 1 > 3, projection=[]
-                  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
+                  DataSourceExec: format=iceberg, projection=[trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
         +-------+
@@ -176,8 +172,7 @@ mod tests {
             CoalescePartitionsExec
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: trip_distance@0 + 1 > 20, projection=[]
-                  RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance], provider=lazy
+                  DataSourceExec: format=iceberg, projection=[trip_distance], provider=lazy
         ");
         insta::assert_snapshot!(batches, @r"
         +-------+

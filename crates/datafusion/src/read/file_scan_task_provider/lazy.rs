@@ -14,18 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
-use datafusion::common::{Result, Statistics, exec_err};
+use datafusion::common::{
+    DataFusionError, Result, Statistics, exec_datafusion_err, exec_err,
+};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::Partitioning;
 use datafusion::prelude::Expr;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::expr::Predicate;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTask, FileScanTaskStream, TableScan};
 use iceberg::spec::SnapshotRef;
 use iceberg::table::Table;
 
@@ -38,8 +43,10 @@ use crate::to_datafusion_error;
 /// Snapshot summary field from the spec's "Optional Snapshot Summary Fields".
 const TOTAL_RECORDS: &str = "total-records";
 
-/// Discovers files while executing, in a single partition: the files of a
-/// snapshot that may match a predicate.
+/// Plans file tasks during execution. A single partition reads the planning
+/// stream directly. Parallel scans use DataFusion sibling state: each reader
+/// takes unclaimed files from the same Flume queue, even if it opens late.
+/// Use `reset_plan_states` before executing the same parallel plan again.
 #[derive(Debug, Clone)]
 pub struct LazyFileScanTaskProvider {
     table: Table,
@@ -48,10 +55,54 @@ pub struct LazyFileScanTaskProvider {
     snapshot_id: Option<i64>,
     projection: Vec<String>,
     predicate: Option<Predicate>,
+    target_partitions: usize,
+}
+
+/// Sibling state for one execution, initialized when its first reader is polled.
+enum StreamState {
+    NotStarted,
+    Errored(Arc<DataFusionError>),
+    Ready(PartitionedFanout),
+}
+
+struct PartitionedFanout {
+    producer: Arc<SpawnedTask<()>>,
+    feeds: Vec<flume::Receiver<Result<FileScanTask>>>,
+}
+
+impl PartitionedFanout {
+    fn new(partitions: usize, mut tasks: FileScanTaskStream) -> Self {
+        let (tx, rx) = flume::unbounded();
+        let producer = SpawnedTask::spawn(async move {
+            while let Some(task) = tasks.next().await {
+                if tx.send(task.map_err(to_datafusion_error)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            producer: Arc::new(producer),
+            feeds: vec![rx; partitions],
+        }
+    }
+
+    fn open(&mut self) -> Result<BoxStream<'static, Result<FileScanTask>>> {
+        let feed = self.feeds.pop().ok_or_else(|| {
+            exec_datafusion_err!("All file task streams have already been opened")
+        })?;
+        // Keep the producer alive even if the plan drops before its readers.
+        let producer = Arc::clone(&self.producer);
+        Ok(feed
+            .into_stream()
+            .inspect(move |_| {
+                let _ = &producer;
+            })
+            .boxed())
+    }
 }
 
 impl LazyFileScanTaskProvider {
-    /// Consumes discovery and retains its tasks in round-robin groups, using the
+    /// Collects the planned tasks into round-robin groups, using the
     /// context's target partition count. The result no longer retains the table.
     /// Empty discovery produces one empty group. Dropping this future drops the
     /// discovery stream; this method does not spawn a background collector.
@@ -65,12 +116,7 @@ impl LazyFileScanTaskProvider {
                 "Iceberg eager planning requires at least one target partition"
             );
         }
-        let mut tasks = Arc::new(self).open(
-            0,
-            FileScanTaskProviderContext {
-                task_context: &context,
-            },
-        )?;
+        let mut tasks = self.scan.plan_files().await.map_err(to_datafusion_error)?;
         let mut groups = Vec::new();
         let mut partition = 0;
         while let Some(task) = tasks.try_next().await.map_err(to_datafusion_error)? {
@@ -200,6 +246,12 @@ impl FileScanTaskProviderBuilder {
             .iter()
             .map(|field| field.name().clone())
             .collect();
+        let target_partitions = self.context.session_config().target_partitions();
+        if target_partitions == 0 {
+            return exec_err!(
+                "Iceberg file planning requires at least one target partition"
+            );
+        }
         // TableScan resolves and retains the snapshot without discovering files.
         // Keep that same scan for execution and its snapshot for statistics.
         let mut scan = self.table.scan().select(&projection);
@@ -217,6 +269,7 @@ impl FileScanTaskProviderBuilder {
             projection,
             snapshot_id: self.snapshot_id,
             predicate: self.predicate,
+            target_partitions,
         };
         if IcebergDataFusionConfig::from_config_or_default(self.context.session_config())
             .execution
@@ -231,22 +284,63 @@ impl FileScanTaskProviderBuilder {
 
 impl FileScanTaskProvider for LazyFileScanTaskProvider {
     fn partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        Partitioning::UnknownPartitioning(self.target_partitions)
+    }
+
+    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        if self.target_partitions == 1 {
+            return None;
+        }
+        Some(Arc::new(tokio::sync::Mutex::new(StreamState::NotStarted)))
     }
 
     fn open(
         self: Arc<Self>,
         partition: usize,
-        _ctx: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream> {
-        if partition != 0 {
+        context: FileScanTaskProviderContext,
+    ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
+        if partition >= self.target_partitions {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         }
-        let scan = Arc::clone(&self.scan);
-        // Files are discovered when the stream is first polled, not here.
-        Ok(Box::pin(
-            futures::stream::once(async move { scan.plan_files().await }).try_flatten(),
-        ))
+        if self.target_partitions == 1 {
+            return Ok(stream::once(async move { self.scan.plan_files().await })
+                .try_flatten()
+                .map_err(to_datafusion_error)
+                .boxed());
+        }
+        let state = context
+            .sibling_state
+            .and_then(|state| state.downcast::<tokio::sync::Mutex<StreamState>>().ok())
+            .ok_or_else(|| {
+                exec_datafusion_err!(
+                    "Parallel lazy scans require sibling state from DataSourceExec"
+                )
+            })?;
+        let feed = async move {
+            let mut state = state.lock().await;
+            match &mut *state {
+                StreamState::Ready(fanout) => return fanout.open(),
+                StreamState::Errored(error) => {
+                    return Err(DataFusionError::Shared(Arc::clone(error)));
+                }
+                StreamState::NotStarted => {}
+            }
+            match self.scan.plan_files().await {
+                Ok(tasks) => {
+                    let mut fanout =
+                        PartitionedFanout::new(self.target_partitions, tasks);
+                    let feed = fanout.open()?;
+                    *state = StreamState::Ready(fanout);
+                    Ok(feed)
+                }
+                Err(error) => {
+                    let error = Arc::new(to_datafusion_error(error));
+                    *state = StreamState::Errored(Arc::clone(&error));
+                    Err(DataFusionError::Shared(error))
+                }
+            }
+        };
+        Ok(stream::once(feed).try_flatten().boxed())
     }
 
     /// Estimates the rows the scan returns before its predicate and fetch,
@@ -266,13 +360,17 @@ impl FileScanTaskProvider for LazyFileScanTaskProvider {
         partition: Option<usize>,
         schema: &Schema,
     ) -> Result<Statistics> {
-        if partition.is_some_and(|partition| partition != 0) {
+        if partition.is_some_and(|partition| partition >= self.target_partitions) {
             return exec_err!("Invalid Iceberg scan partition {partition:?}");
         }
         let statistics = Statistics::new_unknown(schema);
         let Some(snapshot) = self.snapshot() else {
             return Ok(statistics.with_num_rows(Precision::Exact(0)));
         };
+        // Before discovery, no individual reader has an assigned share of the files.
+        if partition.is_some() && self.target_partitions > 1 {
+            return Ok(statistics);
+        }
         let num_rows = match snapshot
             .summary()
             .additional_properties
