@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion::arrow::datatypes::Schema;
+use datafusion::common::stats::Precision;
 use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
@@ -28,12 +29,10 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 
 /// Files discovered before execution, in groups that each become one output
 /// partition. Group order and empty groups are retained.
+/// Row estimates sum the retained file record counts before predicates and deletes.
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
-    /// Whole-assignment statistics retained when converting lazy discovery;
-    /// external assignments have no retained estimates.
-    pub(super) statistics: Option<Statistics>,
 }
 
 impl EagerFileScanTaskProvider {
@@ -48,10 +47,7 @@ impl EagerFileScanTaskProvider {
                 "An Iceberg task provider requires at least one file group"
             );
         }
-        Ok(Self {
-            file_scan_tasks,
-            statistics: None,
-        })
+        Ok(Self { file_scan_tasks })
     }
 
     /// All file tasks, in partition order and then group order.
@@ -93,12 +89,20 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
         if partition.is_some_and(|partition| partition >= self.groups().len()) {
             return exec_err!("Invalid Iceberg scan partition {partition:?}");
         }
-        if (partition.is_none() || self.groups().len() == 1)
-            && let Some(statistics) = &self.statistics
-        {
-            return Ok(statistics.clone());
-        }
-        Ok(Statistics::new_unknown(schema))
+        let groups = match partition {
+            Some(partition) => &self.groups()[partition..=partition],
+            None => self.groups(),
+        };
+        let rows = groups.iter().flatten().try_fold(0_usize, |rows, task| {
+            rows.checked_add(usize::try_from(task.record_count()?).ok()?)
+        });
+        // Predicates and deletes may reduce a positive count, but cannot add rows.
+        let num_rows = match rows {
+            Some(0) => Precision::Exact(0),
+            Some(rows) => Precision::Inexact(rows),
+            None => Precision::Absent,
+        };
+        Ok(Statistics::new_unknown(schema).with_num_rows(num_rows))
     }
 
     fn fmt_as(&self, f: &mut Formatter) -> std::fmt::Result {
@@ -122,5 +126,48 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataFileFormat, Schema as IcebergSchema};
+
+    use super::*;
+
+    #[test]
+    fn a_file_with_zero_records_has_exactly_zero_rows() -> Result<()> {
+        let provider =
+            EagerFileScanTaskProvider::try_new(vec![vec![file_task(Some(0))]])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Exact(0));
+        Ok(())
+    }
+
+    #[test]
+    fn leaves_rows_unknown_when_a_task_has_no_record_count() -> Result<()> {
+        let provider = EagerFileScanTaskProvider::try_new(vec![vec![
+            file_task(Some(10)),
+            file_task(None),
+        ]])?;
+        let statistics = provider.partition_statistics(None, &Schema::empty())?;
+        assert_eq!(statistics.num_rows, Precision::Absent);
+        Ok(())
+    }
+
+    // Only metadata is inspected; these files are never opened.
+    fn file_task(record_count: Option<u64>) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(1)
+            .with_record_count(record_count)
+            .with_data_file_path("data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(IcebergSchema::builder().build().unwrap()))
+            .with_project_field_ids(vec![])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 }

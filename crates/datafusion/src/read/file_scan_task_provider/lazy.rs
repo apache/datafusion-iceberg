@@ -65,7 +65,6 @@ impl LazyFileScanTaskProvider {
                 "Iceberg eager planning requires at least one target partition"
             );
         }
-        let statistics = self.partition_statistics(None, &self.schema)?;
         let mut tasks = Arc::new(self).open(
             0,
             FileScanTaskProviderContext {
@@ -84,9 +83,7 @@ impl LazyFileScanTaskProvider {
         if groups.is_empty() {
             groups.push(Vec::new());
         }
-        let mut provider = EagerFileScanTaskProvider::try_new(groups)?;
-        provider.statistics = Some(statistics);
-        Ok(provider)
+        EagerFileScanTaskProvider::try_new(groups)
     }
 
     /// Table retained for discovery, including its metadata and storage access.

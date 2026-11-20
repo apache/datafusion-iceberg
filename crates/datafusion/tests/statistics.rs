@@ -18,7 +18,7 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use iceberg_datafusion::IcebergTableProviderFactory;
+    use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
     use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
     #[tokio::test]
@@ -41,6 +41,41 @@ mod tests {
         +---------------+------------------------------------------------------------------------------------------------------------------------------------------------+
         ");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eager_statistics_count_only_the_selected_files() -> Result<()> {
+        // Taxi has seven daily files of 25,000 rows; the predicate selects two.
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
+            .with_session_extension(|mut state| {
+                state
+                    .config()
+                    .get_or_insert_default()
+                    .options_mut()
+                    .extensions
+                    .insert(IcebergDataFusionConfig::default());
+                state
+            })
+            .with_config_option("iceberg.execution.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 2)
+            .build()
+            .await?;
+
+        let plan = harness
+            .physical_plan(
+                "SELECT vendor_id FROM taxi \
+                 WHERE pickup_date IN (DATE '2024-01-10', DATE '2024-01-11')",
+            )
+            .await?;
+
+        insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
+        all partitions (2): Rows=Inexact(50000), Bytes=Inexact(400000), [(Col[0]:),(Col[1]:)]
+        partition 0: Rows=Inexact(25000), Bytes=Inexact(200000), [(Col[0]:),(Col[1]:)]
+        partition 1: Rows=Inexact(25000), Bytes=Inexact(200000), [(Col[0]:),(Col[1]:)]
+        ");
         Ok(())
     }
 }
