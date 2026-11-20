@@ -19,7 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use super::file_scan_task_provider::{FileScanTaskProvider, FileScanTaskProviderContext};
-use crate::to_datafusion_error;
+use crate::{from_datafusion_error, to_datafusion_error};
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::stats::Precision;
@@ -35,7 +35,7 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::SessionConfig;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 
@@ -243,7 +243,7 @@ impl DataSource for IcebergDataSource {
         let stream = self
             .reader
             .clone()
-            .read(tasks)
+            .read(tasks.map_err(from_datafusion_error).boxed())
             .map_err(to_datafusion_error)?
             .stream()
             .map_err(to_datafusion_error);
