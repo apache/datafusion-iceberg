@@ -491,10 +491,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_unknown_rows_for_a_missing_snapshot() {
+    async fn rejects_a_missing_snapshot_during_lazy_planning() {
         let table = table_with_snapshot_summaries(&[&[("total-records", "100")]]);
-        let statistics = id_scan_statistics(table, Some(2), None).await;
-        assert_eq!(statistics.num_rows, Precision::Absent);
+        let context = SessionContext::new();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let error = FileScanTaskProviderBuilder::new(context.task_ctx(), table, schema)
+            .with_snapshot_id(Some(2))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Snapshot with id 2 not found"));
     }
 
     #[tokio::test]
