@@ -21,6 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
+use datafusion::common::utils::project_schema;
 use datafusion::common::{config_datafusion_err, not_impl_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -139,12 +140,12 @@ impl TableProvider for IcebergCatalogTableProvider {
             .map_err(to_datafusion_error)?;
 
         // Create scan with fresh metadata (always use current snapshot).
-        let (schema, tasks) = FileScanTaskProviderBuilder::new(
+        let schema = project_schema(&self.schema, projection)?;
+        let tasks = FileScanTaskProviderBuilder::new(
             state.task_ctx(),
             table.clone(),
-            self.schema.clone(),
+            Arc::clone(&schema),
         )
-        .with_projection(projection)
         .with_filters(filters)
         .build()
         .await?;
