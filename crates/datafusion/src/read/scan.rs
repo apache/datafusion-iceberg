@@ -37,7 +37,7 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::SessionConfig;
-use futures::stream::unfold;
+use futures::stream::poll_fn;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
@@ -251,25 +251,23 @@ impl DataSource for IcebergDataSource {
             .with_category(MetricCategory::Bytes)
             .gauge("bytes_scanned", partition);
 
-        // Count tasks as the reader pulls them, including read-ahead for LIMIT.
-        // Update reader bytes on batches and EOF, even when no rows match.
-        let stream = self
+        // Count files when the reader pulls their tasks, including read-ahead for LIMIT.
+        let tasks = tasks.inspect_ok(move |_| files_opened.add(1)).boxed();
+        let result = self
             .reader
             .clone()
-            .read(tasks.inspect_ok(move |_| files_opened.add(1)).boxed())
-            .map(|result| {
-                let metrics = result.metrics().clone();
-                unfold(
-                    (result.stream(), metrics, bytes_scanned),
-                    |(mut stream, metrics, bytes_scanned)| async move {
-                        let batch = stream.next().await;
-                        bytes_scanned.set(metrics.bytes_read() as usize);
-                        batch.map(|batch| (batch, (stream, metrics, bytes_scanned)))
-                    },
-                )
-            })
-            .map_err(to_datafusion_error)?
-            .map_err(to_datafusion_error);
+            .read(tasks)
+            .map_err(to_datafusion_error)?;
+        // Reader bytes include data and delete files, but not manifest discovery.
+        let reader_metrics = result.metrics().clone();
+        let mut batches = result.stream().map_err(to_datafusion_error);
+        let stream = poll_fn(move |cx| {
+            let poll = batches.poll_next_unpin(cx);
+            if poll.is_ready() {
+                bytes_scanned.set(reader_metrics.bytes_read() as usize);
+            }
+            poll
+        });
         Ok(Box::pin(LimitStream::new(
             Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream)),
             0,
