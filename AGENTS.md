@@ -108,7 +108,7 @@ input
 
 - **`TaskWriter`** picks one of three writers: `UnpartitionedWriter`; `FanoutWriter` (accepts unsorted input, keeps many files open); or `ClusteredWriter` (requires sorted input, which is why the sort step exists).
 - **Writer limits:** only Parquet is supported. The writer honors `write.parquet.*` table properties and table encryption. It matches columns by name, because DataFusion batches carry no field IDs.
-- **`PartitionExpr`** is public and retains its partition spec and table schema so that distributed engines can serialize them and rebuild the expression on workers with `try_new`. Its equality and hash are by value; don't go back to pointer equality.
+- **`PartitionExpr`** is public and retains its partition spec and table schema so that distributed engines can serialize them and rebuild the expression on workers with `try_new`, passing the decoded children. Its children are the table's top-level columns, in table order, and it reads the batch only through them, so optimizer rules like `ProjectionPushdown` that move it onto a different input rewrite them like any other column reference. Its equality and hash are by value; don't go back to pointer equality.
 
 ### Errors
 
