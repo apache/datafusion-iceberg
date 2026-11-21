@@ -20,3 +20,12 @@
 # Apache Iceberg DataFusion Integration
 
 This crate contains the integration of Apache DataFusion and Apache Iceberg.
+
+### Tracing file discovery
+
+With an INFO-level `tracing` subscriber, a scan emits `iceberg.plan_scan` while
+building the task provider. With `iceberg.execution.eager_file_planning` enabled,
+`iceberg.plan_files` is a child of that span. Otherwise it appears during execution,
+when the reader opens the lazy file-task stream. Its lifetime can include time
+between polls; it is not a measure of S3 request latency. On exhaustion it records
+`file_tasks`, the number of successfully discovered tasks.
