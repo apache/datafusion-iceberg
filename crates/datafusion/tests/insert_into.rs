@@ -31,7 +31,7 @@ use iceberg::spec::{
     Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use iceberg_datafusion_test_tools::{FixtureCatalog, IcebergTestHarness, display_schema};
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -486,6 +486,69 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// With fanout disabled, only partitioned tables are sorted before writing:
+/// an unpartitioned table has no partition column to sort by.
+#[tokio::test]
+async fn inserts_into_an_unpartitioned_table_without_fanout() -> Result<(), Box<dyn Error>>
+{
+    let fixtures = FixtureCatalog::try_new().await?;
+    fixtures
+        .table(
+            TableIdent::from_strs(["default", "t"])?,
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "val", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()?,
+        )
+        .property("write.datafusion.fanout.enabled", "false")
+        .create()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_catalog(
+            "iceberg",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        )
+        // One partition keeps repartitioning out of the plan.
+        .with_config_option("datafusion.execution.target_partitions", 1)
+        .build()
+        .await?;
+
+    let (plan, count) = harness
+        .query("INSERT INTO iceberg.default.t VALUES (1, 10), (2, 20)")
+        .await?;
+    insta::assert_snapshot!(plan, @r#"
+    IcebergCommitExec: table=default.t, schema=[1: id: required int, 2: val: required int]
+      IcebergWriteExec: table=default.t, result_schema=Schema { fields: [Field { name: "data_files", data_type: LargeBinary }], metadata: {} }
+        ProjectionExec: expr=[column1@0 as id, column2@1 as val]
+          DataSourceExec: partitions=1, partition_sizes=[1]
+    "#);
+    insta::assert_snapshot!(count, @r"
+    +-------+
+    | count |
+    +-------+
+    | 2     |
+    +-------+
+    ");
+
+    let (_, rows) = harness
+        .query("SELECT * FROM iceberg.default.t ORDER BY id")
+        .await?;
+    insta::assert_snapshot!(rows, @r"
+    +----+-----+
+    | id | val |
+    +----+-----+
+    | 1  | 10  |
+    | 2  | 20  |
+    +----+-----+
+    ");
 
     Ok(())
 }

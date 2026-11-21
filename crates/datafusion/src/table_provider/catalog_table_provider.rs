@@ -207,7 +207,6 @@ impl TableProvider for IcebergCatalogTableProvider {
         let repartitioned_plan =
             repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
 
-        // Apply sort node when it's not fanout mode
         let fanout_enabled = table
             .metadata()
             .properties()
@@ -223,7 +222,10 @@ impl TableProvider for IcebergCatalogTableProvider {
             .transpose()?
             .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
 
-        let write_input = if fanout_enabled {
+        // Without fanout, a partitioned table is written by the clustered writer,
+        // which needs its input sorted by partition. Unpartitioned tables have no
+        // partition column to sort by.
+        let write_input = if fanout_enabled || partition_spec.is_unpartitioned() {
             repartitioned_plan
         } else {
             sort_by_partition(repartitioned_plan)?
