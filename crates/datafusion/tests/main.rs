@@ -28,3 +28,4 @@ mod plan_nodes;
 mod projection_pushdown;
 mod schema_evolution;
 mod statistics;
+mod table_lookup;

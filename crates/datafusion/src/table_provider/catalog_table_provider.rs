@@ -31,12 +31,10 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::error::to_datafusion_error;
-use crate::metadata::table::IcebergMetadataTableProvider;
 use crate::read::{FileScanTaskProviderBuilder, IcebergDataSource};
 use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
@@ -89,19 +87,6 @@ impl IcebergCatalogTableProvider {
             table_ident,
             schema,
         })
-    }
-
-    pub(crate) async fn metadata_table(
-        &self,
-        r#type: MetadataTableType,
-    ) -> Result<IcebergMetadataTableProvider> {
-        // Load fresh table metadata for metadata table access
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
-        IcebergMetadataTableProvider::try_new(table, r#type)
     }
 
     /// The catalog this provider loads its table from and commits through.
