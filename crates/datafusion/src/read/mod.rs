@@ -16,6 +16,7 @@
 // under the License.
 
 mod file_scan_task_provider;
+pub(crate) mod physical_predicate;
 pub(crate) mod predicate;
 pub(crate) mod scan;
 
@@ -23,5 +24,6 @@ pub use file_scan_task_provider::{
     EagerFileScanTaskProvider, FileScanTaskProvider, FileScanTaskProviderBuilder,
     FileScanTaskProviderContext, LazyFileScanTaskProvider,
 };
+pub use physical_predicate::convert_physical_filter_to_predicate;
 pub use predicate::convert_filters_to_predicate;
 pub use scan::{IcebergDataSource, IcebergDataSourceBuilder};
