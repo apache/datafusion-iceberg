@@ -205,7 +205,7 @@ impl TableProvider for IcebergCatalogTableProvider {
             })?;
 
         let repartitioned_plan =
-            repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
+            repartition(plan_with_partition, partition_spec, target_partitions)?;
 
         // Apply sort node when it's not fanout mode
         let fanout_enabled = table
