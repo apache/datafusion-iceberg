@@ -241,7 +241,7 @@ fn discover_files(scan: Arc<TableScan>, eager: bool) -> FileScanTaskStream {
         stream::once(async move {
             let mut tasks = scan.plan_files().instrument(span.clone()).await?;
             let mut file_tasks = 0usize;
-            Ok(stream::poll_fn(move |cx| {
+            Ok::<_, iceberg::Error>(stream::poll_fn(move |cx| {
                 span.in_scope(|| {
                     let next = tasks.as_mut().poll_next(cx);
                     match &next {
