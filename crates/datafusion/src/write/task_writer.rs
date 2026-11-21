@@ -301,6 +301,8 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     }
 }
 
+/// `RecordBatchPartitionSplitter::split` returns partitions in hash order. Remove this once the
+/// pinned iceberg-rust includes https://github.com/apache/iceberg-rust/issues/3753.
 fn sort_by_first_row(
     batch: &RecordBatch,
     partition_type: &StructType,
