@@ -31,7 +31,7 @@ use iceberg::spec::{
     Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use iceberg_datafusion_test_tools::{FixtureCatalog, IcebergTestHarness, display_schema};
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -486,6 +486,77 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// An INSERT whose input ends in a projection that renames and reorders columns gets
+/// the partition projection merged into it by the optimizer. The partition values
+/// must still come from the columns being written (#35).
+#[tokio::test]
+async fn test_insert_into_partitioned_through_reordering_projection()
+-> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    fixtures
+        .table(
+            TableIdent::from_strs(["default", "t"])?,
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "val", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()?,
+        )
+        .partition_by("id", Transform::Identity)
+        .create()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_catalog(
+            "iceberg",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        )
+        // One partition keeps repartitioning out of the plan.
+        .with_config_option("datafusion.execution.target_partitions", 1)
+        .build()
+        .await?;
+
+    // `id` is written from `column2`, the second source column, so the partition
+    // values must read `column2@1`, not the first column of the merged projection's
+    // input.
+    let (plan, count) = harness
+        .query(
+            "INSERT INTO iceberg.default.t
+             SELECT column2 AS id, column1 AS val FROM (VALUES (1, 100), (2, 200))",
+        )
+        .await?;
+    insta::assert_snapshot!(plan, @r#"
+    IcebergCommitExec: table=default.t, schema=[1: id: required int, 2: val: required int]
+      IcebergWriteExec: table=default.t, result_schema=Schema { fields: [Field { name: "data_files", data_type: LargeBinary }], metadata: {} }
+        ProjectionExec: expr=[column2@1 as id, column1@0 as val, iceberg_partition_values(id: identity(column2@1)) as _partition]
+          DataSourceExec: partitions=1, partition_sizes=[1]
+    "#);
+    insta::assert_snapshot!(count, @r"
+    +-------+
+    | count |
+    +-------+
+    | 2     |
+    +-------+
+    ");
+
+    // A filter on the partition column prunes files by their partition values, so it
+    // only finds the row if they're right.
+    let (_, rows) = harness
+        .query("SELECT * FROM iceberg.default.t WHERE id = 100")
+        .await?;
+    insta::assert_snapshot!(rows, @r"
+    +-----+-----+
+    | id  | val |
+    +-----+-----+
+    | 100 | 1   |
+    +-----+-----+
+    ");
 
     Ok(())
 }
