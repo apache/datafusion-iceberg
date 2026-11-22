@@ -28,7 +28,11 @@ use datafusion::common::{internal_err, not_impl_err, tree_node::TreeNodeRecursio
 use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, OrderingRequirements, Partitioning, PhysicalExpr,
+    PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -36,7 +40,7 @@ use datafusion::physical_plan::{
     execute_input_stream,
 };
 use futures::StreamExt;
-use iceberg::arrow::FieldMatchMode;
+use iceberg::arrow::{FieldMatchMode, PROJECTED_PARTITION_VALUE_COLUMN};
 use iceberg::spec::{
     DataFile, DataFileFormat, FormatVersion, StructType, write_data_files_to_avro,
 };
@@ -173,6 +177,25 @@ impl ExecutionPlan for IcebergWriteExec {
     /// Prevents the introduction of additional `RepartitionExec` and processing input in parallel.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
+    }
+
+    /// Without fanout, a partitioned table is written by the clustered writer, which
+    /// needs each task's rows sorted by `_partition`. An invalid fanout property
+    /// declares no requirement; `execute` reports it.
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        let metadata = self.table.metadata();
+        let fanout = metadata
+            .table_properties()
+            .write_datafusion_fanout_enabled();
+        let clustered = !metadata.default_partition_spec().is_unpartitioned()
+            && matches!(fanout, Ok(false));
+        let ordering = match col(PROJECTED_PARTITION_VALUE_COLUMN, &self.input.schema()) {
+            Ok(partition) if clustered => {
+                Some(LexOrdering::from([PhysicalSortExpr::new_default(partition)]).into())
+            }
+            _ => None,
+        };
+        vec![ordering]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {

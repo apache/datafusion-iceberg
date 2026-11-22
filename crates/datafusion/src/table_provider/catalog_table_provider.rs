@@ -32,7 +32,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
-use iceberg::spec::TableProperties;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::error::to_datafusion_error;
@@ -42,7 +41,6 @@ use crate::write::commit::IcebergCommitExec;
 use crate::write::exec::IcebergWriteExec;
 use crate::write::project::project_with_partition;
 use crate::write::repartition::repartition;
-use crate::write::sort::sort_by_partition;
 
 /// Catalog-backed table provider with automatic metadata refresh.
 ///
@@ -207,29 +205,8 @@ impl TableProvider for IcebergCatalogTableProvider {
         let repartitioned_plan =
             repartition(plan_with_partition, table.metadata_ref(), target_partitions)?;
 
-        // Apply sort node when it's not fanout mode
-        let fanout_enabled = table
-            .metadata()
-            .properties()
-            .get(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED)
-            .map(|value| {
-                value.parse::<bool>().map_err(|e| {
-                    config_datafusion_err!(
-                        "Invalid value for {}, expected 'true' or 'false': {e}",
-                        TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or(TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT);
-
-        let write_input = if fanout_enabled {
-            repartitioned_plan
-        } else {
-            sort_by_partition(repartitioned_plan)?
-        };
-
-        let write_plan = Arc::new(IcebergWriteExec::new(table.clone(), write_input));
+        let write_plan =
+            Arc::new(IcebergWriteExec::new(table.clone(), repartitioned_plan));
 
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));
@@ -511,170 +488,5 @@ mod tests {
             "test_table".to_string(),
             temp_dir,
         )
-    }
-
-    #[tokio::test]
-    async fn test_insert_plan_fanout_enabled_no_sort() {
-        use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::InsertOp;
-        use datafusion::physical_plan::empty::EmptyExec;
-
-        // When fanout is enabled (default), no sort node should be added
-        let (catalog, namespace, table_name, _temp_dir) =
-            get_partitioned_test_catalog_and_table(Some(true)).await;
-
-        let provider = IcebergCatalogTableProvider::try_new(
-            catalog.clone(),
-            namespace.clone(),
-            table_name.clone(),
-        )
-        .await
-        .unwrap();
-
-        let ctx = SessionContext::new();
-        let input_schema = provider.schema();
-        let input = Arc::new(EmptyExec::new(input_schema)) as Arc<dyn ExecutionPlan>;
-
-        let state = ctx.state();
-        let insert_plan = provider
-            .insert_into(&state, input, InsertOp::Append)
-            .await
-            .unwrap();
-
-        // With fanout enabled, there should be no SortExec in the plan
-        assert!(
-            !plan_contains_sort(&insert_plan),
-            "Plan should NOT contain SortExec when fanout is enabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_insert_plan_fanout_disabled_has_sort() {
-        use datafusion::datasource::TableProvider;
-        use datafusion::logical_expr::dml::InsertOp;
-        use datafusion::physical_plan::empty::EmptyExec;
-
-        // When fanout is disabled, a sort node should be added
-        let (catalog, namespace, table_name, _temp_dir) =
-            get_partitioned_test_catalog_and_table(Some(false)).await;
-
-        let provider = IcebergCatalogTableProvider::try_new(
-            catalog.clone(),
-            namespace.clone(),
-            table_name.clone(),
-        )
-        .await
-        .unwrap();
-
-        let ctx = SessionContext::new();
-        let input_schema = provider.schema();
-        let input = Arc::new(EmptyExec::new(input_schema)) as Arc<dyn ExecutionPlan>;
-
-        let state = ctx.state();
-        let insert_plan = provider
-            .insert_into(&state, input, InsertOp::Append)
-            .await
-            .unwrap();
-
-        // With fanout disabled, there should be a SortExec in the plan
-        assert!(
-            plan_contains_sort(&insert_plan),
-            "Plan should contain SortExec when fanout is disabled"
-        );
-    }
-
-    async fn get_partitioned_test_catalog_and_table(
-        fanout_enabled: Option<bool>,
-    ) -> (Arc<dyn Catalog>, NamespaceIdent, String, TempDir) {
-        use iceberg::spec::{Transform, UnboundPartitionField, UnboundPartitionSpec};
-
-        let temp_dir = TempDir::new().unwrap();
-        let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
-
-        let catalog = MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    warehouse_path.clone(),
-                )]),
-            )
-            .await
-            .unwrap();
-
-        let namespace = NamespaceIdent::new("test_ns".to_string());
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .unwrap();
-
-        let schema = Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
-                    .into(),
-                NestedField::required(
-                    2,
-                    "category",
-                    Type::Primitive(PrimitiveType::String),
-                )
-                .into(),
-            ])
-            .build()
-            .unwrap();
-
-        let partition_spec = UnboundPartitionSpec::builder()
-            .with_spec_id(0)
-            .add_partition_field(
-                UnboundPartitionField::builder()
-                    .source_ids(vec![2])
-                    .name("category")
-                    .transform(Transform::Identity)
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap()
-            .build();
-
-        let mut properties = HashMap::new();
-        if let Some(enabled) = fanout_enabled {
-            properties.insert(
-                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED.to_string(),
-                enabled.to_string(),
-            );
-        }
-
-        let table_creation = TableCreation::builder()
-            .name("partitioned_table".to_string())
-            .location(format!("{warehouse_path}/partitioned_table"))
-            .schema(schema)
-            .partition_spec(partition_spec)
-            .properties(properties)
-            .build();
-
-        catalog
-            .create_table(&namespace, table_creation)
-            .await
-            .unwrap();
-
-        (
-            Arc::new(catalog),
-            namespace,
-            "partitioned_table".to_string(),
-            temp_dir,
-        )
-    }
-
-    /// Helper to check if a plan contains a SortExec node.
-    fn plan_contains_sort(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        if plan.name() == "SortExec" {
-            return true;
-        }
-        for child in plan.children() {
-            if plan_contains_sort(child) {
-                return true;
-            }
-        }
-        false
     }
 }

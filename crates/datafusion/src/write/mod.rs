@@ -19,7 +19,6 @@ pub(crate) mod commit;
 pub(crate) mod exec;
 pub(crate) mod project;
 pub(crate) mod repartition;
-pub(crate) mod sort;
 pub(crate) mod task_writer;
 
 pub use commit::IcebergCommitExec;
