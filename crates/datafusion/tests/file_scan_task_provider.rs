@@ -229,9 +229,9 @@ async fn eager_file_statistics_apply_fetch_per_partition() -> Result<()> {
     // Each of the two file groups contributes three rows to the assignment.
     let plan = harness.physical_plan("SELECT id FROM items").await?;
     insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
-    all partitions (2): Rows=Inexact(6), Bytes=Inexact(48), [(Col[0]:)]
-    partition 0: Rows=Inexact(3), Bytes=Inexact(24), [(Col[0]:)]
-    partition 1: Rows=Inexact(3), Bytes=Inexact(24), [(Col[0]:)]
+    all partitions (2): Rows=Exact(6), Bytes=Exact(48), [(Col[0]:)]
+    partition 0: Rows=Exact(3), Bytes=Exact(24), [(Col[0]:)]
+    partition 1: Rows=Exact(3), Bytes=Exact(24), [(Col[0]:)]
     ");
 
     // Fetch caps each source partition at two rows, not the whole assignment.
@@ -240,8 +240,8 @@ async fn eager_file_statistics_apply_fetch_per_partition() -> Result<()> {
         .await?;
     insta::assert_snapshot!(harness.source_statistics(&plan)?, @"
     all partitions (2): Rows=Inexact(4), Bytes=Inexact(32), [(Col[0]:)]
-    partition 0: Rows=Inexact(2), Bytes=Inexact(16), [(Col[0]:)]
-    partition 1: Rows=Inexact(2), Bytes=Inexact(16), [(Col[0]:)]
+    partition 0: Rows=Exact(2), Bytes=Exact(16), [(Col[0]:)]
+    partition 1: Rows=Exact(2), Bytes=Exact(16), [(Col[0]:)]
     ");
     Ok(())
 }

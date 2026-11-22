@@ -17,9 +17,13 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::error::Result;
     use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
-    use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
+    use iceberg_datafusion_test_tools::{
+        IcebergTestHarness, ReadCountingStorageFactory, create_taxi_table,
+    };
 
     #[tokio::test]
     async fn reports_the_snapshot_row_count_to_datafusion() -> Result<()> {
@@ -76,6 +80,53 @@ mod tests {
         partition 0: Rows=Inexact(25000), Bytes=Inexact(200000), [(Col[0]:),(Col[1]:)]
         partition 1: Rows=Inexact(25000), Bytes=Inexact(200000), [(Col[0]:),(Col[1]:)]
         ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eager_count_star_is_answered_without_reading_data_files() -> Result<()> {
+        let storage = ReadCountingStorageFactory::default();
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(
+                IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
+                    storage.clone(),
+                )),
+            )
+            .with_table(create_taxi_table().await?)
+            .with_session_extension(|mut state| {
+                state
+                    .config()
+                    .get_or_insert_default()
+                    .options_mut()
+                    .extensions
+                    .insert(IcebergDataFusionConfig::default());
+                state
+            })
+            .with_config_option("iceberg.execution.eager_file_planning", true)
+            .with_config_option("datafusion.execution.target_partitions", 2)
+            .build()
+            .await?;
+
+        // Taxi has seven daily files of 25,000 rows and no deletes.
+        let (plan, _) = harness.query("SELECT count(*) FROM taxi").await?;
+        insta::assert_snapshot!(plan, @"
+        ProjectionExec: expr=[175000 as count(*)]
+          PlaceholderRowExec
+        ");
+        assert_eq!(storage.take_reads(), 0);
+
+        // A pushed-down predicate may drop rows, so the files are still read.
+        let (_, rows) = harness
+            .query("SELECT count(*) FROM taxi WHERE pickup_date = DATE '2024-01-10'")
+            .await?;
+        insta::assert_snapshot!(rows, @"
+        +----------+
+        | count(*) |
+        +----------+
+        | 25000    |
+        +----------+
+        ");
+        assert_ne!(storage.take_reads(), 0);
         Ok(())
     }
 }

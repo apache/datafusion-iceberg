@@ -29,7 +29,9 @@ use super::provider::{FileScanTaskProvider, FileScanTaskProviderContext};
 
 /// Files discovered before execution, in groups that each become one output
 /// partition. Group order and empty groups are retained.
-/// Row estimates sum the retained file record counts before predicates and deletes.
+/// Row counts sum the retained file record counts. The sum is exact when every
+/// task reads a whole file with no row predicate and no deletes, and an upper
+/// bound otherwise.
 #[derive(Debug)]
 pub struct EagerFileScanTaskProvider {
     file_scan_tasks: Vec<Vec<FileScanTask>>,
@@ -97,8 +99,10 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             rows.checked_add(usize::try_from(task.record_count()?).ok()?)
         });
         // Predicates and deletes may reduce a positive count, but cannot add rows.
+        let exact = groups.iter().flatten().all(returns_every_record);
         let num_rows = match rows {
             Some(0) => Precision::Exact(0),
+            Some(rows) if exact => Precision::Exact(rows),
             Some(rows) => Precision::Inexact(rows),
             None => Precision::Absent,
         };
@@ -129,9 +133,20 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
     }
 }
 
+/// Whether `task` reads a whole file with no row predicate and no deletes, so it
+/// returns exactly its record count.
+fn returns_every_record(task: &FileScanTask) -> bool {
+    task.predicate().is_none()
+        && task.deletes().is_empty()
+        && task.start() == 0
+        && task.length() == task.file_size_in_bytes()
+}
+
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataFileFormat, Schema as IcebergSchema};
+    use iceberg::expr::BoundPredicate;
+    use iceberg::scan::FileScanTaskDeleteFile;
+    use iceberg::spec::{DataContentType, DataFileFormat, Schema as IcebergSchema};
 
     use super::*;
 
@@ -155,18 +170,82 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn whole_files_without_predicates_or_deletes_have_an_exact_row_count() -> Result<()> {
+        let provider = EagerFileScanTaskProvider::try_new(vec![
+            vec![file_task(Some(10)), file_task(Some(5))],
+            vec![file_task(Some(7))],
+        ])?;
+        let schema = Schema::empty();
+        assert_eq!(
+            provider.partition_statistics(None, &schema)?.num_rows,
+            Precision::Exact(22)
+        );
+        assert_eq!(
+            provider.partition_statistics(Some(1), &schema)?.num_rows,
+            Precision::Exact(7)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_that_may_drop_rows_makes_only_its_partition_inexact() -> Result<()> {
+        let with_predicate = task(Some(10), 2, Some(BoundPredicate::AlwaysTrue), vec![]);
+        let with_delete = task(Some(10), 2, None, vec![position_delete_file()]);
+        let half_the_file = task(Some(10), 1, None, vec![]);
+        for inexact in [with_predicate, with_delete, half_the_file] {
+            let provider = EagerFileScanTaskProvider::try_new(vec![
+                vec![inexact],
+                vec![file_task(Some(7))],
+            ])?;
+            let schema = Schema::empty();
+            assert_eq!(
+                provider.partition_statistics(None, &schema)?.num_rows,
+                Precision::Inexact(17)
+            );
+            assert_eq!(
+                provider.partition_statistics(Some(1), &schema)?.num_rows,
+                Precision::Exact(7)
+            );
+        }
+        Ok(())
+    }
+
     // Only metadata is inspected; these files are never opened.
     fn file_task(record_count: Option<u64>) -> FileScanTask {
+        task(record_count, 2, None, vec![])
+    }
+
+    /// A task for `length` bytes of a two-byte file.
+    fn task(
+        record_count: Option<u64>,
+        length: u64,
+        predicate: Option<BoundPredicate>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+    ) -> FileScanTask {
         FileScanTask::builder()
-            .with_file_size_in_bytes(1)
+            .with_file_size_in_bytes(2)
             .with_start(0)
-            .with_length(1)
+            .with_length(length)
             .with_record_count(record_count)
             .with_data_file_path("data.parquet".to_string())
             .with_data_file_format(DataFileFormat::Parquet)
             .with_schema(Arc::new(IcebergSchema::builder().build().unwrap()))
             .with_project_field_ids(vec![])
+            .with_predicate(predicate)
+            .with_deletes(deletes)
             .with_case_sensitive(true)
+            .build()
+            .unwrap()
+    }
+
+    fn position_delete_file() -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile::builder()
+            .with_file_path("deletes.parquet".to_string())
+            .with_file_size_in_bytes(1)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
             .build()
             .unwrap()
     }
