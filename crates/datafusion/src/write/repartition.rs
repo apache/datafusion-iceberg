@@ -26,6 +26,8 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
 use iceberg::spec::{TableMetadata, TableMetadataRef, Transform};
+
+use crate::write::project::partition_values_column_index;
 /// Creates an Iceberg-aware repartition execution plan that optimizes data distribution
 /// for parallel processing while respecting Iceberg table partitioning semantics.
 ///
@@ -137,12 +139,12 @@ fn determine_partitioning_strategy(
         .iter()
         .any(|pf| matches!(pf.transform, Transform::Identity | Transform::Bucket(_)));
 
-    let partition_col_result = input_schema.index_of(PROJECTED_PARTITION_VALUE_COLUMN);
+    let partition_col_result = partition_values_column_index(&input_schema);
     let is_partitioned_table = !partition_spec.is_unpartitioned();
 
     match (is_partitioned_table, partition_col_result) {
         // Case 1: Partitioned table with _partition column present
-        (true, Ok(partition_col_idx)) => {
+        (true, Some(partition_col_idx)) => {
             let partition_expr = Arc::new(Column::new(
                 PROJECTED_PARTITION_VALUE_COLUMN,
                 partition_col_idx,
@@ -159,7 +161,7 @@ fn determine_partitioning_strategy(
         }
 
         // Case 2: Partitioned table missing _partition column (normally this should not happen)
-        (true, Err(_)) => plan_err!(
+        (true, None) => plan_err!(
             "Partitioned table input missing {PROJECTED_PARTITION_VALUE_COLUMN} column. \
              Ensure projection happens before repartitioning."
         ),
@@ -863,5 +865,73 @@ mod tests {
             matches!(partitioning, Partitioning::Hash(_, _)),
             "Should use Hash partitioning for _partition column with Identity transforms"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hash_partitioning_skips_a_partition_table_column() {
+        // The table has its own `_partition` column, before the appended partition values.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    PROJECTED_PARTITION_VALUE_COLUMN,
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let sort_order = SortOrder::builder().build(&schema).unwrap();
+        let table_metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            sort_order,
+            "/test/partition_column".to_string(),
+            iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let table = Table::builder()
+            .metadata(table_metadata.metadata)
+            .identifier(TableIdent::from_strs(["test", "partition_column"]).unwrap())
+            .file_io(FileIO::new_with_fs())
+            .metadata_location("/test/partition_column_metadata.json")
+            .runtime(Runtime::current())
+            .build()
+            .unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new(PROJECTED_PARTITION_VALUE_COLUMN, ArrowDataType::Utf8, false),
+            ArrowField::new(
+                PROJECTED_PARTITION_VALUE_COLUMN,
+                ArrowDataType::Struct(Fields::empty()),
+                false,
+            ),
+        ]));
+        let input = Arc::new(EmptyExec::new(arrow_schema));
+
+        let repartitioned_plan =
+            repartition(input, table.metadata_ref(), NonZeroUsize::new(4).unwrap())
+                .unwrap();
+
+        let Partitioning::Hash(exprs, _) =
+            repartitioned_plan.properties().output_partitioning()
+        else {
+            panic!("Should use Hash partitioning for Identity transforms");
+        };
+        let column = exprs[0].downcast_ref::<Column>().unwrap();
+        assert_eq!(column.index(), 2);
     }
 }

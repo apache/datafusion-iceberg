@@ -98,6 +98,19 @@ pub fn project_with_partition(
     Ok(Arc::new(projection))
 }
 
+/// Returns the index of the partition values column that [`project_with_partition`]
+/// appends to `schema`.
+///
+/// The column is appended after every table column, so a table column that is also
+/// named [`PROJECTED_PARTITION_VALUE_COLUMN`] comes before it. Looking the column up by
+/// name would find that table column instead.
+pub(crate) fn partition_values_column_index(schema: &ArrowSchema) -> Option<usize> {
+    schema
+        .fields()
+        .iter()
+        .rposition(|field| field.name() == PROJECTED_PARTITION_VALUE_COLUMN)
+}
+
 /// PhysicalExpr implementation for partition value calculation
 ///
 /// The [`PartitionValueCalculator`] cannot be serialized, so the spec and schema it

@@ -21,8 +21,9 @@
 //! of RecordBatch data to Iceberg tables.
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::common::exec_datafusion_err;
 use datafusion::error::Result;
-use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
 use iceberg::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use iceberg::writer::IcebergWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
@@ -31,6 +32,7 @@ use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::partitioning::unpartitioned_writer::UnpartitionedWriter;
 
 use crate::to_datafusion_error;
+use crate::write::project::partition_values_column_index;
 
 /// High-level writer for DataFusion that handles partitioning and routing of RecordBatch data.
 ///
@@ -223,10 +225,14 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let splitter = partition_splitter
             .as_ref()
             .expect("Partition splitter should be initialized");
-        let partitioned_batches = splitter.split(batch).map_err(to_datafusion_error)?;
+        let batch = partition_values_first(batch)?;
+        let partitioned_batches = splitter.split(&batch).map_err(to_datafusion_error)?;
 
         // Write each partition
         for (partition_key, partition_batch) in partitioned_batches {
+            // Drop the partition values so the data file gets only the table's columns.
+            let data_columns = (1..partition_batch.num_columns()).collect::<Vec<_>>();
+            let partition_batch = partition_batch.project(&data_columns)?;
             writer
                 .write(partition_key, partition_batch)
                 .await
@@ -271,6 +277,24 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
             }
         }
     }
+}
+
+/// Moves the partition values column that `project_with_partition` appended to the
+/// front of `batch`.
+///
+/// The splitter looks the column up by name and takes the first match, so a table
+/// column that is also named `_partition` would otherwise be read in its place.
+fn partition_values_first(batch: &RecordBatch) -> Result<RecordBatch> {
+    let partition_index =
+        partition_values_column_index(&batch.schema()).ok_or_else(|| {
+            exec_datafusion_err!(
+                "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
+            )
+        })?;
+    let columns = std::iter::once(partition_index)
+        .chain((0..batch.num_columns()).filter(|&index| index != partition_index))
+        .collect::<Vec<_>>();
+    Ok(batch.project(&columns)?)
 }
 
 #[cfg(test)]
@@ -565,6 +589,122 @@ mod tests {
         let partition_counts = verify_partition_files(&data_files, 4);
         assert_eq!(partition_counts.get("ASIA"), Some(&2));
         assert_eq!(partition_counts.get("EU"), Some(&2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_task_writer_partitioned_with_a_partition_table_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use datafusion::arrow::array::AsArray;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // `_partition` is both a table column and the partition values column.
+        let schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(
+                        2,
+                        PROJECTED_PARTITION_VALUE_COLUMN,
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(
+                        3,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()?,
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(1)
+                .add_partition_field(
+                    "region",
+                    "region",
+                    iceberg::spec::Transform::Identity,
+                )?
+                .build()?,
+        );
+        let partition_field = Field::new("region", DataType::Utf8, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1000".to_string())]),
+        );
+        let field_id = |id: &str| {
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())])
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(field_id("1")),
+            Field::new(PROJECTED_PARTITION_VALUE_COLUMN, DataType::Utf8, false)
+                .with_metadata(field_id("2")),
+            Field::new("region", DataType::Utf8, false).with_metadata(field_id("3")),
+            Field::new(
+                PROJECTED_PARTITION_VALUE_COLUMN,
+                DataType::Struct(vec![partition_field.clone()].into()),
+                false,
+            ),
+        ]));
+        // Sorted by region, so the clustered writer accepts it too.
+        let regions = vec!["EU", "EU", "US", "US"];
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["p1", "p2", "p3", "p4"])),
+                Arc::new(StringArray::from(regions.clone())),
+                Arc::new(StructArray::from(vec![(
+                    Arc::new(partition_field),
+                    Arc::new(StringArray::from(regions)) as ArrayRef,
+                )])),
+            ],
+        )?;
+
+        for fanout_enabled in [true, false] {
+            let temp_dir = TempDir::new()?;
+            let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
+            let mut task_writer = TaskWriter::try_new(
+                writer_builder,
+                fanout_enabled,
+                schema.clone(),
+                partition_spec.clone(),
+            )?;
+            task_writer.write(batch.clone()).await?;
+            let data_files = task_writer.close().await?;
+
+            let partition_counts = verify_partition_files(&data_files, 4);
+            assert_eq!(partition_counts.get("EU"), Some(&2));
+            assert_eq!(partition_counts.get("US"), Some(&2));
+
+            for data_file in &data_files {
+                let written = ParquetRecordBatchReaderBuilder::try_new(
+                    std::fs::File::open(data_file.file_path())?,
+                )?
+                .build()?
+                .collect::<Result<Vec<_>, _>>()?;
+                let written = &written[0];
+                let column_names = written
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    column_names,
+                    ["id", PROJECTED_PARTITION_VALUE_COLUMN, "region"]
+                );
+                let ids = written
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int32Type>();
+                let values = written.column(1).as_string::<i32>();
+                for row in 0..written.num_rows() {
+                    assert_eq!(values.value(row), format!("p{}", ids.value(row)));
+                }
+            }
+        }
 
         Ok(())
     }

@@ -23,6 +23,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, UInt64Array};
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -32,6 +33,7 @@ use iceberg::spec::{
 };
 use iceberg_datafusion::IcebergCatalogProvider;
 use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -486,6 +488,114 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_partitioned_table_with_a_partition_column()
+-> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+
+    // `_partition` is also the name of the column `project_with_partition` appends.
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(
+                2,
+                "_partition",
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+            NestedField::required(3, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let table_ident =
+        TableIdent::from_strs(["test_partition_column", "partitioned_table"])?;
+    fixtures
+        .table(table_ident.clone(), schema)
+        .partition_by("category", Transform::Identity)
+        .create()
+        .await?;
+
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+    );
+
+    let batches = ctx
+        .sql(
+            r#"
+            INSERT INTO catalog.test_partition_column.partitioned_table
+            VALUES
+                (1, 'p1', 'electronics'),
+                (2, 'p2', 'books'),
+                (3, 'p3', 'electronics'),
+                (4, 'p4', 'clothing')
+            "#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let rows_inserted = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(rows_inserted.value(0), 4);
+
+    // Read the data files directly: a scan that selects `_partition` resolves it to the
+    // metadata column of that name rather than the table column.
+    let table = fixtures.catalog().load_table(&table_ident).await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut partitions = HashSet::new();
+    let mut batches = Vec::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            let data_file = entry.data_file();
+            partitions.insert(data_file.partition().clone());
+            let bytes = table
+                .file_io()
+                .new_input(data_file.file_path())?
+                .read()
+                .await?;
+            batches.extend(
+                ParquetRecordBatchReaderBuilder::try_new(bytes)?
+                    .build()?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    assert_eq!(
+        partitions,
+        HashSet::from(
+            ["electronics", "books", "clothing"]
+                .map(|category| { Struct::from_iter([Some(Literal::string(category))]) })
+        )
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("written", concat_batches(&batches[0].schema(), &batches)?)?;
+    let batches = ctx
+        .sql("SELECT * FROM written ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +----+------------+-------------+
+    | id | _partition | category    |
+    +----+------------+-------------+
+    | 1  | p1         | electronics |
+    | 2  | p2         | books       |
+    | 3  | p3         | electronics |
+    | 4  | p4         | clothing    |
+    +----+------------+-------------+
+    ");
 
     Ok(())
 }

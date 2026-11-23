@@ -28,6 +28,8 @@ use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
 
+use crate::write::project::partition_values_column_index;
+
 /// Sorts an ExecutionPlan by partition values for Iceberg tables.
 ///
 /// This function takes an input ExecutionPlan that has been extended with partition values
@@ -48,8 +50,7 @@ pub(crate) fn sort_by_partition(
     let schema = input.schema();
 
     // Find the partition column in the schema
-    let (partition_column_index, _partition_field) = schema
-        .column_with_name(PROJECTED_PARTITION_VALUE_COLUMN)
+    let partition_column_index = partition_values_column_index(&schema)
         .ok_or_else(|| plan_datafusion_err!(
             "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in schema. Ensure the plan has been extended with partition values using project_with_partition."
         ))?;
@@ -243,5 +244,49 @@ mod tests {
         assert_eq!(id_col.value(1), 2);
         assert_eq!(id_col.value(2), 4);
         assert_eq!(id_col.value(3), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sort_by_partition_skips_a_partition_table_column() {
+        // The table has its own `_partition` column, before the appended partition values.
+        let partition_field = Field::new("id_partition", DataType::Int32, false);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(PROJECTED_PARTITION_VALUE_COLUMN, DataType::Utf8, false),
+            Field::new(
+                PROJECTED_PARTITION_VALUE_COLUMN,
+                DataType::Struct(Fields::from(vec![partition_field.clone()])),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 1, 2])),
+                // Already in order, so sorting on this column would leave the rows as is.
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StructArray::from(vec![(
+                    Arc::new(partition_field),
+                    Arc::new(Int32Array::from(vec![3, 1, 2])) as _,
+                )])),
+            ],
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let input = mem_table.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let sorted_plan = sort_by_partition(input).unwrap();
+        let result = datafusion::physical_plan::collect(sorted_plan, ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let id_col = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[1, 2, 3]);
     }
 }
