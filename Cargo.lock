@@ -3283,6 +3283,8 @@ dependencies = [
  "parquet",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
