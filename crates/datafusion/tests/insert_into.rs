@@ -28,10 +28,12 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use iceberg::TableIdent;
 use iceberg::spec::{
-    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, TableProperties,
+    Transform, Type,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use iceberg_datafusion_test_tools::{FixtureCatalog, data_file_name, display_schema};
+use regex::Regex;
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -488,4 +490,148 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_object_storage_layout_with_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let ctx = create_category_table(
+        &fixtures,
+        &[(
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            "true",
+        )],
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(
+        redacted_data_file_paths(&fixtures).await?,
+        ["<hash>/category=a/<file>"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_object_storage_layout_without_partition_paths()
+-> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let ctx = create_category_table(
+        &fixtures,
+        &[
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+                "true",
+            ),
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
+                "false",
+            ),
+        ],
+    )
+    .await?;
+
+    ctx.sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(
+        redacted_data_file_paths(&fixtures).await?,
+        ["<hash>-<file>"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_into_invalid_object_storage_enabled() -> Result<(), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let ctx = create_category_table(
+        &fixtures,
+        &[(
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            "yes",
+        )],
+    )
+    .await?;
+
+    let error = ctx
+        .sql("INSERT INTO catalog.ns.t VALUES (1, 'a')")
+        .await?
+        .collect()
+        .await
+        .unwrap_err();
+
+    insta::assert_snapshot!(error, @r"
+    IcebergError(DataInvalid)
+    caused by
+    Execution error: DataInvalid => Invalid value for write.object-storage.enabled: provided string was not `true` or `false`
+    ");
+
+    Ok(())
+}
+
+/// Creates `ns.t (id int, category string)`, identity-partitioned on `category`, with
+/// table `properties`, and returns a session with its catalog registered as `catalog`.
+async fn create_category_table(
+    fixtures: &FixtureCatalog,
+    properties: &[(&str, &str)],
+) -> Result<SessionContext, Box<dyn Error>> {
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::required(2, "category", Type::Primitive(PrimitiveType::String))
+                .into(),
+        ])
+        .build()?;
+    let mut table = fixtures
+        .table(TableIdent::from_strs(["ns", "t"])?, schema)
+        .partition_by("category", Transform::Identity);
+    for (key, value) in properties {
+        table = table.property(*key, *value);
+    }
+    table.create().await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "catalog",
+        Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+    );
+    Ok(ctx)
+}
+
+/// Returns the paths of `ns.t`'s data files relative to its data directory, sorted, with
+/// leading object-storage hash directories such as `0101/1100/0011/01010101` shown as
+/// `<hash>` and generated file names as `<file>`.
+async fn redacted_data_file_paths(
+    fixtures: &FixtureCatalog,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let hash = Regex::new("^[01]{4}/[01]{4}/[01]{4}/[01]{8}")?;
+    let file_name = Regex::new(r"[0-9a-f-]{36}-[0-9]{5}\.parquet$")?;
+
+    let table = fixtures
+        .catalog()
+        .load_table(&TableIdent::from_strs(["ns", "t"])?)
+        .await?;
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut paths = Vec::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            let path = data_file_name(entry.data_file().file_path());
+            let path = hash.replace(path, "<hash>");
+            paths.push(file_name.replace(&path, "<file>").into_owned());
+        }
+    }
+    paths.sort();
+
+    Ok(paths)
 }
