@@ -20,12 +20,17 @@ use iceberg::{Error, ErrorKind};
 
 /// Converts a datafusion error into an iceberg error.
 pub fn from_datafusion_error(error: DataFusionError) -> Error {
-    let fallback_message = error.to_string();
-    let DataFusionError::Context(context, error) = error else {
+    // Sibling readers can receive the same planning error.
+    let mut inner = &error;
+    while let DataFusionError::Shared(shared) = inner {
+        inner = shared;
+    }
+    let fallback_message = inner.to_string();
+    let DataFusionError::Context(context, error) = inner else {
         return unexpected_datafusion_error(fallback_message);
     };
 
-    let Some(kind) = parse_iceberg_error_kind(&context) else {
+    let Some(kind) = parse_iceberg_error_kind(context) else {
         return unexpected_datafusion_error(fallback_message);
     };
     let DataFusionError::Execution(message) = error.as_ref() else {
@@ -93,6 +98,13 @@ mod tests {
 
         assert_eq!(roundtripped.kind(), ErrorKind::DataInvalid);
         assert_eq!(roundtripped.to_string(), "DataInvalid => invalid manifest");
+    }
+
+    #[test]
+    fn preserves_the_kind_of_a_shared_planning_error() {
+        let error = Error::new(ErrorKind::DataInvalid, "invalid manifest");
+        let shared = DataFusionError::Shared(to_datafusion_error(error).into());
+        assert_eq!(from_datafusion_error(shared).kind(), ErrorKind::DataInvalid);
     }
 
     #[test]

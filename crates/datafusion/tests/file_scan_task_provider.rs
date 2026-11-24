@@ -22,14 +22,18 @@ use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::common::Result;
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::physical_plan::execution_plan::reset_plan_states;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, collect, displayable,
+};
 use futures::TryStreamExt;
 use iceberg::TableIdent;
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg_datafusion::read::{EagerFileScanTaskProvider, IcebergDataSource};
 use iceberg_datafusion::{IcebergDataFusionConfig, IcebergTableProviderFactory};
 use iceberg_datafusion_test_tools::{
-    FixtureCatalog, IcebergTestHarness, create_taxi_table,
+    FixtureCatalog, FixtureTable, IcebergTestHarness, ReadCountingStorageFactory,
+    create_taxi_table,
 };
 
 #[tokio::test]
@@ -57,8 +61,7 @@ async fn lazy_scan_filters_and_projects_taxi_rows() -> Result<()> {
             RepartitionExec: partitioning=Hash([pickup_date@0], 2), input_partitions=2
               AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
-                  RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+                  DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
     ");
     insta::assert_snapshot!(rows, @"
     +-------------+-------+
@@ -192,17 +195,7 @@ async fn replacing_the_provider_preserves_the_fetch_limit() -> Result<()> {
 
 #[tokio::test]
 async fn eager_file_statistics_apply_fetch_per_partition() -> Result<()> {
-    let fixtures = FixtureCatalog::try_new().await?;
-    let schema = Schema::builder()
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-        ])
-        .build()
-        .unwrap();
-    let mut table = fixtures
-        .table(TableIdent::from_strs(["default", "items"]).unwrap(), schema)
-        .create()
-        .await?;
+    let mut table = empty_items().await?;
     table
         .append()
         .file(id_batch(vec![1, 2, 3])?)
@@ -251,6 +244,7 @@ async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
     let harness = IcebergTestHarness::builder()
         .with_iceberg_table_factory(IcebergTableProviderFactory::new())
         .with_table(create_taxi_table().await?)
+        .with_config_option("datafusion.execution.target_partitions", 1)
         .with_config_option("datafusion.execution.batch_size", 2000)
         .build()
         .await?;
@@ -267,6 +261,131 @@ async fn the_scan_keeps_its_construction_time_reader_settings() -> Result<()> {
 
     assert_eq!(batches.iter().map(RecordBatch::num_rows).max(), Some(2000));
     Ok(())
+}
+
+#[tokio::test]
+async fn reset_scans_read_the_same_files_independently() -> Result<()> {
+    let mut table = empty_items().await?;
+    table
+        .append()
+        .file(id_batch(vec![1, 2])?)
+        .file(id_batch(vec![3, 4])?)
+        .commit()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(table)
+        .with_config_option("datafusion.execution.target_partitions", 4)
+        .build()
+        .await?;
+    let scan = harness.scan().await?;
+    assert_eq!(scan.output_partitioning().partition_count(), 4);
+    let next_run = reset_plan_states(scan.clone())?;
+    let context = harness.state().task_ctx();
+    let (original_rows, reset_rows) =
+        tokio::try_join!(collect(scan, context.clone()), collect(next_run, context),)?;
+
+    let expected = [
+        "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "+----+",
+    ];
+    datafusion::assert_batches_sorted_eq!(expected, &original_rows);
+    datafusion::assert_batches_sorted_eq!(expected, &reset_rows);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_partition_reads_only_the_unclaimed_file() -> Result<()> {
+    let mut table = empty_items().await?;
+    table
+        .append()
+        .file(id_batch(vec![1])?)
+        .file(id_batch(vec![2])?)
+        .commit()
+        .await?;
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(table)
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .build()
+        .await?;
+    let scan = harness.scan().await?;
+    let context = harness.state().task_ctx();
+
+    let mut active = scan.execute(0, context.clone())?;
+    let first = active.try_next().await?.expect("one row in the first file");
+    assert_eq!(first.num_rows(), 1);
+    drop(active);
+
+    let mut rows = scan.execute(1, context)?.try_collect::<Vec<_>>().await?;
+    rows.push(first);
+    datafusion::assert_batches_sorted_eq!(
+        ["+----+", "| id |", "+----+", "| 1  |", "| 2  |", "+----+"],
+        &rows
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lazy_scan_shares_a_position_delete_file_across_data_files() -> Result<()> {
+    let mut table = empty_items().await?;
+    let files = table
+        .append()
+        .file(id_batch(vec![1, 2])?)
+        .file(id_batch(vec![3, 4])?)
+        .commit()
+        .await?;
+    let deletes = table
+        .delete_positions(&[(&files[0], 0), (&files[1], 0)])
+        .await?;
+    let storage = ReadCountingStorageFactory::default();
+    let (_, rows) = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(
+            IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
+                storage.clone(),
+            )),
+        )
+        .with_table(table)
+        .with_config_option("datafusion.execution.target_partitions", 2)
+        .query("SELECT id FROM items ORDER BY id")
+        .await?;
+    insta::assert_snapshot!(rows, @"
+    +----+
+    | id |
+    +----+
+    | 2  |
+    | 4  |
+    +----+
+    ");
+    assert_eq!(storage.file_opens(deletes.file_path()), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lazy_scan_without_a_snapshot_is_empty() -> Result<()> {
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(empty_items().await?)
+        .with_config_option("datafusion.execution.target_partitions", 4)
+        .build()
+        .await?;
+    let plan = harness.scan().await?;
+    assert_eq!(plan.output_partitioning().partition_count(), 4);
+    assert!(collect(plan, harness.state().task_ctx()).await?.is_empty());
+    Ok(())
+}
+
+async fn empty_items() -> Result<FixtureTable> {
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .unwrap();
+    FixtureCatalog::try_new()
+        .await?
+        .table(TableIdent::from_strs(["default", "items"]).unwrap(), schema)
+        .create()
+        .await
 }
 
 fn id_batch(values: Vec<i64>) -> Result<RecordBatch> {

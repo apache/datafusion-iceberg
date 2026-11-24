@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::arrow::array::{RecordBatch, new_null_array};
+use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, new_null_array};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::{exec_err, not_impl_err};
@@ -29,9 +29,12 @@ use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::spec::{
     DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestListWriter,
     ManifestWriterBuilder, Operation, Snapshot, SnapshotSummaryCollector, Summary,
-    UNASSIGNED_SEQUENCE_NUMBER,
+    TableMetadata, UNASSIGNED_SEQUENCE_NUMBER,
 };
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::position_delete_writer::{
+    PositionDeleteFileWriterBuilder, position_delete_schema,
+};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
@@ -94,14 +97,7 @@ impl<'a> Append<'a> {
         let schema = metadata.current_schema().clone();
         let partition_spec = metadata.default_partition_spec().clone();
         let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).map_err(df_err)?);
-        let parent_snapshot_id = metadata.current_snapshot_id();
-        let snapshot_id = metadata
-            .snapshots()
-            .map(|s| s.snapshot_id())
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let sequence_number = metadata.next_sequence_number();
+        let snapshot_id = next_snapshot_id(metadata);
 
         let splitter = if partition_spec.is_unpartitioned() {
             None
@@ -151,7 +147,89 @@ impl<'a> Append<'a> {
             data_files.extend(writer.close().await.map_err(df_err)?);
         }
 
-        let mut manifest_writer = ManifestWriterBuilder::new(
+        self.table
+            .commit_files(&data_files, Operation::Append)
+            .await?;
+        Ok(data_files)
+    }
+}
+
+impl FixtureTable {
+    /// Commits one shared position-delete file for an unpartitioned V2 table.
+    /// Each pair identifies a zero-based row in a previously appended file.
+    pub async fn delete_positions(
+        &mut self,
+        rows: &[(&DataFile, i64)],
+    ) -> Result<DataFile> {
+        let table = self.table();
+        let metadata = table.metadata();
+        if metadata.format_version() != FormatVersion::V2
+            || !metadata.default_partition_spec().is_unpartitioned()
+        {
+            return not_impl_err!(
+                "fixture position deletes require an unpartitioned V2 table"
+            );
+        }
+        if rows.is_empty()
+            || rows
+                .iter()
+                .any(|(file, pos)| *pos < 0 || *pos as u64 >= file.record_count())
+        {
+            return exec_err!("expected at least one valid position to delete");
+        }
+        let mut rows: Vec<_> = rows
+            .iter()
+            .map(|(file, pos)| (file.file_path(), *pos))
+            .collect();
+        rows.sort_unstable();
+        let (paths, positions): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        let schema = position_delete_schema();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&schema).map_err(df_err)?),
+            vec![
+                Arc::new(StringArray::from(paths)),
+                Arc::new(Int64Array::from(positions)),
+            ],
+        )?;
+        let mut writer =
+            PositionDeleteFileWriterBuilder::new(RollingFileWriterBuilder::new(
+                ParquetWriterBuilder::new(WriterProperties::default(), schema),
+                usize::MAX,
+                table.file_io().clone(),
+                DefaultLocationGenerator::new(metadata).map_err(df_err)?,
+                DefaultFileNameGenerator::new(
+                    format!("deletes-{}", next_snapshot_id(metadata)),
+                    None,
+                    DataFileFormat::Parquet,
+                ),
+            ))
+            .build(None)
+            .await
+            .map_err(df_err)?;
+        writer.write(batch).await.map_err(df_err)?;
+        let files = writer.close().await.map_err(df_err)?;
+        let Ok([delete]) = <[DataFile; 1]>::try_from(files) else {
+            return exec_err!("expected one position-delete file");
+        };
+        self.commit_files(std::slice::from_ref(&delete), Operation::Delete)
+            .await?;
+        Ok(delete)
+    }
+
+    async fn commit_files(
+        &mut self,
+        files: &[DataFile],
+        operation: Operation,
+    ) -> Result<()> {
+        let table = self.table();
+        let metadata = table.metadata();
+        let file_io = table.file_io();
+        let schema = metadata.current_schema().clone();
+        let partition_spec = metadata.default_partition_spec().clone();
+        let snapshot_id = next_snapshot_id(metadata);
+        let parent_snapshot_id = metadata.current_snapshot_id();
+        let sequence_number = metadata.next_sequence_number();
+        let builder = ManifestWriterBuilder::new(
             file_io
                 .new_output(format!(
                     "{}/metadata/snap-{snapshot_id}-m0.avro",
@@ -161,10 +239,14 @@ impl<'a> Append<'a> {
             Some(snapshot_id),
             schema.clone(),
             partition_spec.as_ref().clone(),
-        )
-        .build_v2_data();
+        );
+        let mut manifest_writer = if operation == Operation::Delete {
+            builder.build_v2_deletes()
+        } else {
+            builder.build_v2_data()
+        };
         let mut summary = SnapshotSummaryCollector::default();
-        for data_file in &data_files {
+        for data_file in files {
             manifest_writer
                 .add_file(data_file.clone(), UNASSIGNED_SEQUENCE_NUMBER)
                 .map_err(df_err)?;
@@ -210,7 +292,7 @@ impl<'a> Append<'a> {
             .with_timestamp_ms(now_ms())
             .with_manifest_list(manifest_list)
             .with_summary(Summary {
-                operation: Operation::Append,
+                operation,
                 additional_properties: with_totals(
                     summary.build(),
                     metadata.current_snapshot().map(|parent| parent.summary()),
@@ -220,15 +302,23 @@ impl<'a> Append<'a> {
             .build();
         let metadata = metadata
             .clone()
-            .into_builder(Some(self.table.metadata_location()?.to_string()))
+            .into_builder(Some(self.metadata_location()?.to_string()))
             .set_branch_snapshot(snapshot, MAIN_BRANCH)
             .map_err(df_err)?
             .build()
             .map_err(df_err)?
             .metadata;
-        self.table.commit(metadata).await?;
-        Ok(data_files)
+        self.commit(metadata).await
     }
+}
+
+fn next_snapshot_id(metadata: &TableMetadata) -> i64 {
+    metadata
+        .snapshots()
+        .map(|s| s.snapshot_id())
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 /// Returns `batch` laid out as `schema`: its columns matched by name, put in

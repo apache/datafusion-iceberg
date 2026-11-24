@@ -20,6 +20,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::physical_plan::Partitioning;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use iceberg::scan::FileScanTask;
 use std::collections::BTreeSet;
 use std::fmt::Formatter;
@@ -70,7 +71,7 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
         self: Arc<Self>,
         partition: usize,
         _context: FileScanTaskProviderContext,
-    ) -> Result<iceberg::scan::FileScanTaskStream> {
+    ) -> Result<BoxStream<'static, Result<FileScanTask>>> {
         let Some(count) = self.groups().get(partition).map(Vec::len) else {
             return exec_err!("Invalid Iceberg scan partition {partition}");
         };

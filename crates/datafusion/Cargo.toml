@@ -33,6 +33,7 @@ autotests = false
 async-trait = { workspace = true }
 bytes = "1"
 dashmap = "6"
+flume = "0.12"
 datafusion = { workspace = true }
 futures = "0.3"
 iceberg = { workspace = true }
@@ -40,7 +41,12 @@ parquet = "59.2"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 
+[[bench]]
+name = "lazy_scan"
+harness = false
+
 [dev-dependencies]
+criterion = "0.8"
 iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
 parquet = "59.2"

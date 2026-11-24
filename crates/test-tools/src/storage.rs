@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,9 +40,16 @@ use serde::{Deserialize, Serialize};
 pub struct ReadCountingStorageFactory {
     #[serde(skip)]
     reads: Arc<AtomicUsize>,
+    #[serde(skip)]
+    opens: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl ReadCountingStorageFactory {
+    /// Number of readers opened for a particular Parquet file, independent of range reads.
+    pub fn file_opens(&self, path: &str) -> usize {
+        self.opens.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
     /// Returns how many byte ranges have been read from data files since the
     /// last call, and resets the count.
     pub fn take_reads(&self) -> usize {
@@ -54,6 +62,7 @@ impl StorageFactory for ReadCountingStorageFactory {
     fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(ReadCountingStorage {
             reads: self.reads.clone(),
+            opens: self.opens.clone(),
         }))
     }
 }
@@ -62,6 +71,8 @@ impl StorageFactory for ReadCountingStorageFactory {
 struct ReadCountingStorage {
     #[serde(skip)]
     reads: Arc<AtomicUsize>,
+    #[serde(skip)]
+    opens: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[async_trait]
@@ -80,6 +91,12 @@ impl Storage for ReadCountingStorage {
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        *self
+            .opens
+            .lock()
+            .unwrap()
+            .entry(path.to_owned())
+            .or_default() += 1;
         Ok(Box::new(CountingFileRead {
             inner: LocalFsStorage::new().reader(path).await?,
             reads: self.reads.clone(),

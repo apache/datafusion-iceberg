@@ -40,7 +40,7 @@ logical_plan
 03)----TableScan: default.default.test_cast_table projection=[id, d], partial_filters=[CAST(default.default.test_cast_table.d AS Timestamp(ns)) < TimestampNanosecond(1672920000000000000, None)]
 physical_plan
 01)FilterExec: CAST(d@1 AS Timestamp(ns)) < 1672920000000000000, projection=[id@0]
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, d], provider=lazy
 
 query I rowsort
@@ -73,7 +73,7 @@ logical_plan
 03)----TableScan: default.default.test_cast_table projection=[id, n], partial_filters=[CAST(default.default.test_cast_table.n AS Utf8) < Utf8("5")]
 physical_plan
 01)FilterExec: CAST(n@1 AS Utf8) < 5, projection=[id@0]
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, n], provider=lazy
 
 query I rowsort
@@ -108,7 +108,7 @@ logical_plan
 03)----TableScan: default.default.test_float_cast_table projection=[id, x], partial_filters=[CAST(default.default.test_float_cast_table.x AS Float64) > Float64(0.1)]
 physical_plan
 01)FilterExec: CAST(x@1 AS Float64) > 0.1, projection=[id@0]
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, x], provider=lazy
 
 query I rowsort
@@ -137,7 +137,7 @@ logical_plan
 03)----TableScan: default.default.test_isnan_cast_table projection=[id, s], partial_filters=[NOT isnan(CAST(default.default.test_isnan_cast_table.s AS Float64))]
 physical_plan
 01)FilterExec: NOT isnan(CAST(s@1 AS Float64)), projection=[id@0]
-02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+02)--CooperativeExec
 03)----DataSourceExec: format=iceberg, projection=[id, s], provider=lazy
 
 query I rowsort
