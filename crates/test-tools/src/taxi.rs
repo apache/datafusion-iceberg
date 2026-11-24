@@ -59,6 +59,13 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// files until dropped. Each file is a single row group with column chunk
 /// statistics but without page indexes.
 pub async fn create_taxi_table() -> Result<FixtureTable> {
+    create_taxi_table_with_row_group_size(TAXI_TRIPS_PER_DAY).await
+}
+
+/// Creates the same taxi fixture with at most `rows_per_group` trips per Parquet row group.
+pub async fn create_taxi_table_with_row_group_size(
+    rows_per_group: usize,
+) -> Result<FixtureTable> {
     let fixtures = FixtureCatalog::try_new().await?;
     let ident = TableIdent::from_strs(["default", "taxi"]).map_err(df_err)?;
     let mut table = fixtures
@@ -68,7 +75,7 @@ pub async fn create_taxi_table() -> Result<FixtureTable> {
         .await?;
     let mut append = table.append().writer_properties(
         WriterProperties::builder()
-            .set_max_row_group_row_count(Some(TAXI_TRIPS_PER_DAY))
+            .set_max_row_group_row_count(Some(rows_per_group))
             .set_statistics_enabled(EnabledStatistics::Chunk)
             .set_offset_index_disabled(true)
             .build(),
