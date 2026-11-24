@@ -99,10 +99,11 @@ impl FileScanTaskProvider for EagerFileScanTaskProvider {
             rows.checked_add(usize::try_from(task.record_count()?).ok()?)
         });
         // Predicates and deletes may reduce a positive count, but cannot add rows.
-        let exact = groups.iter().flatten().all(returns_every_record);
         let num_rows = match rows {
             Some(0) => Precision::Exact(0),
-            Some(rows) if exact => Precision::Exact(rows),
+            Some(rows) if groups.iter().flatten().all(returns_every_record) => {
+                Precision::Exact(rows)
+            }
             Some(rows) => Precision::Inexact(rows),
             None => Precision::Absent,
         };
