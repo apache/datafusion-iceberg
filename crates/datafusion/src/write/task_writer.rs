@@ -22,7 +22,7 @@
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::Result;
-use iceberg::arrow::RecordBatchPartitionSplitter;
+use iceberg::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
 use iceberg::spec::{DataFile, PartitionSpecRef, SchemaRef};
 use iceberg::writer::IcebergWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
@@ -225,8 +225,16 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
             .expect("Partition splitter should be initialized");
         let partitioned_batches = splitter.split(batch).map_err(to_datafusion_error)?;
 
-        // Write each partition
-        for (partition_key, partition_batch) in partitioned_batches {
+        // Write each partition. The splitter keeps the precomputed partition
+        // column, which isn't part of the table schema, so drop it before it
+        // reaches the file writer.
+        for (partition_key, mut partition_batch) in partitioned_batches {
+            if let Ok(idx) = partition_batch
+                .schema_ref()
+                .index_of(PROJECTED_PARTITION_VALUE_COLUMN)
+            {
+                partition_batch.remove_column(idx);
+            }
             writer
                 .write(partition_key, partition_batch)
                 .await
@@ -282,7 +290,6 @@ mod tests {
         ArrayRef, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
     use iceberg::io::FileIO;
     use iceberg::spec::{
         DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Type,
