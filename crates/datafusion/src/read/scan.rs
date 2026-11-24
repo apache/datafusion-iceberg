@@ -416,18 +416,21 @@ mod tests {
         snapshot_id: Option<i64>,
         fetch: Option<usize>,
     ) -> Statistics {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
         let context = SessionContext::new();
-        let (schema, provider) =
-            FileScanTaskProviderBuilder::new(context.task_ctx(), table.clone(), schema)
-                .with_projection(Some(&[0]))
-                .with_snapshot_id(snapshot_id)
-                .build()
-                .await
-                .unwrap();
+        let provider = FileScanTaskProviderBuilder::new(
+            context.task_ctx(),
+            table.clone(),
+            Arc::clone(&schema),
+        )
+        .with_snapshot_id(snapshot_id)
+        .build()
+        .await
+        .unwrap();
         let source = IcebergDataSource::builder(
             &context.copied_config(),
             schema,
@@ -541,11 +544,14 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
         let context = SessionContext::new();
-        let (schema, provider) =
-            FileScanTaskProviderBuilder::new(context.task_ctx(), table.clone(), schema)
-                .build()
-                .await
-                .unwrap();
+        let provider = FileScanTaskProviderBuilder::new(
+            context.task_ctx(),
+            table.clone(),
+            Arc::clone(&schema),
+        )
+        .build()
+        .await
+        .unwrap();
         let source = IcebergDataSource::builder(
             &context.copied_config(),
             schema,

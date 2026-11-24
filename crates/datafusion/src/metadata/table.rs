@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::source::DataSourceExec;
@@ -26,8 +25,6 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use futures::TryStreamExt;
-use futures::stream::BoxStream;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::table::Table;
@@ -98,17 +95,5 @@ impl IcebergMetadataTableProvider {
     /// Which metadata table of [`Self::table`] this provider reads.
     pub fn metadata_type(&self) -> &MetadataTableType {
         &self.r#type
-    }
-
-    pub async fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let metadata_table = self.table.inspect();
-        let stream = match self.r#type {
-            MetadataTableType::Snapshots => metadata_table.snapshots().scan().await,
-            MetadataTableType::Manifests => metadata_table.manifests().scan().await,
-            MetadataTableType::History => metadata_table.history().scan().await,
-        }
-        .map_err(to_datafusion_error)?;
-        let stream = stream.map_err(to_datafusion_error);
-        Ok(Box::pin(stream))
     }
 }

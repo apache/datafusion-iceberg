@@ -20,6 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::Session;
+use datafusion::common::utils::project_schema;
 use datafusion::common::{exec_datafusion_err, not_impl_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -123,12 +124,12 @@ impl TableProvider for IcebergStaticTableProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Use cached table (no refresh).
-        let (schema, tasks) = FileScanTaskProviderBuilder::new(
+        let schema = project_schema(&self.schema, projection)?;
+        let tasks = FileScanTaskProviderBuilder::new(
             state.task_ctx(),
             self.table.clone(),
-            self.schema.clone(),
+            Arc::clone(&schema),
         )
-        .with_projection(projection)
         .with_snapshot_id(self.snapshot_id)
         .with_filters(filters)
         .build()

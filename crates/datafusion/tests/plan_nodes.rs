@@ -79,7 +79,7 @@ fn lazy_files(scan: &IcebergDataSource) -> &LazyFileScanTaskProvider {
 async fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
     let files = lazy_files(scan);
     let context = SessionContext::new();
-    let (schema, provider) = FileScanTaskProviderBuilder::new(
+    let provider = FileScanTaskProviderBuilder::new(
         context.task_ctx(),
         files.table().clone(),
         files.schema(),
@@ -91,7 +91,7 @@ async fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
     .unwrap();
     IcebergDataSource::builder(
         &context.copied_config(),
-        schema,
+        scan.schema(),
         scan.file_io().clone(),
         files.table().reader_builder(),
         provider,
@@ -260,17 +260,17 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // A scan reads the columns of its schema and no others, so one built over
     // part of the table returns only those columns, from the pinned snapshot.
     let foo2_only = Arc::new(pinned.schema().project(&[1])?);
-    let (schema, files) = FileScanTaskProviderBuilder::new(
+    let files = FileScanTaskProviderBuilder::new(
         ctx.task_ctx(),
         pinned.table().clone(),
-        foo2_only,
+        Arc::clone(&foo2_only),
     )
     .with_snapshot_id(Some(snapshot_id))
     .build()
     .await?;
     let partial = IcebergDataSource::builder(
         &ctx.copied_config(),
-        schema,
+        foo2_only,
         pinned.table().file_io().clone(),
         pinned.table().reader_builder(),
         files,

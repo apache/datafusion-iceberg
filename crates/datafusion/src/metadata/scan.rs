@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -28,9 +29,11 @@ use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::inspect::MetadataTableType;
 
 use super::table::IcebergMetadataTableProvider;
+use crate::to_datafusion_error;
 
 /// Reads rows from an Iceberg metadata table through DataFusion's `DataSource` API.
 #[derive(Debug, Clone)]
@@ -69,7 +72,7 @@ impl DataSource for IcebergMetadataDataSource {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let fut = self.provider.clone().scan();
+        let fut = read_all(self.provider.clone());
         let projection = self.projection.clone();
 
         // TODO: Push these projections down into the scan layer instead of manually iterating over the result set
@@ -132,4 +135,18 @@ impl DataSource for IcebergMetadataDataSource {
     ) -> Result<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
+}
+
+/// Reads every row of `provider`'s metadata table.
+async fn read_all(
+    provider: IcebergMetadataTableProvider,
+) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+    let metadata_table = provider.table().inspect();
+    let batches = match provider.metadata_type() {
+        MetadataTableType::Snapshots => metadata_table.snapshots().scan().await,
+        MetadataTableType::Manifests => metadata_table.manifests().scan().await,
+        MetadataTableType::History => metadata_table.history().scan().await,
+    }
+    .map_err(to_datafusion_error)?;
+    Ok(batches.map_err(to_datafusion_error))
 }

@@ -3233,7 +3233,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=73e772c7dbc18f4a3f9f92187b6c56cafbc2f145#73e772c7dbc18f4a3f9f92187b6c56cafbc2f145"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c9739191da5e44c5c097714fa68c0e32696ba8f#6c9739191da5e44c5c097714fa68c0e32696ba8f"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3271,7 +3271,7 @@ dependencies = [
  "parquet",
  "parquet-geospatial",
  "rand 0.9.5",
- "reqwest 0.12.28",
+ "reqwest",
  "roaring",
  "serde",
  "serde_bytes",
@@ -3293,7 +3293,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=73e772c7dbc18f4a3f9f92187b6c56cafbc2f145#73e772c7dbc18f4a3f9f92187b6c56cafbc2f145"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c9739191da5e44c5c097714fa68c0e32696ba8f#6c9739191da5e44c5c097714fa68c0e32696ba8f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3301,7 +3301,7 @@ dependencies = [
  "iceberg",
  "itertools 0.13.0",
  "moka",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_derive",
  "serde_json",
@@ -3371,7 +3371,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust?rev=73e772c7dbc18f4a3f9f92187b6c56cafbc2f145#73e772c7dbc18f4a3f9f92187b6c56cafbc2f145"
+source = "git+https://github.com/apache/iceberg-rust?rev=6c9739191da5e44c5c097714fa68c0e32696ba8f#6c9739191da5e44c5c097714fa68c0e32696ba8f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4151,7 +4151,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rand 0.10.4",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4812,38 +4812,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-core",
- "http 1.5.0",
- "http-body 1.1.0",
- "http-body-util",
- "hyper",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
@@ -4867,6 +4835,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
