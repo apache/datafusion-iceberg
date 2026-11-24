@@ -27,8 +27,10 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProviderFactory};
     use iceberg_datafusion_test_tools::{
-        FixtureCatalog, IcebergTestHarness, create_taxi_table,
+        FixtureCatalog, IcebergTestHarness, ReadCountingStorageFactory,
+        create_taxi_table, create_taxi_table_with_row_group_size,
     };
+
     #[tokio::test]
     async fn pushes_down_compound_predicates() -> Result<()> {
         let (plan, batches) = IcebergTestHarness::builder()
@@ -231,6 +233,47 @@ mod tests {
         // the first row is logical_plan, the second row is physical_plan
         let expected = "predicate=(foo > 1) OR (bar IS NULL)";
         assert!(s.value(1).trim().contains(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_pruning_controls_row_group_reads() -> Result<()> {
+        let storage = ReadCountingStorageFactory::default();
+        let harness = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(
+                IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
+                    storage.clone(),
+                )),
+            )
+            .with_table(create_taxi_table_with_row_group_size(5_000).await?)
+            .with_config_option("datafusion.execution.parquet.enable_page_index", false)
+            .with_config_option("datafusion.execution.parquet.pruning", true)
+            .build()
+            .await?;
+
+        // Trips are ordered by pickup time. Only the first row group can match.
+        let query = "SELECT count(*) AS trips FROM taxi
+                     WHERE pickup_at < TIMESTAMP '2024-01-08 00:00:06'";
+        let (_, pruned_rows) = harness.query(query).await?;
+        let pruned_reads = storage.take_reads();
+        harness
+            .query("SET datafusion.execution.parquet.pruning = false")
+            .await?;
+        let (_, unpruned_rows) = harness.query(query).await?;
+        let unpruned_reads = storage.take_reads();
+
+        insta::assert_snapshot!(pruned_rows, @"
+        +-------+
+        | trips |
+        +-------+
+        | 2     |
+        +-------+
+        ");
+        assert_eq!(pruned_rows, unpruned_rows);
+        assert!(
+            pruned_reads < unpruned_reads,
+            "pruning read {pruned_reads} ranges; disabling it read {unpruned_reads}"
+        );
         Ok(())
     }
 }
