@@ -36,14 +36,14 @@ dashmap = "6"
 datafusion = { workspace = true }
 futures = "0.3"
 iceberg = { workspace = true }
-parquet = "59.2"
+parquet = "60"
 tokio = { workspace = true }
 uuid = { version = "1.18", features = ["v7"] }
 
 [dev-dependencies]
 iceberg-datafusion-test-tools = { workspace = true }
 insta = "1"
-parquet = "59.2"
+parquet = "60"
 tempfile = "3.18"
 
 # Every integration test is a module of `tests/main.rs`, so they all link into one binary

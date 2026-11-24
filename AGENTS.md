@@ -129,7 +129,7 @@ Library code returns `datafusion::error::Result`. Convert iceberg errors with `t
 ## Dependencies
 
 - **iceberg-rust:** `iceberg` and `iceberg-catalog-rest` are git dependencies on `apache/iceberg-rust`, pinned to the same `rev` in the root `Cargo.toml`. The writers, partition splitting, table properties, encryption, and metadata tables all come from there. A missing API usually has to land upstream first; then bump both `rev`s together.
-- **Arrow/Parquet version:** DataFusion, iceberg-rust, and `crates/datafusion`'s direct `parquet` dependency must all resolve to one Arrow/Parquet version (currently 59.x). For that reason Dependabot skips semver-major `datafusion*`/`parquet` bumps. Do those upgrades manually, together with a compatible iceberg-rust `rev`.
+- **Arrow/Parquet version:** DataFusion, iceberg-rust, and `crates/datafusion`'s direct `parquet` dependency must all resolve to one Arrow/Parquet version (currently 60.x). For that reason Dependabot skips semver-major `datafusion*`/`parquet` bumps. Do those upgrades manually, together with a compatible iceberg-rust `rev`.
 
 ## Conventions
 
