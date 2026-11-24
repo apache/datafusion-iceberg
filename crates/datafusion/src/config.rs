@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use datafusion::common::{config_namespace, extensions_options};
 use datafusion::config::ConfigExtension;
 use datafusion::prelude::SessionConfig;
+use iceberg::arrow::{ArrowReaderOptions, ParquetReadOptions};
 
 extensions_options! {
     /// Session options for Iceberg tables, under `iceberg.<group>.<option>`.
@@ -31,7 +32,26 @@ extensions_options! {
     ///
     /// let config = SessionConfig::new()
     ///     .with_option_extension(IcebergDataFusionConfig::default())
-    ///     .set_bool("iceberg.execution.eager_file_planning", true);
+    ///     .set_bool("iceberg.execution.eager_file_planning", true)
+    ///     .set_usize("iceberg.execution.data_file_concurrency_limit", 2);
+    /// ```
+    ///
+    /// Scans honor DataFusion's execution batch size and its Parquet `pruning`,
+    /// `enable_page_index`, `bloom_filter_on_read`, and `metadata_size_hint` options.
+    /// Bloom-filter reads follow DataFusion's default of enabled.
+    ///
+    /// Rust callers can supply the complete reader options for scans planned with
+    /// this config. These take precedence over individual SQL reader settings,
+    /// including DataFusion's batch size and Parquet options. Omitted fields use
+    /// Iceberg's defaults. File planning still uses the execution config.
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion::prelude::SessionConfig;
+    /// use iceberg::arrow::ArrowReaderOptions;
+    ///
+    /// let session = SessionConfig::new();
+    /// let reader = ArrowReaderOptions::builder().with_batch_size(2048).build();
+    /// let query_config = session.clone().with_extension(Arc::new(reader));
     /// ```
     pub struct IcebergDataFusionConfig {
         /// Options for executing table scans.
@@ -45,6 +65,26 @@ config_namespace! {
         /// Discover file tasks in TableProvider::scan instead of at execution, and
         /// split them across up to the session's target partitions.
         pub eager_file_planning: bool, default = false
+        /// Maximum concurrent data files per output partition. Zero is treated as one.
+        pub data_file_concurrency_limit: usize, default = 1
+        /// Iceberg-specific Parquet range-read and index settings.
+        pub parquet: IcebergParquetConfig, default = IcebergParquetConfig::default()
+    }
+}
+
+config_namespace! {
+    /// Iceberg Parquet options under `iceberg.execution.parquet`.
+    pub struct IcebergParquetConfig {
+        /// Maximum gap in bytes between ranges to combine into one read.
+        pub range_coalesce_bytes: u64, default = ParquetReadOptions::default().range_coalesce_bytes()
+        /// Maximum concurrent range requests per file.
+        pub range_fetch_concurrency: usize, default = ParquetReadOptions::default().range_fetch_concurrency()
+        /// Preload the Parquet column index.
+        pub preload_column_index: bool, default = ParquetReadOptions::default().preload_column_index()
+        /// Preload the Parquet offset index.
+        pub preload_offset_index: bool, default = ParquetReadOptions::default().preload_offset_index()
+        /// Stored page-index preference. Iceberg overrides it per file based on predicates and deletes.
+        pub preload_page_index: bool, default = ParquetReadOptions::default().preload_page_index()
     }
 }
 
@@ -61,5 +101,75 @@ impl IcebergDataFusionConfig {
             Some(v) => v,
             None => &DEFAULT,
         }
+    }
+}
+
+/// Resolves the reader options once, when planning the scan.
+pub(crate) fn arrow_reader_options(config: &SessionConfig) -> ArrowReaderOptions {
+    if let Some(options) = config.get_extension::<ArrowReaderOptions>() {
+        return Arc::unwrap_or_clone(options);
+    }
+
+    let execution = &IcebergDataFusionConfig::from_config_or_default(config).execution;
+    let parquet = &config.options().execution.parquet;
+    let io = &execution.parquet;
+    let parquet_options = ParquetReadOptions::builder()
+        .with_metadata_size_hint(
+            parquet
+                .metadata_size_hint
+                .unwrap_or_else(|| ParquetReadOptions::default().metadata_size_hint()),
+        )
+        .with_range_coalesce_bytes(io.range_coalesce_bytes)
+        .with_range_fetch_concurrency(io.range_fetch_concurrency)
+        .with_preload_column_index(io.preload_column_index)
+        .with_preload_offset_index(io.preload_offset_index)
+        .with_preload_page_index(io.preload_page_index)
+        .build();
+    ArrowReaderOptions::builder()
+        .with_batch_size(config.batch_size())
+        .with_row_group_filtering_enabled(parquet.pruning)
+        .with_row_selection_enabled(parquet.enable_page_index)
+        .with_bloom_filter_enabled(parquet.bloom_filter_on_read)
+        .with_data_file_concurrency_limit(execution.data_file_concurrency_limit.max(1))
+        .with_parquet_options(parquet_options)
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_settings_resolve_to_iceberg_reader_options() {
+        let config = SessionConfig::new()
+            .with_option_extension(IcebergDataFusionConfig::default())
+            .set_usize("datafusion.execution.batch_size", 345)
+            .set_bool("datafusion.execution.parquet.pruning", false)
+            .set_bool("datafusion.execution.parquet.enable_page_index", true)
+            .set_bool("datafusion.execution.parquet.bloom_filter_on_read", true)
+            .set_usize("datafusion.execution.parquet.metadata_size_hint", 8192)
+            .set_usize("iceberg.execution.data_file_concurrency_limit", 3)
+            .set_u64("iceberg.execution.parquet.range_coalesce_bytes", 1024)
+            .set_usize("iceberg.execution.parquet.range_fetch_concurrency", 2)
+            .set_bool("iceberg.execution.parquet.preload_column_index", false)
+            .set_bool("iceberg.execution.parquet.preload_offset_index", false)
+            .set_bool("iceberg.execution.parquet.preload_page_index", true);
+        let parquet = ParquetReadOptions::builder()
+            .with_metadata_size_hint(8192)
+            .with_range_coalesce_bytes(1024)
+            .with_range_fetch_concurrency(2)
+            .with_preload_column_index(false)
+            .with_preload_offset_index(false)
+            .with_preload_page_index(true)
+            .build();
+        let expected = ArrowReaderOptions::builder()
+            .with_batch_size(345)
+            .with_row_group_filtering_enabled(false)
+            .with_row_selection_enabled(true)
+            .with_bloom_filter_enabled(true)
+            .with_data_file_concurrency_limit(3)
+            .with_parquet_options(parquet)
+            .build();
+        assert_eq!(arrow_reader_options(&config), expected);
     }
 }

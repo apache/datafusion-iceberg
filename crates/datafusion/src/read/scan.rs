@@ -19,6 +19,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use super::file_scan_task_provider::{FileScanTaskProvider, FileScanTaskProviderContext};
+use crate::config::arrow_reader_options;
 use crate::to_datafusion_error;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -36,7 +37,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
 use datafusion::prelude::SessionConfig;
 use futures::TryStreamExt;
-use iceberg::arrow::{ArrowReader, ArrowReaderBuilder, ArrowReaderOptions};
+use iceberg::arrow::{ArrowReader, ArrowReaderBuilder};
 use iceberg::io::FileIO;
 
 /// Reads the tasks of a [`FileScanTaskProvider`] using a process-local reader.
@@ -67,9 +68,8 @@ impl Debug for IcebergDataSource {
 impl IcebergDataSource {
     /// Starts source construction with session reader settings and explicit local
     /// storage/runtime resources. `reader` must use the supplied `file_io`.
-    /// This replaces the settings on `reader` with session reader defaults.
-    /// Batch size and page-index settings come from `config`; file concurrency
-    /// defaults to one because DataFusion runs partitions concurrently.
+    /// Reader options come from the session's typed `iceberg::arrow::ArrowReaderOptions`
+    /// extension when present, otherwise from the DataFusion and Iceberg SQL settings.
     /// A later [`IcebergDataSourceBuilder::with_reader`] overrides these defaults.
     /// No discovery or current-runtime lookup is performed, even with eager
     /// planning enabled: the caller supplies the task provider at construction.
@@ -90,17 +90,10 @@ impl IcebergDataSource {
         reader: ArrowReaderBuilder,
         file_scan_task_provider: Arc<dyn FileScanTaskProvider>,
     ) -> IcebergDataSourceBuilder {
-        let options = ArrowReaderOptions::builder()
-            .with_batch_size(config.batch_size())
-            .with_row_selection_enabled(
-                config.options().execution.parquet.enable_page_index,
-            )
-            .with_data_file_concurrency_limit(1)
-            .build();
         IcebergDataSourceBuilder {
             schema,
             file_io,
-            reader: reader.with_options(options).build(),
+            reader: reader.with_options(arrow_reader_options(config)).build(),
             fetch: None,
             file_scan_task_provider,
         }

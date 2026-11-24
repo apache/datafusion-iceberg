@@ -19,7 +19,7 @@ mod catalog;
 pub use catalog::*;
 
 mod config;
-pub use config::{IcebergDataFusionConfig, IcebergExecutionConfig};
+pub use config::{IcebergDataFusionConfig, IcebergExecutionConfig, IcebergParquetConfig};
 
 mod error;
 pub use error::*;
