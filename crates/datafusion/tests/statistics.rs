@@ -83,10 +83,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn eager_count_star_is_answered_without_reading_data_files() -> Result<()> {
-        let storage = ReadCountingStorageFactory::default();
-        let harness = IcebergTestHarness::builder()
+    async fn eager_taxi_harness(
+        storage: &ReadCountingStorageFactory,
+    ) -> Result<IcebergTestHarness> {
+        IcebergTestHarness::builder()
             .with_iceberg_table_factory(
                 IcebergTableProviderFactory::new_with_storage_factory(Arc::new(
                     storage.clone(),
@@ -105,7 +105,13 @@ mod tests {
             .with_config_option("iceberg.execution.eager_file_planning", true)
             .with_config_option("datafusion.execution.target_partitions", 2)
             .build()
-            .await?;
+            .await
+    }
+
+    #[tokio::test]
+    async fn eager_count_star_is_answered_without_reading_data_files() -> Result<()> {
+        let storage = ReadCountingStorageFactory::default();
+        let harness = eager_taxi_harness(&storage).await?;
 
         // Taxi has seven daily files of 25,000 rows and no deletes.
         let (plan, _) = harness.query("SELECT count(*) FROM taxi").await?;
@@ -114,11 +120,33 @@ mod tests {
           PlaceholderRowExec
         ");
         assert_eq!(storage.take_reads(), 0);
+        Ok(())
+    }
 
-        // A pushed-down predicate may drop rows, so the files are still read.
-        let (_, rows) = harness
-            .query("SELECT count(*) FROM taxi WHERE pickup_date = DATE '2024-01-10'")
-            .await?;
+    #[tokio::test]
+    async fn eager_count_star_with_a_predicate_still_reads_data_files() -> Result<()> {
+        let storage = ReadCountingStorageFactory::default();
+        let harness = eager_taxi_harness(&storage).await?;
+
+        // A pushed-down predicate may drop rows, so the row count stays inexact and
+        // DataFusion still aggregates what the scan returns.
+        let sql = "SELECT count(*) FROM taxi WHERE pickup_date = DATE '2024-01-10'";
+        let physical_plan = harness.physical_plan(sql).await?;
+        insta::assert_snapshot!(harness.source_statistics(&physical_plan)?, @"
+        all partitions (1): Rows=Inexact(25000), Bytes=Inexact(100000), [(Col[0]:)]
+        partition 0: Rows=Inexact(25000), Bytes=Inexact(100000), [(Col[0]:)]
+        ");
+
+        let (plan, rows) = harness.query(sql).await?;
+        insta::assert_snapshot!(plan, @"
+        ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
+          AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+            CoalescePartitionsExec
+              AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+                FilterExec: pickup_date@0 = 2024-01-10, projection=[]
+                  RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+                    DataSourceExec: format=iceberg, projection=[pickup_date], provider=eager, planned_files=1, predicates=[pickup_date = 2024-01-10]
+        ");
         insta::assert_snapshot!(rows, @"
         +----------+
         | count(*) |
