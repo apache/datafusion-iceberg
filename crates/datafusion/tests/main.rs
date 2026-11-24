@@ -26,6 +26,5 @@ mod metadata_tables;
 mod page_index;
 mod plan_nodes;
 mod projection_pushdown;
-mod reader_config;
 mod schema_evolution;
 mod statistics;

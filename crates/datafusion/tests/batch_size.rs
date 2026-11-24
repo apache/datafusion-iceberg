@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use datafusion::error::Result;
+use iceberg::arrow::ArrowReaderOptions;
 use iceberg_datafusion::IcebergTableProviderFactory;
 use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
@@ -42,5 +45,31 @@ async fn scan_honors_session_batch_size() -> Result<()> {
     ");
     let max_rows = batches.iter().map(|batch| batch.num_rows()).max();
     assert_eq!(max_rows, Some(2000));
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_reader_options_override_session_batch_size() -> Result<()> {
+    let options = ArrowReaderOptions::builder().with_batch_size(137).build();
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_session_extension(move |mut state| {
+            state
+                .config()
+                .get_or_insert_default()
+                .set_extension(Arc::new(options));
+            state
+        })
+        .with_config_option("datafusion.execution.batch_size", 2000)
+        .with_table(create_taxi_table().await?)
+        .build()
+        .await?;
+    let (_, batches) = harness
+        .query_batches("SELECT pickup_date FROM taxi")
+        .await?;
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).max(),
+        Some(137)
+    );
     Ok(())
 }
