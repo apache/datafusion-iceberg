@@ -360,7 +360,7 @@ mod tests {
             .select(["id"])
             .build()
             .map_err(df_err)?
-            .to_arrow()
+            .to_arrow(Default::default())
             .await
             .map_err(df_err)?
             .try_collect()
