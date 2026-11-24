@@ -17,13 +17,23 @@
 
 #[cfg(test)]
 mod tests {
-    use datafusion::error::Result;
-    use iceberg_datafusion::test_utils::IcebergTestHarness;
+    use std::error::Error;
+    use std::sync::Arc;
 
+    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::error::Result;
+    use datafusion::prelude::SessionContext;
+    use iceberg::TableIdent;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg_datafusion::{IcebergCatalogProvider, IcebergTableProviderFactory};
+    use iceberg_datafusion_test_tools::{
+        FixtureCatalog, IcebergTestHarness, create_taxi_table,
+    };
     #[tokio::test]
     async fn pushes_down_compound_predicates() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT COUNT(*) AS trips
                FROM taxi
@@ -33,30 +43,31 @@ mod tests {
             )
             .await?;
 
-        insta::assert_snapshot!(plan, @"
+        insta::assert_snapshot!(plan, @r"
         ProjectionExec: expr=[count(Int64(1))@0 as trips]
           AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
             CoalescePartitionsExec
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@2 = 2024-01-10 AND payment_type@1 IN (SET) ([1, 2]) AND trip_distance@0 >= 2, projection=[]
                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance, payment_type, pickup_date], predicate=((pickup_date = 2024-01-10) AND (payment_type IN (1, 2))) AND (trip_distance >= 2)
+                    DataSourceExec: format=iceberg, projection=[trip_distance, payment_type, pickup_date], provider=lazy, predicate=((pickup_date = 2024-01-10) AND (payment_type IN (1, 2))) AND (trip_distance >= 2)
         ");
         insta::assert_snapshot!(batches, @r"
-    +-------+
-    | trips |
-    +-------+
-    | 9891  |
-    +-------+
-    ");
+        +-------+
+        | trips |
+        +-------+
+        | 10659 |
+        +-------+
+        ");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn pushes_down_disjunctions() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT pickup_date, COUNT(*) AS trips
                    FROM taxi
@@ -76,7 +87,7 @@ mod tests {
                   AggregateExec: mode=Partial, gby=[pickup_date@0 as pickup_date], aggr=[count(Int64(1))]
                     FilterExec: pickup_date@0 = 2024-01-10 OR pickup_date@0 = 2024-01-11
                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                        DataSourceExec: format=iceberg, projection=[pickup_date], predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
+                        DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy, predicate=(pickup_date = 2024-01-10) OR (pickup_date = 2024-01-11)
         ");
         insta::assert_snapshot!(batches, @r"
     +-------------+-------+
@@ -92,8 +103,9 @@ mod tests {
 
     #[tokio::test]
     async fn pushes_down_null_predicates() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT COUNT(*) AS trips FROM taxi WHERE passenger_count IS NULL")
             .await?;
 
@@ -104,23 +116,24 @@ mod tests {
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: passenger_count@0 IS NULL, projection=[]
                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[passenger_count], predicate=passenger_count IS NULL
+                    DataSourceExec: format=iceberg, projection=[passenger_count], provider=lazy, predicate=passenger_count IS NULL
         ");
         insta::assert_snapshot!(batches, @r"
-    +-------+
-    | trips |
-    +-------+
-    | 8829  |
-    +-------+
-    ");
+        +-------+
+        | trips |
+        +-------+
+        | 8886  |
+        +-------+
+        ");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn retains_unsupported_filter_after_safe_pushdown() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query(
                 r"SELECT COUNT(*) AS trips
                    FROM taxi
@@ -136,23 +149,24 @@ mod tests {
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: pickup_date@1 = 2024-01-10 AND trip_distance@0 + 1 > 3, projection=[]
                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance, pickup_date], predicate=pickup_date = 2024-01-10
+                    DataSourceExec: format=iceberg, projection=[trip_distance, pickup_date], provider=lazy, predicate=pickup_date = 2024-01-10
         ");
         insta::assert_snapshot!(batches, @r"
-    +-------+
-    | trips |
-    +-------+
-    | 10516 |
-    +-------+
-    ");
+        +-------+
+        | trips |
+        +-------+
+        | 11688 |
+        +-------+
+        ");
 
         Ok(())
     }
 
     #[tokio::test]
     async fn executes_wholly_unsupported_filters_without_pushdown() -> Result<()> {
-        let harness = IcebergTestHarness::new().await?;
-        let (plan, batches) = harness
+        let (plan, batches) = IcebergTestHarness::builder()
+            .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+            .with_table(create_taxi_table().await?)
             .query("SELECT COUNT(*) AS trips FROM taxi WHERE trip_distance + 1.0 > 20.0")
             .await?;
 
@@ -163,16 +177,60 @@ mod tests {
               AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
                 FilterExec: trip_distance@0 + 1 > 20, projection=[]
                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                    DataSourceExec: format=iceberg, projection=[trip_distance]
+                    DataSourceExec: format=iceberg, projection=[trip_distance], provider=lazy
         ");
         insta::assert_snapshot!(batches, @r"
-    +-------+
-    | trips |
-    +-------+
-    | 2757  |
-    +-------+
-    ");
+        +-------+
+        | trips |
+        +-------+
+        | 4462  |
+        +-------+
+        ");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_table_predict_pushdown() -> Result<(), Box<dyn Error>> {
+        let fixtures = FixtureCatalog::try_new().await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::optional(2, "bar", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .build()?;
+        fixtures
+            .table(TableIdent::from_strs(["ns", "t1"])?, schema)
+            .create()
+            .await?;
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "catalog",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        );
+        let records = ctx
+            .sql("select * from catalog.ns.t1 where (foo > 1 and length(bar) = 1 ) or bar is null")
+            .await
+            .unwrap()
+            .explain(false, false)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(1, records.len());
+        let record = &records[0];
+        // the first column is plan_type, the second column plan string.
+        let s = record
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(2, s.len());
+        // the first row is logical_plan, the second row is physical_plan
+        let expected = "predicate=(foo > 1) OR (bar IS NULL)";
+        assert!(s.value(1).trim().contains(expected));
         Ok(())
     }
 }

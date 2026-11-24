@@ -20,6 +20,7 @@ members = [
     "crates/datafusion",
     "crates/sqllogictest",
     "crates/playground",
+    "crates/test-tools",
 ]
 resolver = "2"
 
@@ -33,12 +34,13 @@ version = "0.12.0"
 [workspace.dependencies]
 anyhow = "1.0.72"
 async-trait = "0.1.89"
-datafusion = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
-datafusion-cli = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
+datafusion = "56.0.0"
+datafusion-cli = "56.0.0"
 iceberg-datafusion = { path = "crates/datafusion" }
-datafusion-sqllogictest = { git = "https://github.com/apache/datafusion.git", rev = "1635ed94742c1c060852bc34dc6ebb2302241c7b" }
-iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "73e772c7dbc18f4a3f9f92187b6c56cafbc2f145" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "73e772c7dbc18f4a3f9f92187b6c56cafbc2f145" }
+iceberg-datafusion-test-tools = { path = "crates/test-tools" }
+datafusion-sqllogictest = "56.0.0"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "73e772c7dbc18f4a3f9f92187b6c56cafbc2f145" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "73e772c7dbc18f4a3f9f92187b6c56cafbc2f145" }
 tokio = { version = "1.47", default-features = false, features = ["sync", "rt-multi-thread"] }
 toml = "1.1"
 tracing = "0.1.41"

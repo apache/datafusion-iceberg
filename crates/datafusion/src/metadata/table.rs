@@ -41,18 +41,13 @@ use crate::to_datafusion_error;
 pub struct IcebergMetadataTableProvider {
     table: Table,
     r#type: MetadataTableType,
+    schema: ArrowSchemaRef,
 }
 
 #[async_trait]
 impl TableProvider for IcebergMetadataTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        let metadata_table = self.table.inspect();
-        let schema = match self.r#type {
-            MetadataTableType::Snapshots => metadata_table.snapshots().schema(),
-            MetadataTableType::Manifests => metadata_table.manifests().schema(),
-            MetadataTableType::History => metadata_table.history().schema(),
-        };
-        schema_to_arrow_schema(&schema).unwrap().into()
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -75,11 +70,24 @@ impl TableProvider for IcebergMetadataTableProvider {
 impl IcebergMetadataTableProvider {
     /// Creates a provider for the `metadata_type` metadata table of an
     /// already loaded table.
-    pub fn new(table: Table, metadata_type: MetadataTableType) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata table's schema has no Arrow equivalent.
+    pub fn try_new(table: Table, metadata_type: MetadataTableType) -> Result<Self> {
+        let metadata_table = table.inspect();
+        let schema = match metadata_type {
+            MetadataTableType::Snapshots => metadata_table.snapshots().schema(),
+            MetadataTableType::Manifests => metadata_table.manifests().schema(),
+            MetadataTableType::History => metadata_table.history().schema(),
+        };
+        let schema =
+            Arc::new(schema_to_arrow_schema(&schema).map_err(to_datafusion_error)?);
+        Ok(Self {
             table,
             r#type: metadata_type,
-        }
+            schema,
+        })
     }
 
     /// The table whose metadata this provider reads.

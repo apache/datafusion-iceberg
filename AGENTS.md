@@ -26,6 +26,7 @@ Apache DataFusion integration for Apache Iceberg: catalog/table providers and ph
 | `crates/datafusion` | `iceberg-datafusion` | The published library |
 | `crates/sqllogictest` | `iceberg-sqllogictest` | SQL-level test harness (unpublished) |
 | `crates/playground` | `iceberg-playground` | REPL CLI built on `datafusion-cli` (unpublished) |
+| `crates/test-tools` | `iceberg-datafusion-test-tools` | Builders for the Iceberg tables tests read (unpublished) |
 
 ## Before Committing
 
@@ -46,13 +47,31 @@ cargo test --workspace --locked
 
 ```sh
 cargo test -p iceberg-datafusion --lib <name_substring>                          # unit tests
-cargo test -p iceberg-datafusion --test integration_datafusion_test <name>      # integration tests
+cargo test -p iceberg-datafusion --test integration <module>::<name>            # integration tests, e.g. filter_pushdown::
 cargo test -p iceberg-sqllogictest --test sqllogictests -- <schedule_substring> # e.g. basic_queries
-cargo insta test -p iceberg-datafusion --test integration_datafusion_test --review  # review inline snapshots
+cargo insta test -p iceberg-datafusion --review                                  # review inline snapshots
 cargo run -p iceberg-playground -- --rc <catalogs.toml>                          # REPL; defaults to ~/.icebergrc
 ```
 
-Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSON); no Docker or external services are needed. The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
+Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSON); no Docker or external services are needed.
+
+Build test tables with `iceberg-datafusion-test-tools` rather than by hand or by committing data files. A `FixtureCatalog` is an in-memory catalog over a temp dir, not tied to any dataset. `fixtures.table(ident, schema).partition_by(..).create()` creates a table, and each `table.append().file(batch)...commit()` adds one snapshot in which every batch becomes exactly one data file. Snapshot ids count up from 1, so snapshots can show them. Data files are written with iceberg-rust's writers, not this crate's insert path, so they carry real column statistics and a writer bug can't hide a reader bug. `create_taxi_table` generates a deterministic, synthetic stand-in for NYC taxi trips: 7 days × 25,000 rows, identity-partitioned on `pickup_date`, one file per day.
+
+Write integration tests with `IcebergTestHarness` from the test tools, configured in one builder chain:
+
+```rust
+let (plan, batches) = IcebergTestHarness::builder()
+    .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+    .with_table(create_taxi_table().await?)
+    .query("SELECT COUNT(*) FROM taxi")
+    .await?;
+```
+
+The harness doesn't depend on `iceberg-datafusion`, so each test hands it the `ICEBERG` table factory with `with_iceberg_table_factory(..)`. `with_table` registers a table under its name with `CREATE EXTERNAL TABLE`, so it's read through `IcebergStaticTableProvider`. For metadata tables or the catalog-backed provider, also register `IcebergCatalogProvider::try_new(table.catalog())` with `with_catalog(..)`. Other builder methods: `with_session_extension`, `with_config_option`, `with_table_option`, `with_metadata` and `configure_session`.
+
+Integration tests live in `crates/datafusion/tests/`, one file per area (`filter_pushdown.rs`, `insert_into.rs`, `metadata_tables.rs`, `schema_evolution.rs`, ...); add a test to the file for what it tests rather than starting a catch-all. There's no shared test module: put setup in the harness or the test tools if many tests need it, and otherwise inline it. Tests of the catalog provider itself build their `SessionContext` directly and register `IcebergCatalogProvider::try_new(fixtures.catalog())` in it.
+
+The playground config holds `[[catalogs]]` entries with `name`, `type` (`rest` or `memory`), and a `[catalogs.config]` table of string properties.
 
 ## Architecture (`crates/datafusion`)
 
@@ -63,7 +82,7 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 - Names like `<table>$snapshots`, `$manifests`, and `$history` resolve to `IcebergMetadataTableProvider`.
 - SQL `CREATE TABLE` and `DROP TABLE` reach the *synchronous* `SchemaProvider::register_table` and `deregister_table` methods, which call the async catalog through `spawn_blocking` + `block_on`. `register_table` rejects input tables that contain rows, so CTAS isn't supported. It auto-assigns field IDs and uses format V2 unless the schema needs V3.
 
-### Table providers (`table/`)
+### Table providers (`table_provider/`)
 
 - **`IcebergCatalogTableProvider`**: catalog-backed. It caches the Arrow schema at construction but reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
 - **`IcebergStaticTableProvider`**: wraps a fixed `Table`, optionally pinned to a snapshot id for time travel. Read-only.
@@ -71,11 +90,11 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 ### Read path and filter pushdown
 
-`IcebergTableScan` converts the projection to column names and the filters to a single Iceberg `Predicate` (`read/predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
+`IcebergDataSource` converts the projection to column names and the filters to a single Iceberg `Predicate` (`read/predicate.rs`). It applies `limit` in-stream, has one output partition, and delegates the actual read to iceberg's `TableScan::to_arrow()`.
 
 Both providers report every filter as `Inexact`, so DataFusion re-applies the original filters after the scan. The pushed-down predicate therefore only has to be *implied by* the original filter. It may match extra rows but must never drop a row that matches. Unconvertible parts are dropped: an `AND` keeps whichever side converted, while an `OR` needs both sides. Preserve this soundness rule when extending `predicate.rs`; for example, it is why casts and some NaN arithmetic are deliberately not pushed down. Removing a cast is left to DataFusion's simplifier (`unwrap_cast_in_comparison`), which rewrites a comparison only when the result doesn't change.
 
-### Write path (`IcebergTableProvider::insert_into`)
+### Write path (`IcebergCatalogTableProvider::insert_into`)
 
 ```
 input
@@ -105,12 +124,12 @@ Library code returns `datafusion::error::Result`. Convert iceberg errors with `t
   - `test_encrypted_round_trip`: format V3, encrypted with in-memory KMS key `test-master-key`
 
   All other tables are created by `CREATE TABLE` inside the `.slt` files.
-- Several `.slt` files assert `EXPLAIN` output, such as `IcebergTableScan projection:[...] predicate:[...] limit:[...]`. Changes to the scan's `DisplayAs`, to pushdown, or to the DataFusion version require updating those expectations by hand; the harness has no auto-complete mode.
+- Several `.slt` files assert `EXPLAIN` output, such as `DataSourceExec: format=iceberg, projection=[...], predicate=..., fetch=...`. Changes to `IcebergDataSource::fmt_as`, to pushdown, or to the DataFusion version require updating those expectations by hand; the harness has no auto-complete mode.
 
 ## Dependencies
 
 - **iceberg-rust:** `iceberg` and `iceberg-catalog-rest` are git dependencies on `apache/iceberg-rust`, pinned to the same `rev` in the root `Cargo.toml`. The writers, partition splitting, table properties, encryption, and metadata tables all come from there. A missing API usually has to land upstream first; then bump both `rev`s together.
-- **Arrow/Parquet version:** DataFusion, iceberg-rust, and `crates/datafusion`'s direct `parquet` dependency must all resolve to one Arrow/Parquet version (currently 59.x). For that reason Dependabot skips semver-major `datafusion*`/`parquet` bumps. Do those upgrades manually, together with a compatible iceberg-rust `rev`.
+- **Arrow/Parquet version:** DataFusion, iceberg-rust, and `crates/datafusion`'s direct `parquet` dependency must all resolve to one Arrow/Parquet version (currently 60.x). For that reason Dependabot skips semver-major `datafusion*`/`parquet` bumps. Do those upgrades manually, together with a compatible iceberg-rust `rev`.
 
 ## Conventions
 

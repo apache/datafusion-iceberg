@@ -16,13 +16,19 @@
 // under the License.
 
 use datafusion::error::Result;
-use iceberg_datafusion::test_utils::IcebergTestHarness;
+use iceberg_datafusion::IcebergTableProviderFactory;
+use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
 #[tokio::test]
 async fn page_index_setting_without_indexes() -> Result<()> {
-    let harness = IcebergTestHarness::new().await?;
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_table(create_taxi_table().await?)
+        .build()
+        .await?;
 
-    // The checked-in taxi files have no column or offset indexes.
+    // create_taxi_table writes no page indexes, so this covers reading files
+    // without them.
     for enabled in [false, true] {
         harness
             .query(&format!(
@@ -41,7 +47,7 @@ async fn page_index_setting_without_indexes() -> Result<()> {
             +-------+
             | trips |
             +-------+
-            | 9891  |
+            | 10659 |
             +-------+
             ");
         }

@@ -41,7 +41,7 @@ logical_plan
 physical_plan
 01)FilterExec: CAST(d@1 AS Timestamp(ns)) < 1672920000000000000, projection=[id@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-03)----DataSourceExec: format=iceberg, projection=[id, d]
+03)----DataSourceExec: format=iceberg, projection=[id, d], provider=lazy
 
 query I rowsort
 SELECT id FROM default.default.test_cast_table WHERE d < TIMESTAMP '2023-01-05 12:00:00'
@@ -74,7 +74,7 @@ logical_plan
 physical_plan
 01)FilterExec: CAST(n@1 AS Utf8) < 5, projection=[id@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-03)----DataSourceExec: format=iceberg, projection=[id, n]
+03)----DataSourceExec: format=iceberg, projection=[id, n], provider=lazy
 
 query I rowsort
 SELECT id FROM default.default.test_cast_table WHERE arrow_cast(n, 'Utf8') < arrow_cast('5', 'Utf8')
@@ -109,7 +109,7 @@ logical_plan
 physical_plan
 01)FilterExec: CAST(x@1 AS Float64) > 0.1, projection=[id@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-03)----DataSourceExec: format=iceberg, projection=[id, x]
+03)----DataSourceExec: format=iceberg, projection=[id, x], provider=lazy
 
 query I rowsort
 SELECT id FROM default.default.test_float_cast_table WHERE x > 0.1
@@ -138,7 +138,7 @@ logical_plan
 physical_plan
 01)FilterExec: NOT isnan(CAST(s@1 AS Float64)), projection=[id@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-03)----DataSourceExec: format=iceberg, projection=[id, s]
+03)----DataSourceExec: format=iceberg, projection=[id, s], provider=lazy
 
 query I rowsort
 SELECT id FROM default.default.test_isnan_cast_table WHERE NOT isnan(CAST(s AS DOUBLE))

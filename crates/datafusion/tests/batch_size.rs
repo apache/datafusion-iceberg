@@ -16,17 +16,19 @@
 // under the License.
 
 use datafusion::error::Result;
-use iceberg_datafusion::test_utils::IcebergTestHarness;
+use iceberg_datafusion::IcebergTableProviderFactory;
+use iceberg_datafusion_test_tools::{IcebergTestHarness, create_taxi_table};
 
 #[tokio::test]
 async fn scan_honors_session_batch_size() -> Result<()> {
-    let harness = IcebergTestHarness::new().await?;
-
     // Batches above the session's batch_size are split after the scan, so a
     // size below arrow-rs's default of 1024 would pass without the reader
     // seeing it. Use a larger one.
-    harness
-        .query("SET datafusion.execution.batch_size = 2000")
+    let harness = IcebergTestHarness::builder()
+        .with_iceberg_table_factory(IcebergTableProviderFactory::new())
+        .with_config_option("datafusion.execution.batch_size", 2000)
+        .with_table(create_taxi_table().await?)
+        .build()
         .await?;
     let (plan, batches) = harness
         .query_batches("SELECT pickup_date FROM taxi")
@@ -36,7 +38,7 @@ async fn scan_honors_session_batch_size() -> Result<()> {
     // not be about the scan.
     insta::assert_snapshot!(plan, @r"
     CooperativeExec
-      DataSourceExec: format=iceberg, projection=[pickup_date]
+      DataSourceExec: format=iceberg, projection=[pickup_date], provider=lazy
     ");
     let max_rows = batches.iter().map(|batch| batch.num_rows()).max();
     assert_eq!(max_rows, Some(2000));
