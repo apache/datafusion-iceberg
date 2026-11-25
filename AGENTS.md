@@ -100,13 +100,14 @@ Both providers report every filter as `Inexact`, so DataFusion re-applies the or
 input
  → project_with_partition  partitioned tables only: appends a `_partition` struct column computed by `PartitionExpr`
  → repartition             hash on `_partition` for identity/bucket transforms, otherwise round-robin; uses session target_partitions
- → sort_by_partition       only when table property `write.datafusion.fanout.enabled` is false (default: true)
+ → (optimizer) sort        on `_partition`, which IcebergWriteExec requires when table property `write.datafusion.fanout.enabled` is false (default: true)
  → IcebergWriteExec        per partition: `TaskWriter` writes Parquet files and emits Avro-serialized DataFiles in a `data_files: LargeBinary` column
  → CoalescePartitionsExec
  → IcebergCommitExec       single partition: one `fast_append` transaction; outputs a `count` row
 ```
 
-- **`TaskWriter`** picks one of three writers: `UnpartitionedWriter`; `FanoutWriter` (accepts unsorted input, keeps many files open); or `ClusteredWriter` (requires sorted input, which is why the sort step exists).
+- **`TaskWriter`** picks one of three writers: `UnpartitionedWriter`; `FanoutWriter` (accepts unsorted input, keeps many files open); or `ClusteredWriter` (requires sorted input, which is why `IcebergWriteExec` requires a sort without fanout).
+- **Input requirements** belong on `IcebergWriteExec` (e.g. `required_input_ordering`), not as nodes added in `insert_into`: the physical optimizer removes a `SortExec` or `RepartitionExec` that no parent requires.
 - **Writer limits:** only Parquet is supported. The writer honors `write.parquet.*` table properties and table encryption. It matches columns by name, because DataFusion batches carry no field IDs.
 - **`PartitionExpr`** is public and retains its partition spec and table schema so that distributed engines can serialize them and rebuild the expression on workers with `try_new`. Its equality and hash are by value; don't go back to pointer equality.
 

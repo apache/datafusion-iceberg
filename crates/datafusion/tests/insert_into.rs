@@ -31,7 +31,7 @@ use iceberg::spec::{
     Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
-use iceberg_datafusion_test_tools::{FixtureCatalog, display_schema};
+use iceberg_datafusion_test_tools::{FixtureCatalog, IcebergTestHarness, display_schema};
 
 #[tokio::test]
 async fn test_insert_into() -> Result<(), Box<dyn Error>> {
@@ -486,6 +486,128 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// Inserts four rows into a new table `t (id, cat)`, partitioned by `transform` of
+/// `cat` if given and written with or without fanout, and returns the insert's
+/// plan and the rows read back.
+async fn insert(
+    transform: Option<Transform>,
+    fanout: bool,
+) -> Result<(String, String), Box<dyn Error>> {
+    let fixtures = FixtureCatalog::try_new().await?;
+    let mut table = fixtures
+        .table(
+            TableIdent::from_strs(["default", "t"])?,
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "cat", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()?,
+        )
+        .property("write.datafusion.fanout.enabled", fanout.to_string());
+    if let Some(transform) = transform {
+        table = table.partition_by("cat", transform);
+    }
+    table.create().await?;
+    let harness = IcebergTestHarness::builder()
+        .with_catalog(
+            "iceberg",
+            Arc::new(IcebergCatalogProvider::try_new(fixtures.catalog()).await?),
+        )
+        .build()
+        .await?;
+
+    let (plan, _) = harness
+        .query("INSERT INTO iceberg.default.t VALUES (1, 1), (2, 2), (3, 1), (4, 2)")
+        .await?;
+    let (_, rows) = harness
+        .query("SELECT * FROM iceberg.default.t ORDER BY id")
+        .await?;
+    Ok((plan, rows))
+}
+
+/// The clustered writer needs its input sorted by partition, so `IcebergWriteExec`
+/// requires that order and the optimizer adds the sort.
+#[tokio::test]
+async fn sorts_partitioned_writes_by_partition_without_fanout()
+-> Result<(), Box<dyn Error>> {
+    let (plan, rows) = insert(Some(Transform::Identity), false).await?;
+
+    insta::assert_snapshot!(plan, @r#"
+    IcebergCommitExec: table=default.t, schema=[1: id: required int, 2: cat: required int]
+      IcebergWriteExec: table=default.t, result_schema=Schema { fields: [Field { name: "data_files", data_type: LargeBinary }], metadata: {} }
+        SortExec: expr=[_partition@2 ASC], preserve_partitioning=[false]
+          ProjectionExec: expr=[column1@0 as id, column2@1 as cat, iceberg_partition_values(cat) as _partition]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+    "#);
+    insta::assert_snapshot!(rows, @r"
+    +----+-----+
+    | id | cat |
+    +----+-----+
+    | 1  | 1   |
+    | 2  | 2   |
+    | 3  | 1   |
+    | 4  | 2   |
+    +----+-----+
+    ");
+
+    Ok(())
+}
+
+/// The fanout writer accepts rows in any order, so no sort is required.
+#[tokio::test]
+async fn writes_partitioned_tables_unsorted_with_fanout() -> Result<(), Box<dyn Error>> {
+    let (plan, rows) = insert(Some(Transform::Identity), true).await?;
+
+    insta::assert_snapshot!(plan, @r#"
+    IcebergCommitExec: table=default.t, schema=[1: id: required int, 2: cat: required int]
+      IcebergWriteExec: table=default.t, result_schema=Schema { fields: [Field { name: "data_files", data_type: LargeBinary }], metadata: {} }
+        ProjectionExec: expr=[column1@0 as id, column2@1 as cat, iceberg_partition_values(cat) as _partition]
+          DataSourceExec: partitions=1, partition_sizes=[1]
+    "#);
+    insta::assert_snapshot!(rows, @r"
+    +----+-----+
+    | id | cat |
+    +----+-----+
+    | 1  | 1   |
+    | 2  | 2   |
+    | 3  | 1   |
+    | 4  | 2   |
+    +----+-----+
+    ");
+
+    Ok(())
+}
+
+/// An unpartitioned table has no partition column to sort by, so no sort is
+/// required.
+#[tokio::test]
+async fn inserts_into_an_unpartitioned_table_without_fanout() -> Result<(), Box<dyn Error>>
+{
+    let (plan, rows) = insert(None, false).await?;
+
+    insta::assert_snapshot!(plan, @r#"
+    IcebergCommitExec: table=default.t, schema=[1: id: required int, 2: cat: required int]
+      IcebergWriteExec: table=default.t, result_schema=Schema { fields: [Field { name: "data_files", data_type: LargeBinary }], metadata: {} }
+        ProjectionExec: expr=[column1@0 as id, column2@1 as cat]
+          DataSourceExec: partitions=1, partition_sizes=[1]
+    "#);
+    insta::assert_snapshot!(rows, @r"
+    +----+-----+
+    | id | cat |
+    +----+-----+
+    | 1  | 1   |
+    | 2  | 2   |
+    | 3  | 1   |
+    | 4  | 2   |
+    +----+-----+
+    ");
 
     Ok(())
 }
